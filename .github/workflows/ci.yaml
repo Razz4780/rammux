@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+    types:
+    - opened
+    - reopened
+    - synchronize
+    - ready_for_review
+    - labeled
+    - unlabeled
+  push:
+    branches: ["main"]
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  basic_checks:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: ["", "--release"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Check clippy
+        run: cargo clippy --all-targets ${{ matrix.profile }} -- -D warnings
+
+      - name: Build targets
+        run: cargo build ${{ matrix.profile }} --all-targets
+
+      - name: Run unit tests
+        run: cargo test ${{ matrix.profile }}
+
+      - name: Run examples
+        run: |
+          set -euo pipefail
+          cargo run ${{ matrix.profile }} --example downgrade
+          cargo run ${{ matrix.profile }} --example flow_control
+          cargo run ${{ matrix.profile }} --example negotiation
+          cargo run ${{ matrix.profile }} --example heavy_io -- --transport unix rammux
