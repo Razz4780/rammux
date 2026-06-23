@@ -1,5 +1,6 @@
 # rammux
 
+[![crates.io](https://img.shields.io/crates/v/rammux.svg)](https://crates.io/crates/rammux)
 [![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![CI](https://github.com/Razz4780/rammux/actions/workflows/ci.yaml/badge.svg)](https://github.com/Razz4780/rammux/actions/workflows/ci.yaml)
 
