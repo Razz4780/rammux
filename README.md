@@ -1,5 +1,8 @@
 # rammux
 
+[![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![CI](https://github.com/Razz4780/rammux/actions/workflows/ci.yaml/badge.svg)](https://github.com/Razz4780/rammux/actions/workflows/ci.yaml)
+
 `rammux` is a Tokio-based stream multiplexer for reliable byte stream transports.
 It lets two peers run many independent bidirectional byte streams over one
 `AsyncRead + AsyncWrite` connection while keeping stream lifecycle, per-stream flow
