@@ -3,34 +3,47 @@ use std::{fmt, mem::MaybeUninit, ptr::NonNull};
 use bytes::{Buf, Bytes};
 
 /// Fixed size buffer for reading inbound data frames.
+///
+/// Meant to be transformed into [`Data`] and stored in [`DataList`].
 #[derive(Default)]
-pub struct Buffer(Option<Box<[MaybeUninit<u8>]>>);
+pub struct Buffer(
+    /// If this slice is not empty, it must be at least as long as the size of [`NextLink`].
+    /// The first bytes zeroed and reserved for the link.
+    Box<[MaybeUninit<u8>]>,
+);
 
 impl Buffer {
+    /// Creates a new buffer with the given capacity.
     pub fn with_capactiy(capacity: usize) -> Self {
         if capacity == 0 {
-            return Self(None);
+            return Default::default();
         }
 
         let cap = capacity
             .checked_add(std::mem::size_of::<NextLink>())
             .expect("capacity overflow");
-        let storage = Box::new_uninit_slice(cap);
-        Self(Some(storage))
+        let mut storage = Box::new_uninit_slice(cap);
+
+        let storage_ptr = storage.as_mut_ptr().cast::<NextLink>();
+        let stub_ptr = NonNull::from_ref([].as_slice());
+        unsafe {
+            // SAFETY: we reserved additional memory for the link.
+            storage_ptr.cast::<NextLink>().write_unaligned(stub_ptr);
+        };
+
+        Self(storage)
     }
 
     pub fn as_slice(&self) -> &[MaybeUninit<u8>] {
-        let Some(storage) = &self.0 else {
-            return Default::default();
-        };
-        unsafe { storage.get_unchecked(std::mem::size_of::<NextLink>()..) }
+        self.0
+            .get(std::mem::size_of::<NextLink>()..)
+            .unwrap_or_default()
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [MaybeUninit<u8>] {
-        let Some(storage) = &mut self.0 else {
-            return Default::default();
-        };
-        unsafe { storage.get_unchecked_mut(std::mem::size_of::<NextLink>()..) }
+        self.0
+            .get_mut(std::mem::size_of::<NextLink>()..)
+            .unwrap_or_default()
     }
 
     /// Assumes that the buffer is fully initialized and returns the data.
@@ -39,23 +52,33 @@ impl Buffer {
     ///
     /// Caller must ensure that the buffer was fully initialized.
     pub unsafe fn assume_init(self) -> Data {
-        self.0.map(Data).unwrap_or_default()
+        let storage = unsafe {
+            // SAFETY: caller ensures that data space is initialized,
+            // and reserved link bytes were initialized in `.with_capacity`.
+            self.0.assume_init()
+        };
+        Data(storage)
     }
 }
 
 /// Data extracted from an inbound frame.
-#[derive(Clone)]
-pub struct Data(Box<[MaybeUninit<u8>]>);
+///
+/// Meant to be stored in [`DataList`].
+#[derive(Clone, Default)]
+pub struct Data(
+    /// If this slice is not empty, it must be at least as long as the size of [`NextLink`],
+    /// and the first bytes are reserved for the link.
+    Box<[u8]>,
+);
 
 impl Data {
     #[cfg(test)]
     pub fn copy_from_slice(slice: &[u8]) -> Self {
         let mut buffer = Buffer::with_capactiy(slice.len());
+        buffer.as_mut_slice().write_copy_of_slice(slice);
         unsafe {
-            buffer
-                .as_mut_slice()
-                .assume_init_mut()
-                .copy_from_slice(slice);
+            // SAFETY: data space was just initialized,
+            // and reserved link bytes were initialized in `Buffer::with_capacity`.
             buffer.assume_init()
         }
     }
@@ -63,28 +86,31 @@ impl Data {
 
 impl AsRef<[u8]> for Data {
     fn as_ref(&self) -> &[u8] {
-        unsafe {
-            self.0
-                .get_unchecked(std::mem::size_of::<NextLink>()..)
-                .assume_init_ref()
-        }
+        self.0
+            .get(std::mem::size_of::<NextLink>()..)
+            .unwrap_or_default()
     }
 }
 
 impl From<Data> for Bytes {
     fn from(value: Data) -> Self {
-        let data = unsafe { value.0.assume_init() };
+        if value.0.is_empty() {
+            return Bytes::new();
+        }
+
         // impl From<Box<[u8]>> for Bytes is very cheap.
         // It does not allocate, only moves some pointers.
-        let mut bytes = Bytes::from(data).try_into_mut().expect("buffer is unique");
+        let mut bytes = Bytes::from(value.0)
+            .try_into_mut()
+            .expect("buffer is unique");
         bytes.advance(std::mem::size_of::<NextLink>());
         bytes.freeze()
     }
 }
 
-impl Default for Data {
-    fn default() -> Self {
-        Self(Box::new_uninit_slice(std::mem::size_of::<NextLink>()))
+impl fmt::Debug for Data {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_ref().fmt(f)
     }
 }
 
@@ -96,24 +122,21 @@ impl PartialEq for Data {
 
 impl Eq for Data {}
 
-impl fmt::Debug for Data {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.as_ref().fmt(f)
-    }
-}
-
-/// Link to the next [`Data`] node in [`DataList`].
+/// Link to the next [`Data`] node in the [`DataList`].
 ///
 /// Link is stored in the first bytes of the slice owned by [`Data`],
-/// and does not always have to be initialized. It is caller's responsibility to ensure
-/// that the link is initialized when needed.
-type NextLink = NonNull<[MaybeUninit<u8>]>;
+/// and does not always have to point to a valid node.
+/// It is caller's responsibility to ensure that the link is valid
+/// when the node is in the [`DataList`], unless as a tail.
+type NextLink = NonNull<[u8]>;
 
-/// Forward list of [`Data`] nodes.
+/// Forward list of non-empty [`Data`] nodes.
+///
+/// Thanks to custom [`Data`] implementation, operations on this list are very cheap.
 #[derive(Default)]
 pub struct DataList {
-    head: Option<NonNull<[MaybeUninit<u8>]>>,
-    tail: Option<NonNull<[MaybeUninit<u8>]>>,
+    head: Option<NonNull<[u8]>>,
+    tail: Option<NonNull<[u8]>>,
 }
 
 impl DataList {
@@ -122,27 +145,42 @@ impl DataList {
     /// This method is O(1) and very cheap.
     /// It only moves some pointers.
     pub fn pop_front(&mut self) -> Option<Data> {
-        let node = Data(unsafe { Box::from_raw(self.head?.as_ptr()) });
+        let head = self.head?;
+        let storage = unsafe {
+            // SAFETY: .head was produced from a Box.
+            Box::from_raw(head.as_ptr())
+        };
         if self.head == self.tail {
             self.head = None;
             self.tail = None;
         } else {
-            // If this node was not the tail, it's next link must be initialized.
-            self.head = Some(unsafe { Self::next(node.0.as_ptr()) });
+            // If head node was not the tail, it's next link must be initialized.
+            let new_head = unsafe {
+                // SAFETY: .head was obtained from a non-empty boxed slice from `Data`.
+                Self::next(storage.as_ref())
+            };
+            self.head = Some(new_head);
         }
-        Some(node)
+        Some(Data(storage))
     }
 
-    /// Pushes the given node to the back of this list.
+    /// Pushes the given node to the back of this list if the node is not empty.
+    /// Otherwise, drops the node.
     ///
     /// This method is O(1) and very cheap.
     /// It only moves some pointers.
-    pub fn push_back(&mut self, buffer: Data) {
-        let link = unsafe { NonNull::new_unchecked(Box::into_raw(buffer.0)) };
+    pub fn push_back(&mut self, data: Data) {
+        if data.0.is_empty() {
+            return;
+        }
+
+        let link = NonNull::from_ref(data.0.as_ref());
+        let _ = Box::into_raw(data.0);
         match self.tail {
-            Some(tail) => {
+            Some(mut tail) => {
                 unsafe {
-                    Self::set_next(tail.as_ptr().cast(), link);
+                    // SAFETY: .tail was obtained from a non-empty boxed slice from `Data`.
+                    Self::set_next(tail.as_mut(), link);
                 }
                 self.tail = Some(link);
             },
@@ -153,15 +191,29 @@ impl DataList {
         }
     }
 
-    /// Reads the next link from the given [`Data`] storage.
-    unsafe fn next(storage: *const MaybeUninit<u8>) -> NextLink {
-        unsafe { storage.cast::<NextLink>().read_unaligned() }
+    /// Reads the [`NextLink`] from the given [`Data`] storage.
+    ///
+    /// # Safety
+    ///
+    /// `storage` must be long enough to contain [`NextLink`] bytes,
+    /// and the first bytes must contain an initialized [`NextLink`].
+    unsafe fn next(storage: &[u8]) -> NextLink {
+        debug_assert!(storage.len() >= std::mem::size_of::<NextLink>());
+        unsafe { storage.as_ptr().cast::<NextLink>().read_unaligned() }
     }
 
-    /// Sets the next link in the given [`Data`] storage.
-    unsafe fn set_next(storage: *mut MaybeUninit<u8>, link: NextLink) {
+    /// Sets the [`NextLink`] in the given [`Data`] storage.
+    ///
+    /// # Safety
+    ///
+    /// `storage` must be long enough to contain [`NextLink`] bytes.
+    unsafe fn set_next(storage: &mut [u8], link: NextLink) {
+        debug_assert!(storage.len() >= std::mem::size_of::<NextLink>());
         unsafe {
-            storage.cast::<NextLink>().write_unaligned(link);
+            storage
+                .as_mut_ptr()
+                .cast::<NextLink>()
+                .write_unaligned(link);
         }
     }
 }
@@ -179,19 +231,21 @@ unsafe impl Sync for DataList {}
 mod test {
     use bytes::Bytes;
 
-    use crate::buffer::{Buffer, DataList};
+    use crate::buffer::{Buffer, Data, DataList};
 
     #[test]
     fn buffer_list() {
-        let chunks: [&[u8]; 4] = [b"some", b"chunks", b"of", b"data"];
+        let chunks: [&[u8]; _] = [b"some", b"chunks", b"of", b"data"];
         let mut list = DataList::default();
 
         for chunk in chunks {
             let mut buffer = Buffer::with_capactiy(chunk.len());
-            let storage = unsafe { buffer.as_mut_slice().assume_init_mut() };
+            let storage = buffer.as_mut_slice();
             assert_eq!(storage.len(), chunk.len());
-            storage.copy_from_slice(chunk);
-            list.push_back(unsafe { buffer.assume_init() });
+            storage.write_copy_of_slice(chunk);
+            let data = unsafe { buffer.assume_init() };
+            assert_eq!(data.as_ref(), chunk);
+            list.push_back(data);
         }
 
         for chunk in chunks {
@@ -199,6 +253,15 @@ mod test {
             assert_eq!(Bytes::from(data), chunk);
         }
 
+        assert!(list.pop_front().is_none());
+    }
+
+    #[test]
+    fn empty_buffer_list() {
+        let mut list = DataList::default();
+        for _ in 0..2 {
+            list.push_back(Data::default());
+        }
         assert!(list.pop_front().is_none());
     }
 }
