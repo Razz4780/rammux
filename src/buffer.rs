@@ -1,4 +1,4 @@
-use std::{fmt, mem::MaybeUninit, ptr::NonNull};
+use std::{fmt, mem::MaybeUninit, ops::Not, ptr::NonNull};
 
 use bytes::{Buf, Bytes};
 
@@ -94,17 +94,13 @@ impl AsRef<[u8]> for Data {
 
 impl From<Data> for Bytes {
     fn from(value: Data) -> Self {
-        if value.0.is_empty() {
-            return Bytes::new();
-        }
-
         // impl From<Box<[u8]>> for Bytes is very cheap.
         // It does not allocate, only moves some pointers.
-        let mut bytes = Bytes::from(value.0)
-            .try_into_mut()
-            .expect("buffer is unique");
-        bytes.advance(std::mem::size_of::<NextLink>());
-        bytes.freeze()
+        let mut bytes = Bytes::from(value.0);
+        if bytes.is_empty().not() {
+            bytes.advance(std::mem::size_of::<NextLink>());
+        }
+        bytes
     }
 }
 
