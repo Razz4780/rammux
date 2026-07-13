@@ -4,6 +4,7 @@
 [![Released API docs](https://docs.rs/rammux/badge.svg)](https://docs.rs/rammux)
 [![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![CI](https://github.com/Razz4780/rammux/actions/workflows/ci.yaml/badge.svg)](https://github.com/Razz4780/rammux/actions/workflows/ci.yaml)
+[![MSRV](https://img.shields.io/crates/msrv/rammux)](https://crates.io/crates/rammux)
 
 `rammux` is a Tokio-based stream multiplexer for reliable byte stream transports.
 It lets two peers run many independent bidirectional byte streams over one
