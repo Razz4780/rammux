@@ -1,10 +1,9 @@
-//! Types for running Rammux protocol on an IO transport.
+//! Types for running rammux protocol on an IO transport.
 
 use std::{
     collections::hash_map::Entry,
     convert::Infallible,
     io,
-    ops::Not,
     task::{Context, Poll},
     time::Duration,
 };
@@ -23,8 +22,8 @@ use crate::{
         pings::OutboundPings,
         state::{Active, ConnState},
     },
-    error::{ErrorKind, RammuxError, StreamError},
-    flow_control::{GlobalWindow, GlobalWindowState},
+    error::{ErrorKind, RammuxError},
+    global_pool::GlobalPool,
     stream::RammuxDuplex,
     stream_id::StreamId,
 };
@@ -35,7 +34,7 @@ mod downgrade;
 mod pings;
 mod state;
 
-/// State machine of a single Rammux connection.
+/// State machine of a single rammux connection.
 ///
 /// # Polling
 ///
@@ -55,10 +54,10 @@ mod state;
 ///
 /// # Downgrade
 ///
-/// To stop using Rammux and recover the wrapped transport, call
+/// To stop using rammux and recover the wrapped transport, call
 /// [`RammuxConnection::downgrade`] and await the returned [`Downgraded`].
 /// That future sends the final `TERM` frame, waits for the peer's `TERM`,
-/// and yields a clean transport with no unread Rammux bytes left in it.
+/// and yields a clean transport with no unread rammux bytes left in it.
 ///
 /// Note that the other side might start the downgrade first.
 /// In this case, [`RammuxConnection::progress`]/[`RammuxConnection::poll_progress`]
@@ -66,30 +65,33 @@ mod state;
 ///
 /// # Drop
 ///
-/// Dropping this struct while the Rammux connection is open will abruptly close the connection and all Rammux streams.
-/// Proper Rammux shutdown requires that [`Downgraded`] is polled to completion.
+/// Dropping this struct while the rammux connection is open will abruptly close the connection and all rammux streams.
+/// Proper rammux shutdown requires that [`Downgraded`] is polled to completion.
 pub struct RammuxConnection<IO> {
     state: ConnState<IO>,
     role: RammuxRole,
     config: RammuxConfig,
-    global_window: GlobalWindow,
+    global_pool: GlobalPool,
 }
 
 impl<IO> RammuxConnection<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
-    /// Creates a new Rammux connection with clean state.
+    /// Creates a new rammux connection with clean state.
     pub fn new(role: RammuxRole, io: IO, config: RammuxConfig) -> Self {
         Self {
             state: ConnState::Active(Active {
                 codec: RammuxCodec::new(io, config.frame_limit),
                 streams: Default::default(),
-                bus: Default::default(),
+                selector: Default::default(),
                 out_pings: OutboundPings::new(config.ping_interval),
                 in_ping: None,
             }),
-            global_window: GlobalWindow::new(config.global_recv_window),
+            global_pool: GlobalPool {
+                rtt: None,
+                available: config.global_recv_window,
+            },
             config,
             role,
         }
@@ -130,7 +132,7 @@ where
                 is_response: true,
             } => {
                 let elapsed = active.out_pings.received_response(payload)?;
-                self.global_window.update_rtt(elapsed);
+                self.global_pool.rtt = Some(elapsed);
                 RammuxProgress::Empty
             },
 
@@ -154,23 +156,23 @@ where
                         id: stream_id,
                         error: "sent a frame for an unknown stream".into(),
                     })?;
-                let result = match payload {
-                    StreamPayload::WindowUpdate(update) => e.modify(|handle| {
-                        handle.received_window_update(update, flags.fin_read, flags.fin_write)?;
-                        Ok::<_, StreamError>(handle.is_dead())
-                    }),
-                    StreamPayload::Data(data) => e.modify(|handle| {
-                        handle.received_data(data, flags.fin_read, flags.fin_write)?;
-                        Ok::<_, StreamError>(handle.is_dead())
-                    }),
-                };
-                let is_dead = result.map_err(|error| ErrorKind::Stream {
+
+                let fin_state = match payload {
+                    StreamPayload::WindowUpdate(update) => {
+                        e.received_window_update(update, flags.fin_read, flags.fin_write)
+                    },
+                    StreamPayload::Data(data) => {
+                        e.received_data(data, flags.fin_read, flags.fin_write)
+                    },
+                }
+                .map_err(|error| ErrorKind::Stream {
                     id: stream_id,
                     error,
                 })?;
-                if is_dead {
+                if fin_state.is_dead() {
                     active.streams.outbound.remove(slab_idx);
                 }
+
                 RammuxProgress::Empty
             },
 
@@ -197,13 +199,9 @@ where
                                         .into(),
                             }));
                         }
-                        let (handle, duplex) = crate::stream::create(
-                            stream_id,
-                            false,
-                            &self.config,
-                            self.global_window.clone(),
-                            &active.bus,
-                        );
+                        let (handle, updates, duplex) =
+                            crate::stream::new(stream_id, false, &self.config);
+                        active.selector.push(updates);
                         (e.insert_entry(handle), Some(duplex))
                     },
                     Entry::Vacant(..) => {
@@ -214,22 +212,21 @@ where
                     },
                 };
 
-                let result = match payload {
-                    StreamPayload::WindowUpdate(update) => e.get_mut().modify(|handle| {
-                        handle.received_window_update(update, flags.fin_read, flags.fin_write)?;
-                        Ok::<_, StreamError>(handle.is_dead())
-                    }),
-                    StreamPayload::Data(data) => e.get_mut().modify(|handle| {
-                        handle.received_data(data, flags.fin_read, flags.fin_write)?;
-                        Ok::<_, StreamError>(handle.is_dead())
-                    }),
-                };
-                let is_dead = result.map_err(|error| ErrorKind::Stream {
+                let fin_state = match payload {
+                    StreamPayload::WindowUpdate(update) => {
+                        e.get_mut()
+                            .received_window_update(update, flags.fin_read, flags.fin_write)
+                    },
+                    StreamPayload::Data(data) => {
+                        e.get_mut()
+                            .received_data(data, flags.fin_read, flags.fin_write)
+                    },
+                }
+                .map_err(|error| ErrorKind::Stream {
                     id: stream_id,
                     error,
                 })?;
-
-                if is_dead {
+                if fin_state.is_dead() {
                     e.remove();
                 }
 
@@ -270,20 +267,15 @@ where
                 continue;
             }
 
-            if let Poll::Ready(stream) = active.bus.poll_recv(cx) {
-                let (update, is_dead) = stream.modify(|stream| {
-                    debug_assert!(
-                        stream.is_dead().not(),
-                        "stream can only transition to dead state after reading the update, \
-                        and dead stream never becomes ready (so is never enqueued again)",
-                    );
-                    let update = stream.read_update();
-                    (update, stream.is_dead())
-                });
+            if let Poll::Ready(Some((update, fin_state))) = active
+                .selector
+                .with_ext(&(), &mut self.global_pool)
+                .poll_next_unpin(cx)
+            {
                 let id = update.id;
                 let item = EncoderItem::from(update);
                 active.codec.start_send_unpin(item)?;
-                if is_dead {
+                if fin_state.is_dead() {
                     if id.initiated_by() == self.role {
                         let idx = id.slab_idx();
                         active.streams.outbound.remove(idx);
@@ -305,6 +297,10 @@ where
     ) -> Poll<Result<RammuxProgress<IO>, ErrorKind>> {
         let _ = self.state.active_mut()?.out_pings.poll_should_send(cx)?;
         let mut inbound = Poll::Pending;
+        // Drain up to one encoder batch of inbound frames first.
+        // In particular, processing multiple WINDOW_UPDATEs can make several
+        // outbound streams writable, allowing their frames to be coalesced into
+        // a vectored write. Keep the work bounded so ready reads cannot starve writes.
         for _ in 0..codec::ENCODER_QUEUE_CAPACITY {
             match self.poll_inbound_progress(cx)? {
                 Poll::Pending => break,
@@ -368,13 +364,8 @@ where
             return Ok(None);
         };
 
-        let (handle, duplex) = crate::stream::create(
-            id,
-            true,
-            &self.config,
-            self.global_window.clone(),
-            &active.bus,
-        );
+        let (handle, updates, duplex) = crate::stream::new(id, true, &self.config);
+        active.selector.push(updates);
         active.streams.outbound.insert(handle);
 
         Ok(Some(duplex))
@@ -401,13 +392,12 @@ where
                 )
             })
             .unwrap_or_default();
-        let GlobalWindowState { rtt, available } = self.global_window.state();
 
         RammuxStats {
             inbound_streams,
             outbound_streams,
-            rtt,
-            available_global_recv_window: available,
+            rtt: self.global_pool.rtt,
+            available_global_recv_window: self.global_pool.available,
         }
     }
 }

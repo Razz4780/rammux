@@ -84,7 +84,7 @@ Usage examples live in the [examples directory](https://github.com/Razz4780/ramm
 - `examples/negotiation.rs`: negotiate config out of band
 - `examples/flow_control.rs`: show blocked and active streams coexisting
 - `examples/downgrade.rs`: orderly shutdown and transport recovery
-- `examples/heavy_io.rs`: compare Rammux against raw transport throughput
+- `examples/heavy_io.rs`: compare rammux against raw transport throughput
 
 ## Protocol
 

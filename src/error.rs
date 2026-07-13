@@ -1,4 +1,4 @@
-//! Rammux errors types.
+//! rammux errors types.
 
 use std::{io, time::Duration};
 
@@ -9,7 +9,7 @@ use crate::{
     stream_id::StreamId,
 };
 
-/// Opaque error originating from a Rammux connection.
+/// Opaque error originating from a rammux connection.
 #[derive(Error, Debug)]
 #[error(transparent)]
 pub struct RammuxError(#[from] pub(crate) ErrorKind);
@@ -78,7 +78,7 @@ pub enum ErrorKind {
     /// Failed to decode an inbound frame.
     #[error(transparent)]
     Decode(#[from] DecodeError),
-    /// Rammux protocol was violated within a specific stream.
+    /// rammux protocol was violated within a specific stream.
     #[error("peer violated the protocol in stream {id}")]
     Stream {
         /// ID of the stream.
@@ -98,7 +98,7 @@ pub enum ErrorKind {
         /// Time elapsed since the `PING` was sent.
         elapsed: Duration,
     },
-    /// Rammux connection was downgraded and is no longer valid.
+    /// rammux connection was downgraded and is no longer valid.
     #[error("connection already downgraded")]
     AlreadyDowngraded,
     #[error("connection poisoned")]
@@ -111,7 +111,7 @@ impl From<io::ErrorKind> for ErrorKind {
     }
 }
 
-/// Rammux protocol violations that can occur within a specific stream.
+/// rammux protocol violations that can occur within a specific stream.
 #[derive(Error, Debug)]
 #[error("{0}")]
 pub struct StreamError(pub &'static str);
@@ -122,7 +122,7 @@ impl From<&'static str> for StreamError {
     }
 }
 
-/// Errors that can occur when decoding an inbound Rammux frame.
+/// Errors that can occur when decoding an inbound rammux frame.
 #[derive(Error, Debug, Clone, Copy)]
 #[error("received an invalid frame header {header:#018x} ({message})")]
 pub struct DecodeError {

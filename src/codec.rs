@@ -27,7 +27,7 @@ pub mod encoder;
 /// How many [`EncoderItem`]s can be stored in a [`RammuxCodec`] before data has to be written into the IO transport.
 pub const ENCODER_QUEUE_CAPACITY: usize = 16;
 
-/// Rammux frame codec applied to an IO transport.
+/// rammux frame codec applied to an IO transport.
 ///
 /// Implements [`Stream`] and [`Sink`].
 ///

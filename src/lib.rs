@@ -1,6 +1,6 @@
 //! Tokio-based asynchronous stream multiplexing over a single byte transport.
 //!
-//! Rammux lets two peers open many independent virtual byte streams inside one
+//! rammux lets two peers open many independent virtual byte streams inside one
 //! reliable byte stream transport, for example a TCP (mind the head-of-line blocking issue)
 //! or a UNIX connection.
 //!
@@ -11,11 +11,11 @@
 //! The transport itself is driven by [`RammuxConnection`](connection::RammuxConnection).
 //! That connection owns protocol IO, handles stream creation, applies per-stream flow
 //! control, sends keepalive `PING`s, and performs graceful downgrade back to the
-//! underlying transport when Rammux is finished.
+//! underlying transport when rammux is finished.
 //!
 //! # Configuration and negotiation
 //!
-//! Rammux does not define an in-band handshake for transport parameters. Before
+//! rammux does not define an in-band handshake for transport parameters. Before
 //! constructing both peers, the application must ensure that both sides use a compatible
 //! [`RammuxConfig`](config::RammuxConfig) and complementary [`RammuxRole`](config::RammuxRole)s.
 //!
@@ -48,9 +48,8 @@ mod codec;
 pub mod config;
 pub mod connection;
 mod error;
-mod flow_control;
+mod global_pool;
 mod header;
-mod rr_bus;
 pub mod stream;
 mod stream_id;
 

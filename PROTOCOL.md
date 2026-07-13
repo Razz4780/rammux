@@ -1,4 +1,4 @@
-# Rammux protocol
+# eammux protocol
 
 This document describes the wire format and session rules implemented in rammux.
 

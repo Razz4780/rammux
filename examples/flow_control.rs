@@ -10,7 +10,7 @@ use tokio::io::DuplexStream;
 
 const DATA: Bytes = Bytes::from_static(&[37; 64 * 1024]);
 
-/// This example presents the flow control mechanism implemented in Rammux.
+/// This example presents the flow control mechanism implemented in rammux.
 ///
 /// See [PROTOCOL.md](https://github.com/Razz4780/rammux/blob/main/PROTOCOL.md) for more info.
 #[tokio::main]

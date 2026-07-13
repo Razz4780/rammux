@@ -6,7 +6,7 @@ use rammux::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
-/// This example presents a possible implementation of the config negotiation required to run Rammux.
+/// This example presents a possible implementation of the config negotiation required to run rammux.
 ///
 /// See [PROTOCOL.md](https://github.com/Razz4780/rammux/blob/main/PROTOCOL.md) for more info.
 #[tokio::main]
@@ -29,7 +29,7 @@ async fn main() {
     );
 }
 
-/// Negotiates Rammux config and starts the connection.
+/// Negotiates rammux config and starts the connection.
 async fn negotiate_rammux(role: RammuxRole, mut io: DuplexStream, mut config: RammuxConfig) {
     println!("[{role}] Negotiating with base config: {config:?}");
 
@@ -63,7 +63,7 @@ async fn negotiate_rammux(role: RammuxRole, mut io: DuplexStream, mut config: Ra
     rammux
         .downgrade()
         .expect("connection was not downgraded")
-        // We won't be using the IO transport after Rammux,
+        // We won't be using the IO transport after rammux,
         // so we can instruct `Downgraded` to eagerly close it.
         .with_shutdown()
         .await
@@ -71,7 +71,7 @@ async fn negotiate_rammux(role: RammuxRole, mut io: DuplexStream, mut config: Ra
     println!("[{role}] Downgrade finished.");
 }
 
-/// Exchanged by peers before starting the Rammux connection.
+/// Exchanged by peers before starting the rammux connection.
 ///
 /// Allows for negotiating the connection parameters.
 #[derive(Debug)]

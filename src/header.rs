@@ -1,4 +1,4 @@
-//! Types for encoding/decoding Rammux frame headers.
+//! Types for encoding/decoding rammux frame headers.
 
 use std::{fmt, ops::Not};
 
@@ -6,10 +6,10 @@ use bitflags::{Flags, bitflags};
 
 use crate::{error::DecodeError, stream_id::StreamId};
 
-/// 8-byte header of a Rammux frame, not validated.
+/// 8-byte header of a rammux frame, not validated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RawHeader {
-    /// ID of a Rammux stream.
+    /// ID of a rammux stream.
     ///
     /// 1. For [`RawFlags::DATA`] and [`RawFlags::WINDOW_UPDATE`] frames,
     ///    this denotes the stream in which data is transferred.
@@ -130,7 +130,7 @@ impl fmt::LowerHex for RawHeader {
 }
 
 bitflags! {
-    /// Flags of a Rammux frame.
+    /// Flags of a rammux frame.
     #[derive(PartialEq, Eq, Clone, Copy, Debug)]
     pub struct RawFlags: u8 {
         /// Denotes `PING` type of the frame.
@@ -151,13 +151,13 @@ bitflags! {
 }
 
 impl RawFlags {
-    /// Flags for a term frame used in Rammux connection dowgrade.
+    /// Flags for a term frame used in rammux connection dowgrade.
     ///
     /// All bits unset.
     pub const TERM: Self = Self::empty();
 }
 
-/// Clean enum representing a valid Rammux frame header.
+/// Clean enum representing a valid rammux frame header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Header {
     Ping {

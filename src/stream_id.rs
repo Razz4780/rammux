@@ -7,9 +7,9 @@ use rand::{
 
 use crate::config::RammuxRole;
 
-/// 24-bit ID of a Rammux stream.
+/// 24-bit ID of a rammux stream.
 ///
-/// Each active Rammux stream has an ID uniquely identifies that stream
+/// Each active rammux stream has an ID uniquely identifies that stream
 /// relative to all other active streams. Freed IDs are reused.
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StreamId(u32);

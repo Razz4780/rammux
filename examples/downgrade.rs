@@ -20,7 +20,7 @@ async fn main() {
     tokio::join!(run_client(client), run_server(server));
 }
 
-/// Opens an Rammux stream and sends [`DATA`] through it, then downgrades the connection.
+/// Opens an rammux stream and sends [`DATA`] through it, then downgrades the connection.
 async fn run_client(mut rammux: RammuxConnection<DuplexStream>) {
     let role = rammux.role();
 
@@ -63,7 +63,7 @@ async fn run_client(mut rammux: RammuxConnection<DuplexStream>) {
     rammux
         .downgrade()
         .expect("connection was not downgraded")
-        // We won't be using the IO transport after Rammux,
+        // We won't be using the IO transport after rammux,
         // so we can instruct `Downgraded` to eagerly close it.
         .with_shutdown()
         .await
@@ -114,7 +114,7 @@ async fn run_server(mut rammux: RammuxConnection<DuplexStream>) {
         .await
         .expect("reader should successfully read all data");
     downgraded
-        // We won't be using the IO transport after Rammux,
+        // We won't be using the IO transport after rammux,
         // so we can instruct `Downgraded` to eagerly close it.
         .with_shutdown()
         .await

@@ -1,10 +1,10 @@
-//! Rammux connection configuration.
+//! rammux connection configuration.
 
 use std::{fmt, num::NonZeroU32, time::Duration};
 
-/// Role in a Rammux connection.
+/// Role in a rammux connection.
 ///
-/// The only difference between the roles in a Rammux connection
+/// The only difference between the roles in a rammux connection
 /// is the pool of [`StreamId`](crate::StreamId)s
 /// that can be used when starting a new stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -26,8 +26,8 @@ impl fmt::Display for RammuxRole {
 
 /// Configuration for a [`RammuxConnection`](crate::connection::RammuxConnection).
 ///
-/// Rammux does not define an in-band handshake for transport parameters.
-/// Before running a Rammux connection, the application must ensure that both sides use a compatible config.
+/// rammux does not define an in-band handshake for transport parameters.
+/// Before running a rammux connection, the application must ensure that both sides use a compatible config.
 /// Settings that have to be negotiated beforehand:
 /// - [`RammuxConfig::frame_limit`]
 /// - [`RammuxConfig::max_outbound_streams`]

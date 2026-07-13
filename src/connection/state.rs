@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use async_selector::selector::Selector;
 use slab::Slab;
 
 use crate::{
@@ -8,8 +9,7 @@ use crate::{
     connection::{downgrade::Downgraded, pings::OutboundPings},
     error::ErrorKind,
     header::PingPayload,
-    rr_bus::{Node, RoundRobinBus},
-    stream::StreamHandle,
+    stream::{handle::StreamHandle, updates::StreamUpdates},
 };
 
 /// Inner state of a [`RammuxConnection`](super::RammuxConnection).
@@ -55,14 +55,14 @@ impl<IO> ConnState<IO> {
 pub struct Active<IO> {
     pub codec: RammuxCodec<IO>,
     pub streams: ActiveStreams,
-    pub bus: RoundRobinBus<StreamHandle>,
+    pub selector: Selector<StreamUpdates>,
     pub out_pings: OutboundPings,
     pub in_ping: Option<PingPayload>,
 }
 
-/// Stores active Rammux streams.
+/// Stores active rammux streams.
 ///
-/// All stored streams are aborted with [`StreamState::abort`] when this struct is dropped.
+/// All stored streams are aborted with [`StreamHandle::try_abort`] when this struct is dropped.
 #[derive(Default)]
 pub struct ActiveStreams {
     /// Outbound streams.
@@ -71,20 +71,20 @@ pub struct ActiveStreams {
     /// It gives us two things for free:
     /// 1. Faster access by ID.
     /// 2. Automatic reuse of freed IDs.
-    pub outbound: Slab<Node<StreamHandle>>,
+    pub outbound: Slab<StreamHandle>,
     /// Inbound streams.
     ///
     /// We do not control IDs of inbound streams, so we use a plain [`HashMap`].
-    pub inbound: HashMap<StreamId, Node<StreamHandle>>,
+    pub inbound: HashMap<StreamId, StreamHandle>,
 }
 
 impl Drop for ActiveStreams {
     fn drop(&mut self) {
         for stream in self.outbound.drain() {
-            stream.modify(StreamHandle::abort);
+            stream.try_abort();
         }
         for (_, stream) in self.inbound.drain() {
-            stream.modify(StreamHandle::abort);
+            stream.try_abort();
         }
     }
 }

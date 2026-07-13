@@ -1,5 +1,5 @@
 use std::{
-    fmt, io,
+    io,
     num::NonZeroU32,
     ops::Not,
     task::{Poll, Waker},
@@ -9,171 +9,284 @@ use bytes::Bytes;
 
 use crate::{
     error::StreamError,
-    rr_bus::MaybeReady,
-    stream::{StateFlags, waker::WakerSlot},
+    stream::{FinState, waker::WakerSlot},
 };
 
-pub struct Outbound {
-    data: Bytes,
-    recv_window: u32,
-    frame_limit: NonZeroU32,
-    state: StateFlags,
-    writer: WakerSlot,
-}
+pub struct OutboundTraffic(OutboundState);
 
-impl Outbound {
-    pub fn new(recv_window: u32, frame_limit: NonZeroU32) -> Self {
-        Self {
-            data: Default::default(),
-            recv_window,
+impl OutboundTraffic {
+    pub fn new(frame_limit: NonZeroU32, recv_window: u32) -> Self {
+        Self(OutboundState::Open {
+            ready_data: Default::default(),
             frame_limit,
-            state: Default::default(),
+            recv_window,
             writer: Default::default(),
-        }
+        })
     }
 
-    pub fn is_dead(&self) -> bool {
-        self.state.fin_sent && self.state.fin_received
-    }
-
-    pub fn read_update(&mut self) -> (Bytes, bool) {
-        match self.state {
-            StateFlags { fin_sent: true, .. } => Default::default(),
-            StateFlags {
-                local_closed,
-                fin_received: false,
-                ..
+    /// Polls the next outbound traffic update.
+    ///
+    /// Returns ready outbound frame data and `FIN_WRITE`.
+    ///
+    /// Notes:
+    /// 1. If `FIN_WRITE` has already been sent, this method will return `([], false)`.
+    /// 2. This method is not responsible for registering [`Waker`] for updates.
+    pub fn poll_update(&mut self) -> Poll<(Bytes, bool)> {
+        match &mut self.0 {
+            OutboundState::Open {
+                ready_data,
+                frame_limit,
+                recv_window,
+                writer,
             } => {
-                let chunk = self
-                    .recv_window
-                    .min(self.frame_limit.get())
-                    .min(u32::try_from(self.data.len()).unwrap_or(u32::MAX));
-                self.recv_window -= chunk;
-                let data = self.data.split_to(crate::safe_cast_usize(chunk));
-                let fin_write = if self.data.is_empty() {
-                    self.writer.wake();
-                    if local_closed {
-                        self.state.fin_sent = true;
-                        true
-                    } else {
-                        false
-                    }
+                if ready_data.is_empty() || *recv_window == 0 {
+                    return Poll::Pending;
+                }
+                let chunk_len = u32::try_from(ready_data.len())
+                    .unwrap_or(u32::MAX)
+                    .min(*recv_window)
+                    .min(frame_limit.get());
+                *recv_window -= chunk_len;
+                let chunk = ready_data.split_to(crate::safe_cast_usize(chunk_len));
+                if ready_data.is_empty() {
+                    writer.wake();
+                }
+                Poll::Ready((chunk, false))
+            },
+
+            OutboundState::HalfClosed {
+                ready_data,
+                frame_limit,
+                recv_window,
+                writer,
+            } => {
+                if *recv_window == 0 {
+                    return Poll::Pending;
+                }
+                let chunk_len = u32::try_from(ready_data.len())
+                    .unwrap_or(u32::MAX)
+                    .min(*recv_window)
+                    .min(frame_limit.get());
+                *recv_window -= chunk_len;
+                let chunk = ready_data.split_to(crate::safe_cast_usize(chunk_len));
+                let fin = if ready_data.is_empty() {
+                    writer.wake();
+                    self.0 = OutboundState::Closed {
+                        recv_window: *recv_window,
+                        fin_state: FinState {
+                            sent: true,
+                            received: false,
+                        },
+                    };
+                    true
                 } else {
                     false
                 };
-                (data, fin_write)
+                Poll::Ready((chunk, fin))
             },
-            StateFlags {
-                fin_sent: false,
-                fin_received: true,
+
+            OutboundState::Closed {
+                fin_state: FinState { sent: true, .. },
                 ..
-            } => {
-                self.state.fin_sent = true;
-                (Default::default(), true)
+            } => Poll::Pending,
+
+            OutboundState::Closed { fin_state, .. } => {
+                fin_state.sent = true;
+                Poll::Ready((Default::default(), true))
             },
         }
     }
 
-    pub fn received_window_update(&mut self, update: u32) -> Result<(), StreamError> {
-        if update == 0 {
-            return Ok(());
-        }
-        if self.state.fin_received {
-            return Err("sent a non-empty WINDOW_UPDATE frame after FIN_READ".into());
-        }
-        self.recv_window = self
-            .recv_window
-            .checked_add(update)
-            .ok_or("sent a WINDOW_UPDATE frame that would overflow the window")?;
-        Ok(())
-    }
-
-    pub fn received_fin_read(&mut self) -> Result<(), StreamError> {
-        if self.state.fin_received {
-            return Err("sent duplicate FIN_READ".into());
-        }
-        self.state.fin_received = true;
-        self.data = Default::default();
-        self.writer.wake();
-        Ok(())
+    pub fn close_writing(&mut self, updates_poller: &mut WakerSlot) {
+        let OutboundState::Open {
+            ready_data,
+            frame_limit,
+            recv_window,
+            writer,
+        } = &mut self.0
+        else {
+            return;
+        };
+        let new_state = if ready_data.is_empty() {
+            updates_poller.wake();
+            OutboundState::Closed {
+                recv_window: *recv_window,
+                fin_state: FinState {
+                    sent: false,
+                    received: false,
+                },
+            }
+        } else {
+            OutboundState::HalfClosed {
+                ready_data: std::mem::take(ready_data),
+                frame_limit: *frame_limit,
+                recv_window: *recv_window,
+                writer: std::mem::take(writer),
+            }
+        };
+        self.0 = new_state;
     }
 
     pub fn poll_write_ready(&mut self, waker: &Waker) -> Poll<io::Result<()>> {
-        match self.state {
-            StateFlags {
-                local_closed: false,
-                fin_sent: false,
-                fin_received: false,
-            } => self.poll_flushed(waker).map(Ok),
-            StateFlags { .. } => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
-        }
-    }
-
-    pub fn poll_flushed(&mut self, waker: &Waker) -> Poll<()> {
-        if self.data.is_empty() {
-            Poll::Ready(())
+        let OutboundState::Open {
+            ready_data, writer, ..
+        } = &mut self.0
+        else {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        };
+        if ready_data.is_empty() {
+            Poll::Ready(Ok(()))
         } else {
-            self.writer.register(waker);
+            writer.register(waker);
             Poll::Pending
         }
     }
 
-    pub fn write(&mut self, data: Bytes) -> io::Result<()> {
-        match self.state {
-            StateFlags {
-                local_closed: false,
-                fin_sent: false,
-                fin_received: false,
+    pub fn poll_flushed(&mut self, waker: &Waker) -> Poll<()> {
+        match &mut self.0 {
+            OutboundState::Open {
+                ready_data, writer, ..
             } => {
-                if self.data.is_empty() {
-                    self.data = data;
-                    Ok(())
+                if ready_data.is_empty() {
+                    Poll::Ready(())
                 } else {
-                    Err(io::Error::other("sink not ready"))
+                    writer.register(waker);
+                    Poll::Pending
                 }
             },
-            StateFlags { .. } => Err(io::ErrorKind::BrokenPipe.into()),
+
+            OutboundState::HalfClosed { writer, .. } => {
+                writer.register(waker);
+                Poll::Pending
+            },
+
+            OutboundState::Closed { .. } => Poll::Ready(()),
         }
     }
 
-    pub fn close_writing(&mut self) {
-        self.state.local_closed = true;
+    pub fn write(&mut self, data: Bytes, updates_poller: &mut WakerSlot) -> io::Result<()> {
+        let OutboundState::Open {
+            ready_data,
+            recv_window,
+            ..
+        } = &mut self.0
+        else {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        };
+        if ready_data.is_empty().not() {
+            return Err(io::Error::other("pipe not ready"));
+        }
+        *ready_data = data;
+        if ready_data.is_empty().not() && *recv_window > 0 {
+            updates_poller.wake();
+        }
+        Ok(())
     }
-}
 
-impl MaybeReady for Outbound {
-    fn is_ready(&self) -> bool {
-        match self.state {
-            StateFlags {
-                local_closed: false,
-                fin_received: false,
+    pub fn received_fin_read(&mut self, updates_poller: &mut WakerSlot) -> Result<(), StreamError> {
+        match &mut self.0 {
+            OutboundState::Open {
+                writer,
+                recv_window,
                 ..
-            } => self.data.is_empty().not() && self.recv_window > 0,
-
-            StateFlags {
-                local_closed: true,
-                fin_received: false,
-                fin_sent: false,
-            } => self.data.is_empty() || self.recv_window > 0,
-
-            StateFlags {
-                fin_received: true,
-                fin_sent: false,
+            }
+            | OutboundState::HalfClosed {
+                writer,
+                recv_window,
                 ..
-            } => true,
+            } => {
+                writer.wake();
+                updates_poller.wake();
+                self.0 = OutboundState::Closed {
+                    recv_window: *recv_window,
+                    fin_state: FinState {
+                        sent: false,
+                        received: true,
+                    },
+                };
+                Ok(())
+            },
 
-            StateFlags { .. } => false,
+            OutboundState::Closed { fin_state, .. } => {
+                if fin_state.received {
+                    return Err(StreamError("sent duplicate FIN_READ"));
+                }
+                fin_state.received = true;
+                Ok(())
+            },
+        }
+    }
+
+    pub fn received_window_update(
+        &mut self,
+        update: u32,
+        updates_poller: &mut WakerSlot,
+    ) -> Result<(), StreamError> {
+        if update == 0 {
+            return Ok(());
+        }
+
+        match &mut self.0 {
+            OutboundState::Open {
+                ready_data,
+                recv_window,
+                ..
+            }
+            | OutboundState::HalfClosed {
+                ready_data,
+                recv_window,
+                ..
+            } => {
+                *recv_window = recv_window
+                    .checked_add(update)
+                    .ok_or(StreamError("triggered receive window overflow"))?;
+                if *recv_window == update && ready_data.is_empty().not() {
+                    updates_poller.wake();
+                }
+                Ok(())
+            },
+            OutboundState::Closed {
+                recv_window,
+                fin_state,
+            } => {
+                if fin_state.received {
+                    return Err(StreamError("sent window update after FIN_READ"));
+                }
+                *recv_window = recv_window
+                    .checked_add(update)
+                    .ok_or(StreamError("triggered receive window overflow"))?;
+                Ok(())
+            },
+        }
+    }
+
+    pub fn fin_state(&self) -> FinState {
+        match &self.0 {
+            OutboundState::Open { .. } | OutboundState::HalfClosed { .. } => FinState::default(),
+            OutboundState::Closed { fin_state, .. } => *fin_state,
         }
     }
 }
 
-impl fmt::Debug for Outbound {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Outbound")
-            .field("data_len", &self.data.len())
-            .field("recv_window", &self.recv_window)
-            .field("frame_limit", &self.frame_limit)
-            .field("state", &self.state)
-            .finish()
-    }
+enum OutboundState {
+    /// Traffic direction is fully open.
+    Open {
+        ready_data: Bytes,
+        frame_limit: NonZeroU32,
+        recv_window: u32,
+        writer: WakerSlot,
+    },
+    /// Local writer closed, but there's still data to be flushed.
+    HalfClosed {
+        /// Never empty.
+        ready_data: Bytes,
+        frame_limit: NonZeroU32,
+        recv_window: u32,
+        writer: WakerSlot,
+    },
+    /// One of the sides closed and there's no pending data.
+    Closed {
+        recv_window: u32,
+        fin_state: FinState,
+    },
 }

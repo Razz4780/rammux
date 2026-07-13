@@ -12,13 +12,13 @@ use crate::{
     error::{ErrorKind, RammuxError},
 };
 
-/// [`Future`] that handles the Rammux connection downgrade.
+/// [`Future`] that handles the rammux connection downgrade.
 ///
 /// Resolves to the IO transport originally passed to the [`RammuxConnection`](super::RammuxConnection).
-/// Returned transport is clean, meaning that it has no unread Rammux protocol bytes.
+/// Returned transport is clean, meaning that it has no unread rammux protocol bytes.
 ///
 /// This future should be polled to completion in order to avoid errors on the other side.
-#[must_use = "downgrade should be polled to unblock the Rammux peer"]
+#[must_use = "downgrade should be polled to unblock the rammux peer"]
 pub struct Downgraded<IO> {
     /// Recovered from [`Active::codec`](super::state::Active::codec).
     codec: Option<RammuxCodec<IO>>,

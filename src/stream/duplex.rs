@@ -1,15 +1,16 @@
 use std::{
     io,
     pin::Pin,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
 use bytes::Bytes;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 
-use crate::{StreamId, rr_bus::Node, stream::StreamHandle};
+use crate::{StreamId, stream::SharedStreamState};
 
-/// Bidirectional virtual data stream created within a Rammux connection.
+/// Bidirectional virtual data stream created within a rammux connection.
 ///
 /// Dropping it will close the stream.
 ///
@@ -78,7 +79,7 @@ impl Sink<Bytes> for RammuxDuplex {
 /// Note that the data can still be lost if the connection fails.
 pub struct RammuxSink {
     pub(super) id: StreamId,
-    pub(super) node: Option<Node<StreamHandle>>,
+    pub(super) state: Option<Arc<Mutex<SharedStreamState>>>,
 }
 
 impl RammuxSink {
@@ -93,58 +94,73 @@ impl Sink<Bytes> for RammuxSink {
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
-        this.node
-            .as_ref()
-            .ok_or(io::ErrorKind::BrokenPipe)?
-            .inspect(|handle| handle.outbound.poll_write_ready(cx.waker()))
-            .map_err(|error| {
-                this.node = None;
-                error
-            })
+        let state = this.state.as_ref().ok_or(io::ErrorKind::BrokenPipe)?;
+        let result = std::task::ready!(state.lock().unwrap().outbound.poll_write_ready(cx.waker()));
+        if result.is_err() {
+            this.state = None;
+        }
+        Poll::Ready(result)
     }
 
     fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
         let this = self.get_mut();
-        this.node
-            .as_ref()
-            .ok_or(io::ErrorKind::BrokenPipe)?
-            .modify(|handle| handle.outbound.write(item))
-            .inspect_err(|_| {
-                this.node = None;
-            })
+        let state = this.state.as_ref().ok_or(io::ErrorKind::BrokenPipe)?;
+        let mut guard = state.lock().unwrap();
+        let SharedStreamState {
+            outbound,
+            updates_poller,
+            ..
+        } = &mut *guard;
+        let result = outbound.write(item, updates_poller);
+        drop(guard);
+        if result.is_err() {
+            this.state = None;
+        }
+        result
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.get_mut()
-            .node
+            .state
             .as_ref()
-            .map(|node| node.inspect(|handle| handle.outbound.poll_flushed(cx.waker())))
+            .map(|state| state.lock().unwrap().outbound.poll_flushed(cx.waker()))
             .unwrap_or(Poll::Ready(()))
             .map(Ok)
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
-        let Some(node) = &this.node else {
+        let Some(state) = &this.state else {
             return Poll::Ready(Ok(()));
         };
-        node.modify(|handle| {
-            handle.outbound.close_writing();
-            handle.outbound.poll_flushed(cx.waker())
-        })
-        .map(|()| {
-            this.node = None;
-            Ok(())
-        })
+        let mut guard = state.lock().unwrap();
+        let SharedStreamState {
+            outbound,
+            updates_poller,
+            ..
+        } = &mut *guard;
+        outbound.close_writing(updates_poller);
+        std::task::ready!(outbound.poll_flushed(cx.waker()));
+        drop(guard);
+        this.state = None;
+        Poll::Ready(Ok(()))
     }
 }
 
 impl Drop for RammuxSink {
     fn drop(&mut self) {
-        let Some(node) = self.node.take() else {
+        let Some(state) = self.state.take() else {
             return;
         };
-        node.modify(|handle| handle.outbound.close_writing());
+        let Ok(mut guard) = state.lock() else {
+            return;
+        };
+        let SharedStreamState {
+            outbound,
+            updates_poller,
+            ..
+        } = &mut *guard;
+        outbound.close_writing(updates_poller);
     }
 }
 
@@ -153,7 +169,7 @@ impl Drop for RammuxSink {
 /// Dropping it will close reading on the stream.
 pub struct RammuxStream {
     pub(super) id: StreamId,
-    pub(super) node: Option<Node<StreamHandle>>,
+    pub(super) state: Option<Arc<Mutex<SharedStreamState>>>,
 }
 
 impl RammuxStream {
@@ -168,13 +184,20 @@ impl Stream for RammuxStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        let Some(node) = &this.node else {
+        let Some(state) = &this.state else {
             return Poll::Ready(None);
         };
 
-        let data = std::task::ready!(node.modify(|handle| handle.inbound.poll_read(cx.waker())));
+        let mut guard = state.lock().unwrap();
+        let SharedStreamState {
+            inbound,
+            updates_poller,
+            ..
+        } = &mut *guard;
+        let data = std::task::ready!(inbound.poll_read(cx.waker(), updates_poller));
+        drop(guard);
         if data.is_none() {
-            this.node = None;
+            this.state = None;
         }
         Poll::Ready(data.map(From::from))
     }
@@ -182,9 +205,17 @@ impl Stream for RammuxStream {
 
 impl Drop for RammuxStream {
     fn drop(&mut self) {
-        let Some(node) = self.node.take() else {
+        let Some(state) = self.state.take() else {
             return;
         };
-        node.modify(|handle| handle.inbound.close_reading());
+        let Ok(mut guard) = state.lock() else {
+            return;
+        };
+        let SharedStreamState {
+            inbound,
+            updates_poller,
+            ..
+        } = &mut *guard;
+        inbound.close_reading(updates_poller);
     }
 }

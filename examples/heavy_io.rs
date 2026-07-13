@@ -29,11 +29,11 @@ struct Args {
     transport: TransportKind,
     /// Size for the optional read buffer to apply on top of the IO transport.
     ///
-    /// Rammux decoder makes a lot of small reads,
+    /// rammux decoder makes a lot of small reads,
     /// so using a read buffer might improve performance.
     #[arg(long)]
     read_buffer: Option<usize>,
-    /// Size of data chunk used when writing to a Rammux stream or the raw connection.
+    /// Size of data chunk used when writing to a rammux stream or the raw connection.
     #[arg(long, default_value_t = 64 * 1024)]
     chunk_size: usize,
     #[command(subcommand)]
@@ -42,7 +42,7 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run two sides of a Rammux connection.
+    /// Run two sides of a rammux connection.
     Rammux {
         /// How many streams should be started within the connection.
         ///
@@ -71,7 +71,7 @@ enum TransportKind {
     Memory,
 }
 
-/// This example presents Rammux implementation performance.
+/// This example presents rammux implementation performance.
 ///
 /// See `--help` output for more info.
 #[tokio::main]
