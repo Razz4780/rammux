@@ -27,8 +27,7 @@ or QUIC.
 - fair round-robin scheduling and data framing across ready streams
 - graceful downgrade back to the original transport
 
-The crate is transport-agnostic.
-If it implements `AsyncRead + AsyncWrite + Unpin`, it can carry rammux.
+The crate is transport-agnostic. If the type implements async reads and writes, it can carry rammux.
 
 ## Mental model
 
@@ -40,7 +39,7 @@ While you do that, the driver:
 1. reads inbound frames,
 2. writes outbound frames,
 3. yields new inbound streams,
-4. initiates and handles `PING` exchanges, and
+4. initiates and handles `PING` exchanges.
 
 Each accepted or created stream is represented as `RammuxDuplex`, which
 implements:
