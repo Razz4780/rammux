@@ -6,7 +6,7 @@ rammux multiplexes many virtual bidirectional byte streams over one ordered byte
 transport. The underlying transport is expected to be a reliable full-duplex
 byte stream.
 
-Inspired by [yammux](https://github.com/hashicorp/yamux).
+Inspired by [Yamux](https://github.com/hashicorp/yamux).
 
 ## Session preconditions
 
