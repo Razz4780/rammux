@@ -17,6 +17,8 @@ mod duplex;
 pub(crate) mod handle;
 mod inbound;
 mod outbound;
+#[cfg(test)]
+mod test;
 pub(crate) mod updates;
 mod waker;
 
@@ -63,7 +65,7 @@ struct SharedStreamState {
 }
 
 /// Represents the current `FIN_*` state of a virtual stream or one of its traffic directions.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FinState {
     sent: bool,
     received: bool,
