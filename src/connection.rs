@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use async_selector::selector::Selector;
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -71,7 +72,6 @@ pub struct RammuxConnection<IO> {
     state: ConnState<IO>,
     role: RammuxRole,
     config: RammuxConfig,
-    global_pool: GlobalPool,
 }
 
 impl<IO> RammuxConnection<IO>
@@ -84,14 +84,13 @@ where
             state: ConnState::Active(Active {
                 codec: RammuxCodec::new(io, config.frame_limit),
                 streams: Default::default(),
-                selector: Default::default(),
+                selector: Selector::new(GlobalPool {
+                    rtt: None,
+                    available: config.global_recv_window,
+                }),
                 out_pings: OutboundPings::new(config.ping_interval),
                 in_ping: None,
             }),
-            global_pool: GlobalPool {
-                rtt: None,
-                available: config.global_recv_window,
-            },
             config,
             role,
         }
@@ -132,7 +131,7 @@ where
                 is_response: true,
             } => {
                 let elapsed = active.out_pings.received_response(payload)?;
-                self.global_pool.rtt = Some(elapsed);
+                active.selector.strategy_mut().rtt = Some(elapsed);
                 RammuxProgress::Empty
             },
 
@@ -267,11 +266,7 @@ where
                 continue;
             }
 
-            if let Poll::Ready(Some((update, fin_state))) = active
-                .selector
-                .with_ext(&(), &mut self.global_pool)
-                .poll_next_unpin(cx)
-            {
+            if let Poll::Ready(Some((update, fin_state))) = active.selector.poll_next_unpin(cx) {
                 let id = update.id;
                 let item = EncoderItem::from(update);
                 active.codec.start_send_unpin(item)?;
@@ -380,15 +375,18 @@ where
 
     /// Returns current statistics of this connection.
     pub fn stats(&self) -> RammuxStats {
-        let (inbound_streams, outbound_streams) = self
+        let (inbound_streams, outbound_streams, rtt, available_global_recv_window) = self
             .state
             .active()
             .map(|active| {
+                let global = active.selector.strategy();
                 (
                     u32::try_from(active.streams.inbound.len())
                         .expect("we can't have more than u32 inbound streams"),
                     u32::try_from(active.streams.outbound.len())
                         .expect("we can't have more than u32 outbound streams"),
+                    global.rtt,
+                    global.available,
                 )
             })
             .unwrap_or_default();
@@ -396,8 +394,8 @@ where
         RammuxStats {
             inbound_streams,
             outbound_streams,
-            rtt: self.global_pool.rtt,
-            available_global_recv_window: self.global_pool.available,
+            rtt,
+            available_global_recv_window,
         }
     }
 }

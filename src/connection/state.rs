@@ -8,6 +8,7 @@ use crate::{
     codec::RammuxCodec,
     connection::{downgrade::Downgraded, pings::OutboundPings},
     error::ErrorKind,
+    global_pool::GlobalPool,
     header::PingPayload,
     stream::{handle::StreamHandle, updates::StreamUpdates},
 };
@@ -55,7 +56,7 @@ impl<IO> ConnState<IO> {
 pub struct Active<IO> {
     pub codec: RammuxCodec<IO>,
     pub streams: ActiveStreams,
-    pub selector: Selector<StreamUpdates>,
+    pub selector: Selector<StreamUpdates, GlobalPool>,
     pub out_pings: OutboundPings,
     pub in_ping: Option<PingPayload>,
 }

@@ -5,7 +5,10 @@ use std::{
     task::{Context, Poll},
 };
 
-use async_selector::pollable::Pollable;
+use async_selector::{
+    selector::{BorrowedMut, Removed},
+    task::Task,
+};
 use bytes::Bytes;
 
 use crate::{
@@ -22,15 +25,16 @@ pub(crate) struct StreamUpdates {
     pub(super) state: Arc<Mutex<SharedStreamState>>,
 }
 
-impl<'a> Pollable<'a, (), GlobalPool> for StreamUpdates {
-    type Progress = (StreamUpdate, FinState);
+impl Task<GlobalPool> for StreamUpdates {
+    type Cont = (StreamUpdate, FinState);
+    type Break = (StreamUpdate, FinState);
+    type Output = (StreamUpdate, FinState);
 
     fn poll_progress(
         self: Pin<&mut Self>,
-        _: &'a (),
         global: &mut GlobalPool,
         cx: &mut Context<'_>,
-    ) -> Poll<ControlFlow<Option<Self::Progress>, Self::Progress>> {
+    ) -> Poll<ControlFlow<Self::Break, Self::Cont>> {
         let this = self.get_mut();
         let mut update = StreamUpdate {
             id: this.id,
@@ -65,12 +69,28 @@ impl<'a> Pollable<'a, (), GlobalPool> for StreamUpdates {
         let fin_state = inbound_fin.and(outbound_fin);
         let update = if fin_state.sent {
             // If we sent both fins, this stream of updates is done.
-            ControlFlow::Break(Some((update, fin_state)))
+            ControlFlow::Break((update, fin_state))
         } else {
             // Otherwise, this stream of updates should be polled again.
             ControlFlow::Continue((update, fin_state))
         };
         Poll::Ready(update)
+    }
+
+    fn transform_cont(
+        _: BorrowedMut<'_, Self>,
+        _: &mut GlobalPool,
+        value: Self::Cont,
+    ) -> Option<Self::Output> {
+        Some(value)
+    }
+
+    fn transform_break(
+        _: Removed<Self>,
+        _: &mut GlobalPool,
+        value: Self::Break,
+    ) -> Option<Self::Output> {
+        Some(value)
     }
 }
 

@@ -13,7 +13,7 @@ categories = ["network-programming"]
 rust-version = "1.95.0"
 
 [dependencies]
-async-selector = "0.3"
+async-selector = "0.4"
 bitflags = "2"
 bytes = "1"
 futures = "0.3"
