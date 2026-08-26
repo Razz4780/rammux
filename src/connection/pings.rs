@@ -63,7 +63,7 @@ impl OutboundPings {
                 std::task::ready!(self.sleep.poll_unpin(cx));
                 let now = Instant::now();
                 self.state = State::ReadyToSend { since: now };
-                self.sleep.as_mut().reset(Instant::now() + self.timeout);
+                self.sleep.as_mut().reset(now + self.timeout);
                 let result = match self.sleep.poll_unpin(cx) {
                     Poll::Ready(()) => Err(ErrorKind::PingSendTimeout {
                         elapsed: now.elapsed(),
