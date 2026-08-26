@@ -20,6 +20,7 @@ const CONFIG: RammuxConfig = RammuxConfig {
     local_recv_window: NonZeroU32::new(12).unwrap(),
     remote_recv_window: 14,
     ping_interval: Duration::from_secs(1),
+    ping_timeout: Duration::from_secs(1),
     global_recv_window: 32,
 };
 

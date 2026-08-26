@@ -74,18 +74,27 @@ pub struct RammuxConfig {
     pub remote_recv_window: u32,
     /// Interval on which `PING` frames will be sent to the peer.
     ///
-    /// This interval also determines `PING` response timeout - if we don't receive
-    /// the response before it's time to send the next `PING`, the connection fails.
+    /// rammux only allows for at most one inflight `PING` from each side.
+    /// If the previous `PING` takes longer than this interval,
+    /// the next `PING` is sent immediately after.
     ///
-    /// This value is a local know and does not have to be negotiated.
+    /// This value is a local knob and does not have to be negotiated.
     pub ping_interval: Duration,
+    /// Timeout for finishing a `PING` exchange.
+    ///
+    /// Note that this timeout is counted from the moment when [`RammuxConnection`](crate::connection::RammuxConnection)
+    /// is ready to send the `PING`, not when the `PING` is actually sent.
+    /// This makes `PING` timeouts resilient against saturated links.
+    ///
+    /// This value is a local knob and does not have to be negotiated.
+    pub ping_timeout: Duration,
     /// Size of the global local receive window shared between all streams.
     ///
     /// This pool will be used for autotuning local receive windows of streams
     /// that are limited by flow control. Such streams will "borrow" window size from the pool,
     /// allowing the remote peer to spend less time waiting on window updates.
     ///
-    /// This value is a local know and does not have to be negotiated.
+    /// This value is a local knob and does not have to be negotiated.
     pub global_recv_window: usize,
 }
 
@@ -100,7 +109,8 @@ impl RammuxConfig {
     /// 2. [`Self::max_inbound_streams`] and [`Self::max_outbound_streams`] - 128
     /// 3. [`Self::local_recv_window`] and [`Self::remote_recv_window`] - 64kb
     /// 4. [`Self::ping_interval`] - 5s
-    /// 5. [`Self::global_recv_window`] - 4mb
+    /// 5. [`Self::ping_timeout`] - 10s
+    /// 6. [`Self::global_recv_window`] - 4mb
     pub const fn new() -> Self {
         Self {
             frame_limit: NonZeroU32::new(16 * 1024).unwrap(),
@@ -109,6 +119,7 @@ impl RammuxConfig {
             local_recv_window: NonZeroU32::new(64 * 1024).unwrap(),
             remote_recv_window: 64 * 1024,
             ping_interval: Duration::from_secs(5),
+            ping_timeout: Duration::from_secs(10),
             global_recv_window: 4 * 1024 * 1024,
         }
     }
