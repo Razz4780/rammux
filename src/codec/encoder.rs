@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, ops::Not};
 
 use bytes::{Buf, Bytes};
 
@@ -101,6 +101,13 @@ impl EncoderItem {
             data,
             consumed: 0,
         }
+    }
+
+    pub fn has_partially_read_chunk(&self) -> bool {
+        (self.consumed == 0
+            || self.consumed == RawHeader::LEN
+            || self.consumed == RawHeader::LEN * 2 && self.data.is_empty())
+        .not()
     }
 }
 
@@ -299,5 +306,84 @@ mod test {
         assert_eq!(item.chunk(), &[]);
         let mut slices = [io::IoSlice::new(&[]); 4];
         assert_eq!(item.chunks_vectored(&mut slices), 0);
+    }
+
+    #[rstest]
+    #[case::window_update_partially_read(
+        EncoderItem::new_window_update(
+            StreamId::from_be_bytes([4, 3, 2]),
+            ControlFlags {
+                syn: true,
+                fin_read: true,
+                fin_write: false,
+            },
+            2137,
+        ),
+        1,
+        true,
+    )]
+    #[case::data_partially_read(
+        EncoderItem::new_data(
+            StreamId::from_be_bytes([71, 99, 21]),
+            ControlFlags {
+                syn: false,
+                fin_read: false,
+                fin_write: true,
+            },
+            Bytes::from_static(b"9999"),
+        ),
+        RawHeader::LEN,
+        true,
+    )]
+    #[case::both_with_first_header_read(
+        EncoderItem::new_window_update_and_data(
+            StreamId::from_be_bytes([7, 6, 5]),
+            ControlFlags {
+                syn: true,
+                fin_read: true,
+                fin_write: true,
+            },
+            12,
+            Bytes::from_static(b"2137"),
+        ),
+        RawHeader::LEN,
+        false,
+    )]
+    #[case::both_with_first_header_read_partially(
+        EncoderItem::new_window_update_and_data(
+            StreamId::from_be_bytes([7, 6, 5]),
+            ControlFlags {
+                syn: true,
+                fin_read: true,
+                fin_write: true,
+            },
+            12,
+            Bytes::from_static(b"2137"),
+        ),
+        RawHeader::LEN - 2,
+        true,
+    )]
+    #[case::both_with_first_headers_read(
+        EncoderItem::new_window_update_and_data(
+            StreamId::from_be_bytes([7, 6, 5]),
+            ControlFlags {
+                syn: true,
+                fin_read: true,
+                fin_write: true,
+            },
+            12,
+            Bytes::from_static(b"2137"),
+        ),
+        RawHeader::LEN * 2,
+        true,
+    )]
+    #[test]
+    fn partially_read(
+        #[case] mut item: EncoderItem,
+        #[case] advance_by: usize,
+        #[case] is_partially_read: bool,
+    ) {
+        item.advance(advance_by);
+        assert_eq!(item.has_partially_read_chunk(), is_partially_read,);
     }
 }

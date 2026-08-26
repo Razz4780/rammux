@@ -188,6 +188,25 @@ impl<IO> RammuxCodec<IO>
 where
     IO: AsyncWrite + Unpin,
 {
+    /// Enqueues the given [`EncoderItem`] for transfer.
+    ///
+    /// In contrast to [`Sink::start_send`], this puts the new item
+    /// as close to the head of the queue as possible.
+    ///
+    /// This is used to handle `PING` frames as quickly as possible.
+    pub fn start_send_priority(&mut self, item: EncoderItem) {
+        if self.encoder_queue_full() {
+            panic!("frame encoder is busy");
+        }
+        let head = self
+            .encoder_queue
+            .pop_front_if(|head| head.has_partially_read_chunk());
+        self.encoder_queue.push_front(item);
+        if let Some(head) = head {
+            self.encoder_queue.push_front(head);
+        }
+    }
+
     fn encoder_queue_full(&self) -> bool {
         self.encoder_queue.len() >= ENCODER_QUEUE_CAPACITY
     }
