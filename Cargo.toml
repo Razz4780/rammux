@@ -10,7 +10,7 @@ description = "Asynchronous stream multiplexer"
 publish = true
 keywords = ["multiplexer", "network", "protocol"]
 categories = ["network-programming"]
-rust-version = "1.95.0"
+rust-version = "1.93.1"
 
 [dependencies]
 async-selector = "0.4"
