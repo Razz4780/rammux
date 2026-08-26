@@ -11,86 +11,221 @@ use crate::{error::ErrorKind, header::PingPayload};
 
 /// Tracks the state of `PING` exchanges initiated by us.
 pub struct OutboundPings {
-    /// Set to elapse when it's time to send the next `PING`.
+    /// Used to sleep until it's time to send or timeout a `PING`.
     sleep: Pin<Box<Sleep>>,
     /// Interval on which we send `PING`s.
     interval: Duration,
+    /// `PING` timeout.
+    timeout: Duration,
     /// `PING` state machine.
     state: State,
 }
 
-enum State {
-    /// We're waiting to send the next `PING` frame.
-    WaitingToSend,
-    /// We should send the next `PING` frame now.
-    ReadyToSend,
-    /// We've sent the `PING` frame and we're waiting for the response.
-    Sent(PingPayload, Instant),
-}
-
 impl OutboundPings {
-    /// Creates a new instance, configured to send `PING`s on the given interval.
-    pub fn new(interval: Duration) -> Self {
+    /// Creates a new instance, configured to send `PING`s on the given interval
+    /// and with the given timeout.
+    pub fn new(interval: Duration, timeout: Duration) -> Self {
         Self {
             sleep: Box::pin(tokio::time::sleep(Duration::ZERO)),
             interval,
-            state: State::ReadyToSend,
+            timeout,
+            state: State::WaitingToSend,
         }
     }
 
-    /// Polls for readiness to send the next `PING` frame.
+    /// If a `PING` is ready to be sent, returns it.
     ///
-    /// If this method fails, this instance becomes invalid and should no longer be used.
+    /// This struct will consider the `PING` to be sent.
+    pub fn take_ready(&mut self) -> Option<PingPayload> {
+        match &mut self.state {
+            State::WaitingToSend | State::WaitingForResponse { .. } => None,
+            State::ReadyToSend { since } => {
+                let payload = PingPayload::random();
+                let now = Instant::now();
+                self.state = State::WaitingForResponse {
+                    ready_since: *since,
+                    sent_at: now,
+                    payload,
+                };
+                Some(payload)
+            },
+        }
+    }
+
+    /// Polls progress on this state machine.
     ///
-    /// # Returns
+    /// Returns when the next `PING` is ready to be sent.
     ///
-    /// * [`Ok`] if we should send `PING`.
-    /// * [`Err`] if we did not receive the response on time.
-    pub fn poll_should_send(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ErrorKind>> {
+    /// If this method returns an error, this struct should no longer be used.
+    pub fn poll_progress(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ErrorKind>> {
         match &mut self.state {
             State::WaitingToSend => {
                 std::task::ready!(self.sleep.poll_unpin(cx));
-                self.state = State::ReadyToSend;
-                Poll::Ready(Ok(()))
+                let now = Instant::now();
+                self.state = State::ReadyToSend { since: now };
+                self.sleep.as_mut().reset(Instant::now() + self.timeout);
+                let result = match self.sleep.poll_unpin(cx) {
+                    Poll::Ready(()) => Err(ErrorKind::PingSendTimeout {
+                        elapsed: now.elapsed(),
+                    }),
+                    Poll::Pending => Ok(()),
+                };
+                Poll::Ready(result)
             },
-            State::ReadyToSend => Poll::Ready(Ok(())),
-            State::Sent(payload, sent_at) => {
+            State::ReadyToSend { since } => {
                 std::task::ready!(self.sleep.poll_unpin(cx));
-                Poll::Ready(Err(ErrorKind::PingTimeout {
+                Poll::Ready(Err(ErrorKind::PingSendTimeout {
+                    elapsed: since.elapsed(),
+                }))
+            },
+            State::WaitingForResponse {
+                payload,
+                ready_since,
+                ..
+            } => {
+                std::task::ready!(self.sleep.poll_unpin(cx));
+                Poll::Ready(Err(ErrorKind::PingResponseTimeout {
                     payload: *payload,
-                    elapsed: sent_at.elapsed(),
+                    elapsed: ready_since.elapsed(),
                 }))
             },
         }
     }
 
-    /// If we should send the next `PING` frame now, returns its payload.
-    pub fn try_collect(&mut self) -> Option<PingPayload> {
-        match &mut self.state {
-            State::ReadyToSend => {
-                let payload = PingPayload::random();
-                let now = Instant::now();
-                self.state = State::Sent(payload, now);
-                self.sleep.as_mut().reset(now + self.interval);
-                Some(payload)
-            },
-            State::WaitingToSend | State::Sent(..) => None,
-        }
-    }
-
     /// Notifies this struct that we received a `PING` response.
+    ///
+    /// Returns the `PING` exchange latency.
+    ///
+    /// If this method returns an error, this struct should no longer be used.
     pub fn received_response(&mut self, payload: PingPayload) -> Result<Duration, ErrorKind> {
         match &mut self.state {
-            State::ReadyToSend | State::WaitingToSend => Err(ErrorKind::UnexpectedPing(payload)),
-            State::Sent(expected, sent_at) => {
+            State::WaitingToSend | State::ReadyToSend { .. } => {
+                Err(ErrorKind::UnexpectedPing(payload))
+            },
+            State::WaitingForResponse {
+                sent_at,
+                payload: expected,
+                ..
+            } => {
                 if *expected != payload {
                     Err(ErrorKind::UnexpectedPing(payload))
                 } else {
                     let elapsed = sent_at.elapsed();
+                    self.sleep.as_mut().reset(*sent_at + self.interval);
                     self.state = State::WaitingToSend;
                     Ok(elapsed)
                 }
             },
+        }
+    }
+}
+
+/// Outbound `PINGS` state machine.
+enum State {
+    /// Waiting to send the next `PING`.
+    ///
+    /// [`OutboundPings::sleep`] set to elapse when the time comes.
+    WaitingToSend,
+    /// Ready to send the next `PING`.
+    ///
+    /// [`OutboundPings::sleep`] set to elapse when the `PING` times out.
+    ReadyToSend {
+        /// Time when the `PING` was ready to be sent.
+        ///
+        /// Timeout is tracked from this point in time.
+        since: Instant,
+    },
+    /// Waiting for a `PING` response.
+    ///
+    /// [`OutboundPings::sleep`] set to elapse when the `PING` times out.
+    WaitingForResponse {
+        /// Time when the `PING` was ready to be sent.
+        ///
+        /// Timeout is tracked from this point in time.
+        ready_since: Instant,
+        /// Time when the `PING` was sent.
+        ///
+        /// Used to measure latency.
+        sent_at: Instant,
+        /// Payload of the sent `PING`.
+        ///
+        /// Used to verify the response.
+        payload: PingPayload,
+    },
+}
+
+#[cfg(test)]
+mod test {
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
+    use crate::connection::pings::OutboundPings;
+
+    #[tokio::test(start_paused = true)]
+    async fn pings_within_interval() {
+        let mut state = OutboundPings::new(Duration::from_secs(5), Duration::from_secs(10));
+        let now = Instant::now();
+        for ready_at in [
+            now,
+            now + Duration::from_secs(5),
+            now + Duration::from_secs(10),
+        ] {
+            futures::future::poll_fn(|cx| state.poll_progress(cx))
+                .await
+                .unwrap();
+            let payload = state.take_ready().unwrap();
+            assert_eq!(Instant::now(), ready_at);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            state.received_response(payload).unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ping_timeout_ping_not_sent() {
+        let mut state = OutboundPings::new(Duration::from_secs(5), Duration::from_secs(10));
+        let now = Instant::now();
+        futures::future::poll_fn(|cx| state.poll_progress(cx))
+            .await
+            .unwrap();
+        assert_eq!(Instant::now(), now);
+        futures::future::poll_fn(|cx| state.poll_progress(cx))
+            .await
+            .unwrap_err();
+        assert_eq!(Instant::now(), now + Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ping_timeout_ping_response_not_received() {
+        let mut state = OutboundPings::new(Duration::from_secs(5), Duration::from_secs(10));
+        let now = Instant::now();
+        futures::future::poll_fn(|cx| state.poll_progress(cx))
+            .await
+            .unwrap();
+        assert_eq!(Instant::now(), now);
+        state.take_ready().unwrap();
+        futures::future::poll_fn(|cx| state.poll_progress(cx))
+            .await
+            .unwrap_err();
+        assert_eq!(Instant::now(), now + Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ping_exceeding_interval() {
+        let mut state = OutboundPings::new(Duration::from_secs(5), Duration::from_secs(10));
+        let now = Instant::now();
+        for ready_at in [
+            now,
+            now + Duration::from_secs(6),
+            now + Duration::from_secs(12),
+        ] {
+            futures::future::poll_fn(|cx| state.poll_progress(cx))
+                .await
+                .unwrap();
+            let payload = state.take_ready().unwrap();
+            assert_eq!(Instant::now(), ready_at);
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            state.received_response(payload).unwrap();
         }
     }
 }

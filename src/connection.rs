@@ -88,7 +88,7 @@ where
                     rtt: None,
                     available: config.global_recv_window,
                 }),
-                out_pings: OutboundPings::new(config.ping_interval),
+                out_pings: OutboundPings::new(config.ping_interval, config.ping_timeout),
                 in_ping: None,
             }),
             config,
@@ -259,7 +259,7 @@ where
                 continue;
             }
 
-            if let Some(payload) = active.out_pings.try_collect() {
+            if let Some(payload) = active.out_pings.take_ready() {
                 active
                     .codec
                     .start_send_unpin(EncoderItem::new_ping(payload, false))?;
@@ -290,7 +290,11 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<RammuxProgress<IO>, ErrorKind>> {
-        let _ = self.state.active_mut()?.out_pings.poll_should_send(cx)?;
+        let _ = self
+            .state
+            .active_mut()
+            .map(|active| active.out_pings.poll_progress(cx))
+            .unwrap_or(Poll::Pending)?;
         let mut inbound = Poll::Pending;
         // Drain up to one encoder batch of inbound frames first.
         // In particular, processing multiple WINDOW_UPDATEs can make several
