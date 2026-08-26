@@ -26,4 +26,5 @@ tokio = { version = "1", features = ["net", "sync", "time"] }
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }
 rstest = "0.26"
+socket2 = "0.6"
 tokio = { version = "1", features = ["full", "test-util"] }
