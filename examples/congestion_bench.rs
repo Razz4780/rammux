@@ -165,11 +165,11 @@ struct LinkParams {
     rate_bps: f64,
     owd: Duration,
     loss: f64,
-    /// Probability that a loss burst continues per MSS (Gilbert-Elliott bad state).
-    burst_stay: f64,
+    /// Mean wall-clock duration of a loss burst.
+    burst_mean: Duration,
     /// Loss probability inside a burst.
     burst_loss: f64,
-    /// Probability of entering a burst per MSS.
+    /// Probability of entering a burst per serviced MSS.
     burst_enter: f64,
     jitter: Duration,
     sndbuf: u64,
@@ -187,7 +187,8 @@ struct DirState {
     last_delivery: Instant,
     cwnd: f64,
     ssthresh: f64,
-    in_burst: bool,
+    /// Wall-clock end of the current loss burst, if inside one.
+    burst_until: Option<Instant>,
     consecutive_rtos: u32,
     rng: Xorshift,
     closed: bool,
@@ -215,7 +216,7 @@ impl Dir {
                 last_delivery: now,
                 cwnd: (10 * MSS) as f64,
                 ssthresh: f64::INFINITY,
-                in_burst: false,
+                burst_until: None,
                 consecutive_rtos: 0,
                 rng: Xorshift(seed | 1),
                 closed: false,
@@ -248,14 +249,23 @@ impl Dir {
             };
             st.pending_bytes -= quantum.len() as u64;
 
-            // Loss process (Gilbert-Elliott, degenerates to Bernoulli).
+            // Loss process (Gilbert-Elliott with wall-clock burst duration,
+            // degenerates to Bernoulli when bursts are disabled).
             let roll = st.rng.next_f64();
-            let (loss_now, stay) = if st.in_burst {
-                (roll < p.burst_loss, st.rng.next_f64() < p.burst_stay)
+            let in_burst = st.burst_until.is_some_and(|until| now < until);
+            if !in_burst {
+                st.burst_until = None;
+                if st.rng.next_f64() < p.burst_enter {
+                    let mean = p.burst_mean.as_secs_f64();
+                    let duration = Duration::from_secs_f64(mean * (0.5 + st.rng.next_f64()));
+                    st.burst_until = Some(now + duration);
+                }
+            }
+            let loss_now = if in_burst {
+                roll < p.burst_loss
             } else {
-                (roll < p.loss, st.rng.next_f64() < p.burst_enter)
+                roll < p.loss
             };
-            st.in_burst = if st.in_burst { stay } else { stay };
 
             // Congestion window reaction and head-of-line stall.
             let rtt = p.owd.as_secs_f64() * 2.0;
@@ -469,24 +479,29 @@ fn emu_pair(args: &Args) -> (EmuStream, EmuStream, Arc<DirGauges>, Arc<DirGauges
         let loss = args.loss_pct / 100.0;
         // Gilbert-Elliott derivation: bad-state loss fixed at 50%, sojourn
         // times derived from mean burst length and long-run loss average.
-        let (burst_enter, burst_stay, burst_loss, bernoulli) = if args.loss_burst_ms > 0.0 {
-            let burst_loss = 0.5f64;
-            let quantum_ms = MSS as f64 * 8000.0 / (args.rate_mbit * 1e6);
-            let stay = (1.0 - quantum_ms / args.loss_burst_ms).clamp(0.0, 0.9999);
-            let mean_bad = 1.0 / (1.0 - stay);
-            // loss = p_bad_frac * burst_loss => p_bad_frac = loss / burst_loss
-            let bad_frac = (loss / burst_loss).min(0.5);
-            let enter = bad_frac / (mean_bad * (1.0 - bad_frac)).max(1e-9);
-            (enter.clamp(0.0, 1.0), stay, burst_loss, 0.0)
+        let (burst_enter, burst_mean, burst_loss, bernoulli) = if args.loss_burst_ms > 0.0 {
+            let burst_loss = 0.33f64;
+            // Long-run loss average: fraction of time in bursts times burst_loss.
+            // Quanta per second at full rate determines the per-quantum enter probability
+            // that yields the requested average.
+            let quanta_per_s = args.rate_mbit * 1e6 / 8.0 / MSS as f64;
+            let bursts_per_s = loss / burst_loss / (args.loss_burst_ms / 1000.0);
+            let enter = (bursts_per_s / quanta_per_s).clamp(0.0, 1.0);
+            (
+                enter,
+                Duration::from_secs_f64(args.loss_burst_ms / 1000.0),
+                burst_loss,
+                0.0,
+            )
         } else {
-            (0.0, 0.0, 0.0, loss)
+            (0.0, Duration::ZERO, 0.0, loss)
         };
         LinkParams {
             rate_bps: args.rate_mbit * 1e6 / 8.0,
             owd: Duration::from_secs_f64(args.rtt_ms / 2000.0),
             loss: bernoulli,
             burst_enter,
-            burst_stay,
+            burst_mean,
             burst_loss,
             jitter: Duration::from_secs_f64(args.jitter_ms / 1000.0),
             sndbuf: args.sndbuf_kb * 1024,
@@ -821,6 +836,7 @@ async fn main() {
                 .unwrap();
             let io_server = listener.accept().await.unwrap().0;
             for stream in [&io_client, &io_server] {
+                stream.set_nodelay(true).unwrap();
                 let sock = socket2::SockRef::from(stream);
                 sock.set_tcp_congestion(args.cc.as_bytes())
                     .expect("failed to set congestion control");
