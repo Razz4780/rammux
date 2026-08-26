@@ -39,6 +39,9 @@ pub enum DecodedFrame {
         flags: ControlFlags,
         payload: StreamPayload,
     },
+    SessionWindowUpdate {
+        update: u32,
+    },
     Terminate,
 }
 

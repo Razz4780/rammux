@@ -69,3 +69,5 @@ const fn safe_cast_usize(value: u32) -> usize {
 // clap is used in examples.
 #[cfg(test)]
 use clap as _;
+#[cfg(test)]
+use socket2 as _;

@@ -87,6 +87,38 @@ pub struct RammuxConfig {
     ///
     /// This value is a local know and does not have to be negotiated.
     pub global_recv_window: usize,
+    /// Initial size of the session-level transit window we grant to the peer.
+    ///
+    /// The transit window bounds the amount of `DATA` payload bytes that can be
+    /// in flight between the peers. Credit is returned with `SESSION_WINDOW_UPDATE`
+    /// frames as soon as data is received and stored in the muxer,
+    /// independently of when the application reads it.
+    ///
+    /// `0` disables the transit window in this direction.
+    ///
+    /// # Negotiation
+    ///
+    /// This value has to be negotiated beforehand and
+    /// must match the peer's [`RammuxConfig::remote_transit_window`].
+    pub local_transit_window: u32,
+    /// Initial size of the transit window granted to us by the peer.
+    ///
+    /// `0` means the peer does not limit our in-flight data.
+    ///
+    /// # Negotiation
+    ///
+    /// This value has to be negotiated beforehand and
+    /// must match the peer's [`RammuxConfig::local_transit_window`].
+    pub remote_transit_window: u32,
+    /// Autotune limit for the local transit window.
+    ///
+    /// This value is a local knob and does not have to be negotiated.
+    pub transit_window_max: u32,
+    /// Use a sliding-window minimum of measured RTTs for transit window autotuning,
+    /// instead of the latest sample.
+    ///
+    /// This value is a local knob and does not have to be negotiated.
+    pub transit_min_rtt_filter: bool,
 }
 
 impl RammuxConfig {
@@ -101,6 +133,8 @@ impl RammuxConfig {
     /// 3. [`Self::local_recv_window`] and [`Self::remote_recv_window`] - 64kb
     /// 4. [`Self::ping_interval`] - 5s
     /// 5. [`Self::global_recv_window`] - 4mb
+    /// 6. [`Self::local_transit_window`] and [`Self::remote_transit_window`] - 0 (disabled)
+    /// 7. [`Self::transit_window_max`] - 4mb
     pub const fn new() -> Self {
         Self {
             frame_limit: NonZeroU32::new(16 * 1024).unwrap(),
@@ -110,6 +144,10 @@ impl RammuxConfig {
             remote_recv_window: 64 * 1024,
             ping_interval: Duration::from_secs(5),
             global_recv_window: 4 * 1024 * 1024,
+            local_transit_window: 0,
+            remote_transit_window: 0,
+            transit_window_max: 4 * 1024 * 1024,
+            transit_min_rtt_filter: false,
         }
     }
 }

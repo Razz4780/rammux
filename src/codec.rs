@@ -144,6 +144,12 @@ where
                                 })));
                             },
                         },
+                        Header::SessionWindowUpdate { update } => {
+                            this.decoder = Default::default();
+                            break Poll::Ready(Some(Ok(DecodedFrame::SessionWindowUpdate {
+                                update,
+                            })));
+                        },
                         Header::Term => {
                             this.decoder = Default::default();
                             break Poll::Ready(Some(Ok(DecodedFrame::Terminate)));
@@ -332,6 +338,7 @@ mod tests {
                 },
                 payload: StreamPayload::Data(Default::default()),
             },
+            DecodedFrame::SessionWindowUpdate { update: 4096 },
             DecodedFrame::Terminate,
         ];
 
@@ -348,6 +355,9 @@ mod tests {
                             payload,
                             is_response,
                         } => EncoderItem::new_ping(*payload, *is_response),
+                        DecodedFrame::SessionWindowUpdate { update } => {
+                            EncoderItem::new_session_window_update(*update)
+                        },
                         DecodedFrame::Stream {
                             stream_id,
                             flags,

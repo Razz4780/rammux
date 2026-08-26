@@ -92,6 +92,15 @@ struct Args {
     stream_window_kb: u32,
     #[arg(long, default_value_t = 16)]
     frame_limit_kb: u32,
+    /// Transit (in-flight) window initial size, KiB. 0 disables it.
+    #[arg(long, default_value_t = 0)]
+    transit_kb: u32,
+    /// Transit window autotune limit, KiB.
+    #[arg(long, default_value_t = 4096)]
+    transit_max_kb: u32,
+    /// Use the min-RTT filter for transit window autotuning.
+    #[arg(long, default_value_t = false)]
+    transit_minrtt: bool,
 
     // ---- sampling ----
     #[arg(long, default_value_t = 500)]
@@ -517,6 +526,10 @@ fn rammux_config(args: &Args) -> RammuxConfig {
     config.remote_recv_window = args.stream_window_kb * 1024;
     config.ping_interval = Duration::from_millis(args.ping_interval_ms);
     config.global_recv_window = args.global_window_kb as usize * 1024;
+    config.local_transit_window = args.transit_kb * 1024;
+    config.remote_transit_window = args.transit_kb * 1024;
+    config.transit_window_max = args.transit_max_kb * 1024;
+    config.transit_min_rtt_filter = args.transit_minrtt;
     config
 }
 
@@ -569,11 +582,13 @@ where
                 let stats = conn.stats();
                 let rtt_ms = stats.rtt.map(|d| d.as_secs_f64() * 1e3).unwrap_or(-1.0);
                 println!(
-                    "{:.3},{role},stats,rtt_ms={rtt_ms:.2},pool_kb={},in={},out={}",
+                    "{:.3},{role},stats,rtt_ms={rtt_ms:.2},pool_kb={},in={},out={},tc_kb={},tw_kb={}",
                     started.elapsed().as_secs_f64(),
                     stats.available_global_recv_window / 1024,
                     stats.inbound_streams,
                     stats.outbound_streams,
+                    stats.transit_send_credit.map(|c| (c / 1024) as i64).unwrap_or(-1),
+                    stats.transit_recv_window.map(|w| (w / 1024) as i64).unwrap_or(-1),
                 );
             }
         }

@@ -45,9 +45,10 @@ impl RammuxError {
     /// Returns whether this error originates from a protocol violation by the other side of the connection.
     pub fn is_protocol_violation(&self) -> bool {
         match &self.0 {
-            ErrorKind::Decode(..) | ErrorKind::UnexpectedPing(..) | ErrorKind::Stream { .. } => {
-                true
-            },
+            ErrorKind::Decode(..)
+            | ErrorKind::UnexpectedPing(..)
+            | ErrorKind::Stream { .. }
+            | ErrorKind::Transit(..) => true,
             ErrorKind::Io(..)
             | ErrorKind::AlreadyDowngraded
             | ErrorKind::PingTimeout { .. }
@@ -90,6 +91,9 @@ pub enum ErrorKind {
     /// Received an unexpected `PING` frame.
     #[error("received an unexpected ping {0}")]
     UnexpectedPing(PingPayload),
+    /// rammux protocol was violated on the session-level transit window.
+    #[error("peer violated the transit window protocol: {0}")]
+    Transit(&'static str),
     /// Failed to receive a `PING` response within the configured timeout.
     #[error("ping {payload} timed out after {:.02}s", elapsed.as_secs_f32())]
     PingTimeout {

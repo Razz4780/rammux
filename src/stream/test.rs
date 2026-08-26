@@ -21,6 +21,10 @@ const CONFIG: RammuxConfig = RammuxConfig {
     remote_recv_window: 14,
     ping_interval: Duration::from_secs(1),
     global_recv_window: 32,
+    local_transit_window: 0,
+    remote_transit_window: 0,
+    transit_window_max: 4 * 1024 * 1024,
+    transit_min_rtt_filter: false,
 };
 
 fn new_stream(
@@ -107,6 +111,7 @@ async fn local_receive_window_is_autotuned() {
     let (mut handle, mut selector, mut duplex) = new_stream(GlobalPool {
         rtt: None,
         available: CONFIG.local_recv_window.get() as usize * 4,
+        ..Default::default()
     });
 
     for _ in 0..5 {

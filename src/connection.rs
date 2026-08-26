@@ -4,6 +4,7 @@ use std::{
     collections::hash_map::Entry,
     convert::Infallible,
     io,
+    num::NonZeroU32,
     task::{Context, Poll},
     time::Duration,
 };
@@ -24,7 +25,7 @@ use crate::{
         state::{Active, ConnState},
     },
     error::{ErrorKind, RammuxError},
-    global_pool::GlobalPool,
+    global_pool::{GlobalPool, TransitRecv, TransitSend},
     stream::RammuxDuplex,
     stream_id::StreamId,
 };
@@ -87,6 +88,17 @@ where
                 selector: Selector::new(GlobalPool {
                     rtt: None,
                     available: config.global_recv_window,
+                    min_rtt: Default::default(),
+                    transit_send: (config.remote_transit_window > 0).then(|| TransitSend {
+                        credit: config.remote_transit_window,
+                    }),
+                    transit_recv: NonZeroU32::new(config.local_transit_window).map(|initial| {
+                        TransitRecv::new(
+                            initial,
+                            config.transit_window_max,
+                            config.transit_min_rtt_filter,
+                        )
+                    }),
                 }),
                 out_pings: OutboundPings::new(config.ping_interval),
                 in_ping: None,
@@ -115,7 +127,37 @@ where
             .ok_or(io::ErrorKind::UnexpectedEof)
             .map_err(io::Error::from)??;
 
+        if let DecodedFrame::Stream {
+            payload: StreamPayload::Data(data),
+            ..
+        } = &frame
+        {
+            // Transit credit is freed as soon as the data is stored in this muxer.
+            active
+                .selector
+                .strategy_mut()
+                .transit_recv_freed(data.as_ref().len());
+        }
+
         let progress = match frame {
+            DecodedFrame::SessionWindowUpdate { update } => {
+                let global = active.selector.strategy_mut();
+                let transit = global
+                    .transit_send
+                    .as_mut()
+                    .ok_or(ErrorKind::Transit("transit window is not enabled"))?;
+                transit.credit = transit
+                    .credit
+                    .checked_add(update)
+                    .ok_or(ErrorKind::Transit("transit window overflow"))?;
+                if update > 0 {
+                    // Streams gated on transit credit returned Pending without
+                    // a stream-level wakeup source, so wake all of them.
+                    active.selector.wake_all();
+                }
+                RammuxProgress::Empty
+            },
+
             DecodedFrame::Ping {
                 payload,
                 is_response: false,
@@ -131,7 +173,7 @@ where
                 is_response: true,
             } => {
                 let elapsed = active.out_pings.received_response(payload)?;
-                active.selector.strategy_mut().rtt = Some(elapsed);
+                active.selector.strategy_mut().record_rtt(elapsed);
                 RammuxProgress::Empty
             },
 
@@ -266,6 +308,13 @@ where
                 continue;
             }
 
+            if let Some(update) = active.selector.strategy_mut().transit_recv_update() {
+                active
+                    .codec
+                    .start_send_unpin(EncoderItem::new_session_window_update(update))?;
+                continue;
+            }
+
             if let Poll::Ready(Some((update, fin_state))) = active.selector.poll_next_unpin(cx) {
                 let id = update.id;
                 let item = EncoderItem::from(update);
@@ -390,12 +439,25 @@ where
                 )
             })
             .unwrap_or_default();
+        let (transit_send_credit, transit_recv_window) = self
+            .state
+            .active()
+            .map(|active| {
+                let global = active.selector.strategy();
+                (
+                    global.transit_send.as_ref().map(|transit| transit.credit),
+                    global.transit_recv.as_ref().map(|recv| recv.current),
+                )
+            })
+            .unwrap_or_default();
 
         RammuxStats {
             inbound_streams,
             outbound_streams,
             rtt,
             available_global_recv_window,
+            transit_send_credit,
+            transit_recv_window,
         }
     }
 }
@@ -428,6 +490,10 @@ pub struct RammuxStats {
     pub rtt: Option<Duration>,
     /// Bytes available in the global receive window pool.
     pub available_global_recv_window: usize,
+    /// Remaining in-flight credit granted to us by the peer, if the transit window is enabled.
+    pub transit_send_credit: Option<u32>,
+    /// Current size of the transit window we grant to the peer, if enabled.
+    pub transit_recv_window: Option<u32>,
 }
 
 #[cfg(test)]

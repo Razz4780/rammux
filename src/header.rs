@@ -67,6 +67,19 @@ impl RawHeader {
             });
         }
 
+        if self.flags.contains(RawFlags::SESSION) {
+            return if self.flags == RawFlags::SESSION | RawFlags::WINDOW_UPDATE
+                && u32::from(self.stream_id) == 0
+            {
+                Ok(Header::SessionWindowUpdate { update: self.len })
+            } else {
+                Err(DecodeError {
+                    header: self,
+                    message: "SESSION frame with dirty bits",
+                })
+            };
+        }
+
         let frame_type = self
             .flags
             .intersection(RawFlags::PING | RawFlags::WINDOW_UPDATE | RawFlags::DATA);
@@ -147,6 +160,11 @@ bitflags! {
         /// 1. `PING` requests
         /// 2. `DATA` and `WINDOW_UPDATE` frames that initiate a new stream.
         const SYN           = 0b00100000;
+        /// Marks a session-level frame.
+        ///
+        /// Currently only valid combined with [`Self::WINDOW_UPDATE`],
+        /// forming a `SESSION_WINDOW_UPDATE` frame.
+        const SESSION       = 0b01000000;
     }
 }
 
@@ -173,6 +191,9 @@ pub enum Header {
         stream_id: StreamId,
         flags: ControlFlags,
         len: u32,
+    },
+    SessionWindowUpdate {
+        update: u32,
     },
     Term,
 }
