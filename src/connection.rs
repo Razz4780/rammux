@@ -114,6 +114,7 @@ where
                         recv.clean_policy = config.transit_clean_probe;
                         recv
                     }),
+                    clean_rtt_sizing: config.clean_rtt_sizing,
                 }),
                 out_pings: OutboundPings::new(config.ping_interval),
                 in_ping: None,
@@ -362,9 +363,7 @@ where
                 continue;
             }
 
-            if active.selector.strategy().probe_force_ping
-                && active.out_pings.force_ready()
-            {
+            if active.selector.strategy().probe_force_ping && active.out_pings.force_ready() {
                 let global = active.selector.strategy_mut();
                 global.probe_force_ping = false;
                 global.probe_mark_clean = true;

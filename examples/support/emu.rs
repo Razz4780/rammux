@@ -475,4 +475,3 @@ pub fn emu_pair(args: &EmuOpts) -> (EmuStream, EmuStream, Arc<DirGauges>, Arc<Di
         g_ba,
     )
 }
-

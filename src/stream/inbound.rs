@@ -282,7 +282,7 @@ impl RecvWindow {
         }
 
         let optimal = global
-            .rtt
+            .sizing_rtt()
             .map(|rtt| Self::get_optimal(self.freed, self.last_update.elapsed(), rtt))
             .unwrap_or(self.current);
         let clamped = optimal

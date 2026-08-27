@@ -71,3 +71,18 @@ const fn safe_cast_usize(value: u32) -> usize {
 use clap as _;
 #[cfg(test)]
 use socket2 as _;
+// mux_compare example dependencies.
+#[cfg(test)]
+use http as _;
+#[cfg(test)]
+use http_body as _;
+#[cfg(test)]
+use http_body_util as _;
+#[cfg(test)]
+use hyper as _;
+#[cfg(test)]
+use hyper_util as _;
+#[cfg(test)]
+use tokio_util as _;
+#[cfg(test)]
+use yamux as _;

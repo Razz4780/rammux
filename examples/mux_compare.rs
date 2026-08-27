@@ -87,6 +87,10 @@ struct Args {
     r_transit_max_kb: u32,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     r_clean: bool,
+    /// Use the clean-probe RTT for stream autotune and the transit rate
+    /// meter too, not just the transit growth policy.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    r_clean_all: bool,
 
     // ---- yamux tuning ----
     /// Max connection receive window in MiB; 0 keeps the yamux default (1 GiB).
@@ -293,6 +297,7 @@ fn rammux_config(args: &Args) -> RammuxConfig {
     config.remote_transit_window = args.r_transit_kb * 1024;
     config.transit_window_max = args.r_transit_max_kb * 1024;
     config.transit_clean_probe = args.r_clean;
+    config.clean_rtt_sizing = args.r_clean_all;
     config.max_inbound_streams = args.streams as u32 + 2;
     config.max_outbound_streams = args.streams as u32 + 2;
     config
@@ -724,8 +729,7 @@ where
         }
     });
 
-    let mut server_builder =
-        hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+    let mut server_builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
     server_builder
         .initial_stream_window_size(args.h_stream_window_kb * 1024)
         .initial_connection_window_size(args.h_conn_window_kb * 1024)
@@ -760,8 +764,7 @@ where
                     .uri("http://bench/echo")
                     .body(ClientBody::Chan(rx))
                     .unwrap();
-                let response = send_request
-                    .send_request(req);
+                let response = send_request.send_request(req);
                 let metrics = metrics.clone();
                 tokio::spawn(async move {
                     let Ok(response) = response.await else { return };

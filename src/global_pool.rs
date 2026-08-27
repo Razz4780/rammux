@@ -31,6 +31,10 @@ pub struct GlobalPool {
     pub transit_send: Option<TransitSend>,
     /// State of the transit window we grant to the peer, if enabled.
     pub transit_recv: Option<TransitRecv>,
+    /// Use the clean-probe RTT for every window-sizing decision
+    /// (stream autotune and the transit rate meter), not just the
+    /// transit growth policy.
+    pub clean_rtt_sizing: bool,
 }
 
 impl GlobalPool {
@@ -56,6 +60,20 @@ impl GlobalPool {
         }
     }
 
+    /// The RTT yardstick for window sizing.
+    ///
+    /// With [`Self::clean_rtt_sizing`] this is the clean-probe sample -
+    /// a value the connection's own standing queue cannot inflate -
+    /// falling back to the raw sample until the first ping completes.
+    /// Otherwise it is the latest raw sample, queueing included.
+    pub fn sizing_rtt(&self) -> Option<Duration> {
+        if self.clean_rtt_sizing {
+            self.clean_rtt.or(self.rtt)
+        } else {
+            self.rtt
+        }
+    }
+
     /// Returns whether outbound frames other than probe/control frames
     /// must be held back for a link-clearing probe.
     pub fn probe_paused(&self) -> bool {
@@ -68,7 +86,7 @@ impl GlobalPool {
     /// Notifies the transit window that `len` bytes of `DATA` payload were received
     /// and stored in this muxer.
     pub fn transit_recv_freed(&mut self, len: usize) {
-        let rtt = self.rtt;
+        let rtt = self.sizing_rtt();
         if let Some(recv) = self.transit_recv.as_mut() {
             let len = u32::try_from(len).unwrap_or(u32::MAX);
             recv.freed = recv.freed.saturating_add(len);
@@ -77,8 +95,8 @@ impl GlobalPool {
                 // max(2 x RTT, 10ms) - rates sampled over shorter horizons
                 // are burst artifacts, not throughput.
                 recv.rate_bucket_bytes += u64::from(len);
-                let bucket = (2 * rtt.unwrap_or(Duration::from_millis(5)))
-                    .max(Duration::from_millis(10));
+                let bucket =
+                    (2 * rtt.unwrap_or(Duration::from_millis(5))).max(Duration::from_millis(10));
                 let elapsed = recv.rate_bucket_start.elapsed();
                 if elapsed >= bucket {
                     let rate = recv.rate_bucket_bytes as f64 / elapsed.as_secs_f64();

@@ -129,6 +129,13 @@ pub struct RammuxConfig {
     ///
     /// Requires a peer that supports `CLEAR_LINK`; negotiate beforehand.
     pub transit_clean_probe: bool,
+    /// Use the clean-probe RTT for every window-sizing decision: the
+    /// per-stream window autotune and the transit rate meter, in addition
+    /// to the transit growth policy. Without [`Self::transit_clean_probe`]
+    /// the only clean sample is the connection's first ping.
+    ///
+    /// This value is a local knob and does not have to be negotiated.
+    pub clean_rtt_sizing: bool,
 }
 
 impl RammuxConfig {
@@ -160,6 +167,7 @@ impl RammuxConfig {
             transit_min_rtt_filter: false,
             transit_bw_gate: false,
             transit_clean_probe: false,
+            clean_rtt_sizing: false,
         }
     }
 }

@@ -304,16 +304,8 @@ where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let started = Instant::now();
-    let client = RammuxConnection::new(
-        RammuxRole::Client,
-        io_client,
-        rammux_config(args),
-    );
-    let server = RammuxConnection::new(
-        RammuxRole::Server,
-        io_server,
-        rammux_config(args),
-    );
+    let client = RammuxConnection::new(RammuxRole::Client, io_client, rammux_config(args));
+    let server = RammuxConnection::new(RammuxRole::Server, io_server, rammux_config(args));
 
     let client_task = drive_conn(client, args, counters.clone(), started);
     let server_task = drive_conn(server, args, counters.clone(), started);

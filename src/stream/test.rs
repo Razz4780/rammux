@@ -27,6 +27,7 @@ const CONFIG: RammuxConfig = RammuxConfig {
     transit_min_rtt_filter: false,
     transit_bw_gate: false,
     transit_clean_probe: false,
+    clean_rtt_sizing: false,
 };
 
 fn new_stream(

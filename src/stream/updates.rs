@@ -57,7 +57,10 @@ impl Task<GlobalPool> for StreamUpdates {
             update.flags.fin_read = fin_read;
             is_pending = false;
         }
-        let transit_credit = global.transit_send.as_mut().map(|transit| &mut transit.credit);
+        let transit_credit = global
+            .transit_send
+            .as_mut()
+            .map(|transit| &mut transit.credit);
         if let Poll::Ready((data, fin_write)) = guard.outbound.poll_update(transit_credit) {
             update.data = data;
             update.flags.fin_write = fin_write;
