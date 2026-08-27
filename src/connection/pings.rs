@@ -78,6 +78,25 @@ impl OutboundPings {
         }
     }
 
+    /// Makes the next `PING` ready to send immediately, if none is in flight.
+    ///
+    /// Returns whether the ping is now ready.
+    pub fn force_ready(&mut self) -> bool {
+        match &self.state {
+            State::WaitingToSend => {
+                self.state = State::ReadyToSend;
+                true
+            },
+            State::ReadyToSend => true,
+            State::Sent(..) => false,
+        }
+    }
+
+    /// Returns whether no `PING` request is currently awaiting its response.
+    pub fn is_idle(&self) -> bool {
+        matches!(&self.state, State::WaitingToSend | State::ReadyToSend)
+    }
+
     /// Notifies this struct that we received a `PING` response.
     pub fn received_response(&mut self, payload: PingPayload) -> Result<Duration, ErrorKind> {
         match &mut self.state {

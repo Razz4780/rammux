@@ -42,6 +42,7 @@ pub enum DecodedFrame {
     SessionWindowUpdate {
         update: u32,
     },
+    ClearLink,
     Terminate,
 }
 

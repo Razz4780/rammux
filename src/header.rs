@@ -72,6 +72,11 @@ impl RawHeader {
                 && u32::from(self.stream_id) == 0
             {
                 Ok(Header::SessionWindowUpdate { update: self.len })
+            } else if self.flags == RawFlags::SESSION | RawFlags::PING
+                && u32::from(self.stream_id) == 0
+                && self.len == 0
+            {
+                Ok(Header::ClearLink)
             } else {
                 Err(DecodeError {
                     header: self,
@@ -195,6 +200,7 @@ pub enum Header {
     SessionWindowUpdate {
         update: u32,
     },
+    ClearLink,
     Term,
 }
 

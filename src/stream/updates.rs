@@ -36,6 +36,13 @@ impl Task<GlobalPool> for StreamUpdates {
         cx: &mut Context<'_>,
     ) -> Poll<ControlFlow<Self::Break, Self::Cont>> {
         let this = self.get_mut();
+        if global.probe_paused() {
+            // A link-clearing probe is in progress: no stream frames may
+            // travel until it completes.
+            let mut guard = this.state.lock().unwrap();
+            guard.updates_poller.register(cx.waker());
+            return Poll::Pending;
+        }
         let mut update = StreamUpdate {
             id: this.id,
             window_update: 0,

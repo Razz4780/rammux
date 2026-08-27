@@ -111,6 +111,9 @@ struct Args {
     /// Gate transit window growth on arrival-rate increase.
     #[arg(long, default_value_t = false)]
     transit_bwgate: bool,
+    /// Clean-probe policy: CLEAR_LINK RTT probes drive a grow-only window.
+    #[arg(long, default_value_t = false)]
+    transit_clean: bool,
 
     // ---- sampling ----
     #[arg(long, default_value_t = 500)]
@@ -593,6 +596,7 @@ fn rammux_config(args: &Args) -> RammuxConfig {
     config.transit_window_max = args.transit_max_kb * 1024;
     config.transit_min_rtt_filter = args.transit_minrtt;
     config.transit_bw_gate = args.transit_bwgate;
+    config.transit_clean_probe = args.transit_clean;
     config
 }
 

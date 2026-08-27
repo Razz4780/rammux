@@ -124,6 +124,11 @@ pub struct RammuxConfig {
     ///
     /// This value is a local knob and does not have to be negotiated.
     pub transit_bw_gate: bool,
+    /// Size the transit window from RTT samples taken over a cooperatively
+    /// cleared link (`CLEAR_LINK` probes), grow-only.
+    ///
+    /// Requires a peer that supports `CLEAR_LINK`; negotiate beforehand.
+    pub transit_clean_probe: bool,
 }
 
 impl RammuxConfig {
@@ -154,6 +159,7 @@ impl RammuxConfig {
             transit_window_max: 4 * 1024 * 1024,
             transit_min_rtt_filter: false,
             transit_bw_gate: false,
+            transit_clean_probe: false,
         }
     }
 }

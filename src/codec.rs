@@ -150,6 +150,10 @@ where
                                 update,
                             })));
                         },
+                        Header::ClearLink => {
+                            this.decoder = Default::default();
+                            break Poll::Ready(Some(Ok(DecodedFrame::ClearLink)));
+                        },
                         Header::Term => {
                             this.decoder = Default::default();
                             break Poll::Ready(Some(Ok(DecodedFrame::Terminate)));
@@ -339,6 +343,7 @@ mod tests {
                 payload: StreamPayload::Data(Default::default()),
             },
             DecodedFrame::SessionWindowUpdate { update: 4096 },
+            DecodedFrame::ClearLink,
             DecodedFrame::Terminate,
         ];
 
@@ -358,6 +363,7 @@ mod tests {
                         DecodedFrame::SessionWindowUpdate { update } => {
                             EncoderItem::new_session_window_update(*update)
                         },
+                        DecodedFrame::ClearLink => EncoderItem::new_clear_link(),
                         DecodedFrame::Stream {
                             stream_id,
                             flags,

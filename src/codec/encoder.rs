@@ -49,6 +49,21 @@ impl EncoderItem {
         }
     }
 
+    pub fn new_clear_link() -> Self {
+        let header = RawHeader {
+            stream_id: crate::StreamId::from_be_bytes([0, 0, 0]),
+            flags: RawFlags::SESSION | RawFlags::PING,
+            len: 0,
+        };
+        let mut headers = [0; RawHeader::LEN * 2];
+        headers[RawHeader::LEN..].copy_from_slice(&header.encode());
+        Self {
+            headers,
+            data: Default::default(),
+            consumed: RawHeader::LEN,
+        }
+    }
+
     pub fn new_terminate() -> Self {
         Self {
             headers: [0_u8; RawHeader::LEN * 2],
