@@ -252,17 +252,17 @@ where
         loop {
             std::task::ready!(active.codec.poll_ready_unpin(cx))?;
 
-            if let Some(payload) = active.in_ping.take() {
-                active
-                    .codec
-                    .start_send_unpin(EncoderItem::new_ping(payload, true))?;
-                continue;
-            }
-
             if let Some(payload) = active.out_pings.take_ready() {
                 active
                     .codec
-                    .start_send_unpin(EncoderItem::new_ping(payload, false))?;
+                    .start_send_priority(EncoderItem::new_ping(payload, false));
+                continue;
+            }
+
+            if let Some(payload) = active.in_ping.take() {
+                active
+                    .codec
+                    .start_send_priority(EncoderItem::new_ping(payload, true));
                 continue;
             }
 
