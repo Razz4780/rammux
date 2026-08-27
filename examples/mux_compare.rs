@@ -335,6 +335,7 @@ where
                                 if sink.send(Bytes::from_static(marker)).await.is_err() {
                                     return;
                                 }
+                                // The marker byte counts toward the stream's payload.
                                 if is_echo {
                                     let payload = Bytes::from(vec![0u8; ECHO_CHUNK]);
                                     loop {
@@ -352,7 +353,7 @@ where
                                         metrics.echo_sample(sent.elapsed());
                                     }
                                 } else {
-                                    let mut sent = 0u64;
+                                    let mut sent = 1u64.min(target);
                                     while sent < target {
                                         let part = if target - sent < chunk.len() as u64 {
                                             chunk.clone().split_to((target - sent) as usize)
@@ -392,16 +393,15 @@ where
                         tokio::spawn(async move {
                             let (mut sink, mut stream) = duplex.into_split();
                             // First byte marks the stream type.
-                            let mut first = match stream.next().await {
+                            let first = match stream.next().await {
                                 Some(data) => data,
                                 None => return,
                             };
                             let is_echo = first[0] == b'E';
-                            let rest = first.split_off(1);
-                            if !rest.is_empty() && !is_echo {
+                            if !is_echo {
                                 metrics
                                     .delivered
-                                    .fetch_add(rest.len() as u64, Ordering::Relaxed);
+                                    .fetch_add(first.len() as u64, Ordering::Relaxed);
                             }
                             if is_echo {
                                 while let Some(data) = stream.next().await {
@@ -549,6 +549,7 @@ fn spawn_yamux_client_stream(
         if stream.write_all(marker).await.is_err() {
             return;
         }
+        // The marker byte counts toward the stream's payload.
         if is_echo {
             let payload = vec![0u8; ECHO_CHUNK];
             let mut buf = vec![0u8; ECHO_CHUNK];
@@ -570,7 +571,7 @@ fn spawn_yamux_client_stream(
                 metrics.echo_sample(sent.elapsed());
             }
         } else {
-            let mut sent = 0u64;
+            let mut sent = 1u64.min(target);
             while sent < target {
                 let take = (chunk.len() as u64).min(target - sent) as usize;
                 if stream.write_all(&chunk[..take]).await.is_err() {
@@ -591,6 +592,9 @@ fn spawn_yamux_server_stream(mut stream: yamux::Stream, metrics: Arc<Metrics>) {
             return;
         }
         let is_echo = marker[0] == b'E';
+        if !is_echo {
+            metrics.delivered.fetch_add(1, Ordering::Relaxed);
+        }
         let mut buf = vec![0u8; 256 * 1024];
         loop {
             match stream.read(&mut buf).await {
