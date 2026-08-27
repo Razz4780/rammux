@@ -59,6 +59,13 @@ struct Args {
     /// Emulated socket send buffer per direction, KiB.
     #[arg(long, default_value_t = 4096)]
     sndbuf_kb: u64,
+    /// Both directions draw from one shared capacity pool (half-duplex media
+    /// like Wi-Fi airtime) instead of having independent full-duplex capacity.
+    #[arg(long, default_value_t = false)]
+    shared_capacity: bool,
+    /// In bi mode, delay the reverse (server-side) writers by this many seconds.
+    #[arg(long, default_value_t = 0.0)]
+    reverse_delay_s: f64,
     /// RNG seed.
     #[arg(long, default_value_t = 42)]
     seed: u64,
@@ -204,12 +211,15 @@ struct Dir {
     params: LinkParams,
     gauges: Arc<DirGauges>,
     kick: Notify,
+    /// Busy-until clock of a shared half-duplex medium, if enabled.
+    shared: Option<Arc<Mutex<Instant>>>,
 }
 
 impl Dir {
-    fn new(params: LinkParams, seed: u64) -> Self {
+    fn new(params: LinkParams, seed: u64, shared: Option<Arc<Mutex<Instant>>>) -> Self {
         let now = Instant::now();
         Self {
+            shared,
             gauges: Default::default(),
             state: Mutex::new(DirState {
                 pending: Default::default(),
@@ -240,6 +250,16 @@ impl Dir {
         let mut woke_reader = false;
 
         while !st.pending.is_empty() && st.free_at <= now {
+            // A shared half-duplex medium must also be free; the quantum
+            // starts when both the direction and the medium are available.
+            let mut start = st.free_at;
+            if let Some(shared) = &self.shared {
+                let medium = *shared.lock().unwrap();
+                if medium > now {
+                    break;
+                }
+                start = start.max(medium);
+            }
             // Service one MSS-sized quantum.
             let take = MSS.min(st.pending_bytes);
             let mut chunk = st.pending.pop_front().unwrap();
@@ -313,7 +333,14 @@ impl Dir {
             };
             let rate = p.rate_bps.min(window_rate).max(1.0);
             let service = Duration::from_secs_f64(quantum.len() as f64 / rate);
-            st.free_at += service + stall;
+            st.free_at = start + service + stall;
+            if let Some(shared) = &self.shared {
+                // The medium is occupied for the wire time at full link rate;
+                // window pacing and recovery stalls do not hold the medium.
+                let mut medium = shared.lock().unwrap();
+                let wire = Duration::from_secs_f64(quantum.len() as f64 / p.rate_bps);
+                *medium = (*medium).max(start) + wire;
+            }
 
             // Delivery: one-way delay plus jitter, in order.
             let jitter = Duration::from_secs_f64(p.jitter.as_secs_f64() * st.rng.next_f64());
@@ -339,7 +366,13 @@ impl Dir {
         }
 
         let next_ready = st.ready.front().map(|(at, _)| *at);
-        let next_service = st.pending.front().map(|_| st.free_at);
+        let next_service = st.pending.front().map(|_| {
+            let mut at = st.free_at;
+            if let Some(shared) = &self.shared {
+                at = at.max(*shared.lock().unwrap());
+            }
+            at
+        });
         drop(st);
         [next_ready, next_service].into_iter().flatten().min()
     }
@@ -510,8 +543,19 @@ fn emu_pair(args: &Args) -> (EmuStream, EmuStream, Arc<DirGauges>, Arc<DirGauges
             sndbuf: args.sndbuf_kb * 1024,
         }
     };
-    let ab = Arc::new(Dir::new(params(), args.seed.wrapping_mul(0x9E3779B97F4A7C15)));
-    let ba = Arc::new(Dir::new(params(), args.seed.wrapping_mul(0xD1B54A32D192ED03)));
+    let shared = args
+        .shared_capacity
+        .then(|| Arc::new(Mutex::new(Instant::now())));
+    let ab = Arc::new(Dir::new(
+        params(),
+        args.seed.wrapping_mul(0x9E3779B97F4A7C15),
+        shared.clone(),
+    ));
+    let ba = Arc::new(Dir::new(
+        params(),
+        args.seed.wrapping_mul(0xD1B54A32D192ED03),
+        shared,
+    ));
     let stop = Arc::new(AtomicBool::new(false));
     tokio::spawn(ab.clone().pump(stop.clone()));
     tokio::spawn(ba.clone().pump(stop.clone()));
@@ -580,7 +624,15 @@ where
                     to_start -= 1;
                     let write = true;
                     let read = args.direction == Direction::Bi;
-                    spawn_stream(duplex, args, write, read, counters.clone(), is_client);
+                    spawn_stream(
+                        duplex,
+                        args,
+                        write,
+                        read,
+                        counters.clone(),
+                        is_client,
+                        Duration::ZERO,
+                    );
                 },
                 Ok(None) => break,
                 Err(error) => return Err(error),
@@ -592,7 +644,15 @@ where
                 RammuxProgress::Inbound(duplex) => {
                     let write = args.direction == Direction::Bi;
                     let read = true;
-                    spawn_stream(duplex, args, write, read, counters.clone(), is_client);
+                    spawn_stream(
+                        duplex,
+                        args,
+                        write,
+                        read,
+                        counters.clone(),
+                        is_client,
+                        Duration::from_secs_f64(args.reverse_delay_s),
+                    );
                 },
                 RammuxProgress::Downgraded(..) => return Ok(()),
                 RammuxProgress::Empty => {},
@@ -621,6 +681,7 @@ fn spawn_stream(
     read: bool,
     counters: Arc<Counters>,
     on_client: bool,
+    write_delay: Duration,
 ) {
     let chunk = Bytes::from(vec![0u8; args.chunk_kb * 1024]);
     let target = args.bytes_per_stream;
@@ -629,6 +690,9 @@ fn spawn_stream(
     tokio::spawn(async move {
         let writer = async {
             if write {
+                if !write_delay.is_zero() {
+                    tokio::time::sleep(write_delay).await;
+                }
                 let mut sent = 0u64;
                 while target == 0 || sent < target {
                     let chunk = if target > 0 && target - sent < chunk.len() as u64 {
