@@ -101,6 +101,9 @@ struct Args {
     /// Use the min-RTT filter for transit window autotuning.
     #[arg(long, default_value_t = false)]
     transit_minrtt: bool,
+    /// Gate transit window growth on arrival-rate increase.
+    #[arg(long, default_value_t = false)]
+    transit_bwgate: bool,
 
     // ---- sampling ----
     #[arg(long, default_value_t = 500)]
@@ -545,6 +548,7 @@ fn rammux_config(args: &Args) -> RammuxConfig {
     config.remote_transit_window = args.transit_kb * 1024;
     config.transit_window_max = args.transit_max_kb * 1024;
     config.transit_min_rtt_filter = args.transit_minrtt;
+    config.transit_bw_gate = args.transit_bwgate;
     config
 }
 

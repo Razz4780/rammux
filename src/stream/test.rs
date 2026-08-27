@@ -25,6 +25,7 @@ const CONFIG: RammuxConfig = RammuxConfig {
     remote_transit_window: 0,
     transit_window_max: 4 * 1024 * 1024,
     transit_min_rtt_filter: false,
+    transit_bw_gate: false,
 };
 
 fn new_stream(

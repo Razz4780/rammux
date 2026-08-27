@@ -119,6 +119,11 @@ pub struct RammuxConfig {
     ///
     /// This value is a local knob and does not have to be negotiated.
     pub transit_min_rtt_filter: bool,
+    /// Allow transit window growth only while the payload arrival rate
+    /// exceeds the best rate observed so far.
+    ///
+    /// This value is a local knob and does not have to be negotiated.
+    pub transit_bw_gate: bool,
 }
 
 impl RammuxConfig {
@@ -148,6 +153,7 @@ impl RammuxConfig {
             remote_transit_window: 0,
             transit_window_max: 4 * 1024 * 1024,
             transit_min_rtt_filter: false,
+            transit_bw_gate: false,
         }
     }
 }

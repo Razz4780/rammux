@@ -97,6 +97,7 @@ where
                             initial,
                             config.transit_window_max,
                             config.transit_min_rtt_filter,
+                            config.transit_bw_gate,
                         )
                     }),
                 }),

@@ -29,9 +29,29 @@ impl GlobalPool {
     /// Notifies the transit window that `len` bytes of `DATA` payload were received
     /// and stored in this muxer.
     pub fn transit_recv_freed(&mut self, len: usize) {
+        let rtt = self.rtt;
         if let Some(recv) = self.transit_recv.as_mut() {
             let len = u32::try_from(len).unwrap_or(u32::MAX);
             recv.freed = recv.freed.saturating_add(len);
+            if recv.bw_gate {
+                // Measure the arrival rate over buckets of at least
+                // max(2 x RTT, 10ms) - rates sampled over shorter horizons
+                // are burst artifacts, not throughput.
+                recv.rate_bucket_bytes += u64::from(len);
+                let bucket = (2 * rtt.unwrap_or(Duration::from_millis(5)))
+                    .max(Duration::from_millis(10));
+                let elapsed = recv.rate_bucket_start.elapsed();
+                if elapsed >= bucket {
+                    let rate = recv.rate_bucket_bytes as f64 / elapsed.as_secs_f64();
+                    recv.rate_ema = if recv.rate_ema == 0.0 {
+                        rate
+                    } else {
+                        0.5 * recv.rate_ema + 0.5 * rate
+                    };
+                    recv.rate_bucket_bytes = 0;
+                    recv.rate_bucket_start = Instant::now();
+                }
+            }
         }
     }
 
@@ -47,9 +67,34 @@ impl GlobalPool {
         } else {
             self.rtt
         };
-        let optimal = rtt
-            .map(|rtt| Self::get_optimal(recv.freed, recv.last_update.elapsed(), rtt))
-            .unwrap_or(recv.current);
+        let elapsed = recv.last_update.elapsed();
+        let optimal = if recv.bw_gate {
+            // Growth trigger: evidence of window limitation - the window is
+            // cycling faster than the credit loop can breathe. Deliberately
+            // uses the latest RTT sample (the operational loop time, queueing
+            // included), like quiche's 2x smoothed-RTT rule: permissiveness
+            // here is safe because growth is still gated on the arrival rate.
+            // Growth gate: the bucket-measured, direction-pure arrival rate
+            // must demonstrably increase - under saturation it caps at the
+            // link share, so self-inflicted queueing can never feed growth.
+            let window_limited = self.rtt.is_some_and(|rtt| elapsed < 2 * rtt);
+            // The 1.25 margin keeps measurement noise on a rate plateau from
+            // producing record samples that would each double the window
+            // (compare BBR's 1.25x bandwidth probe): growth must demonstrably
+            // pay for itself.
+            if window_limited && recv.rate_ema > 0.0 && recv.rate_ema > recv.max_rate * 1.25 {
+                recv.max_rate = recv.rate_ema;
+                recv.current.saturating_mul(2)
+            } else {
+                // Deliberately asymmetric, like every battle-tested
+                // implementation: the autotuner never shrinks. Shrinking
+                // belongs to an external signal (memory pressure, idle).
+                recv.current
+            }
+        } else {
+            rtt.map(|rtt| Self::get_optimal(recv.freed, elapsed, rtt))
+                .unwrap_or(recv.current)
+        };
         let clamped = optimal
             // Window cannot shrink below the initial size.
             .max(recv.initial.get())
@@ -102,18 +147,33 @@ pub struct TransitRecv {
     pub max: u32,
     /// Use the sliding-window minimum RTT instead of the latest sample.
     pub min_rtt_filter: bool,
+    /// Gate growth on the payload arrival rate exceeding the best rate seen so far.
+    pub bw_gate: bool,
+    /// Smoothed arrival rate, bytes per second.
+    pub rate_ema: f64,
+    /// Best smoothed arrival rate observed, bytes per second.
+    pub max_rate: f64,
+    /// Start of the current rate-measurement bucket.
+    pub rate_bucket_start: Instant,
+    /// Payload bytes received in the current rate-measurement bucket.
+    pub rate_bucket_bytes: u64,
     /// Time of the last produced window update.
     pub last_update: Instant,
 }
 
 impl TransitRecv {
-    pub fn new(initial: NonZeroU32, max: u32, min_rtt_filter: bool) -> Self {
+    pub fn new(initial: NonZeroU32, max: u32, min_rtt_filter: bool, bw_gate: bool) -> Self {
         Self {
             initial,
             current: initial.get(),
             freed: 0,
             max: max.max(initial.get()),
             min_rtt_filter,
+            bw_gate,
+            rate_ema: 0.0,
+            max_rate: 0.0,
+            rate_bucket_start: Instant::now(),
+            rate_bucket_bytes: 0,
             last_update: Instant::now(),
         }
     }
