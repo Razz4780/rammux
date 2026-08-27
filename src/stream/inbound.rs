@@ -283,15 +283,22 @@ impl RecvWindow {
 
         let optimal = global
             .sizing_rtt()
-            .map(|rtt| Self::get_optimal(self.freed, self.last_update.elapsed(), rtt))
+            .map(|rtt| {
+                Self::get_optimal(
+                    self.freed,
+                    self.last_update.elapsed(),
+                    rtt,
+                    global.stream_window_gain,
+                )
+            })
             .unwrap_or(self.current);
         let clamped = optimal
             // Window cannot shrink below the initial size.
             .max(self.initial.get())
             // Window cannot shrink by more than 25% in one round.
             .max(self.current - self.current / 4)
-            // Window cannot grow by more than 100% in one round.
-            .min(self.current.saturating_mul(2));
+            // Window cannot grow by more than the configured factor in one round.
+            .min(self.current.saturating_mul(global.stream_window_growth));
 
         let update = if clamped > self.current {
             // Window can grow, we need to borrow from the global pool.
@@ -343,8 +350,13 @@ impl RecvWindow {
     /// However, given that [`Self::try_update`] applies bounds to window resizes,
     /// this behavior is acceptable.
     #[allow(clippy::cast_possible_truncation)]
-    fn get_optimal(consumed_since_update: u32, time_since_update: Duration, rtt: Duration) -> u32 {
-        let new_window = 1.5 * rtt.as_secs_f64() * f64::from(consumed_since_update)
+    fn get_optimal(
+        consumed_since_update: u32,
+        time_since_update: Duration,
+        rtt: Duration,
+        gain: f64,
+    ) -> u32 {
+        let new_window = gain * rtt.as_secs_f64() * f64::from(consumed_since_update)
             / time_since_update.as_secs_f64();
         new_window as u32
     }

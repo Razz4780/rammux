@@ -5,7 +5,6 @@ use tokio::time::Instant;
 /// Global state shared by all rammux streams within a single rammux connection.
 ///
 /// Used as the polling strategy of the connection's task selector.
-#[derive(Default)]
 pub struct GlobalPool {
     /// Last measured round-trip time of the connection.
     pub rtt: Option<Duration>,
@@ -35,6 +34,33 @@ pub struct GlobalPool {
     /// (stream autotune and the transit rate meter), not just the
     /// transit growth policy.
     pub clean_rtt_sizing: bool,
+    /// Per-stream window autotune gain: the window targets
+    /// `gain x rate x RTT`.
+    pub stream_window_gain: f64,
+    /// Per-stream window growth limit: the window can at most multiply
+    /// by this factor in a single update round.
+    pub stream_window_growth: u32,
+}
+
+impl Default for GlobalPool {
+    fn default() -> Self {
+        Self {
+            rtt: None,
+            available: 0,
+            min_rtt: Default::default(),
+            probe: Default::default(),
+            clean_rtt: None,
+            last_probe: None,
+            probe_send_clear: false,
+            probe_force_ping: false,
+            probe_mark_clean: false,
+            transit_send: None,
+            transit_recv: None,
+            clean_rtt_sizing: false,
+            stream_window_gain: 1.5,
+            stream_window_growth: 2,
+        }
+    }
 }
 
 impl GlobalPool {

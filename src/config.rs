@@ -136,6 +136,16 @@ pub struct RammuxConfig {
     ///
     /// This value is a local knob and does not have to be negotiated.
     pub clean_rtt_sizing: bool,
+    /// Per-stream receive window autotune gain: each stream's window
+    /// targets `gain x consumption rate x RTT`.
+    ///
+    /// This value is a local knob and does not have to be negotiated.
+    pub stream_window_gain: f64,
+    /// Per-stream receive window growth limit: a window can at most
+    /// multiply by this factor in a single update round. Must be >= 1.
+    ///
+    /// This value is a local knob and does not have to be negotiated.
+    pub stream_window_growth: u32,
 }
 
 impl RammuxConfig {
@@ -168,6 +178,8 @@ impl RammuxConfig {
             transit_bw_gate: false,
             transit_clean_probe: false,
             clean_rtt_sizing: false,
+            stream_window_gain: 1.5,
+            stream_window_growth: 2,
         }
     }
 }

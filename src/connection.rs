@@ -115,6 +115,8 @@ where
                         recv
                     }),
                     clean_rtt_sizing: config.clean_rtt_sizing,
+                    stream_window_gain: config.stream_window_gain,
+                    stream_window_growth: config.stream_window_growth,
                 }),
                 out_pings: OutboundPings::new(config.ping_interval),
                 in_ping: None,

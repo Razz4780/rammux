@@ -28,6 +28,8 @@ const CONFIG: RammuxConfig = RammuxConfig {
     transit_bw_gate: false,
     transit_clean_probe: false,
     clean_rtt_sizing: false,
+    stream_window_gain: 1.5,
+    stream_window_growth: 2,
 };
 
 fn new_stream(
