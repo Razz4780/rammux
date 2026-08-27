@@ -88,12 +88,18 @@ impl GlobalPool {
 
     /// The RTT yardstick for window sizing.
     ///
-    /// With [`Self::clean_rtt_sizing`] this is the clean-probe sample -
-    /// a value the connection's own standing queue cannot inflate -
-    /// falling back to the raw sample until the first ping completes.
-    /// Otherwise it is the latest raw sample, queueing included.
+    /// With [`Self::clean_rtt_sizing`] and a running link-clearing probe
+    /// this is the clean-probe sample - a value the connection's own
+    /// standing queue cannot inflate - falling back to the raw sample
+    /// until the first ping completes. Without the probe there is nothing
+    /// keeping clean samples fresh, so sizing uses the latest raw sample,
+    /// queueing included.
     pub fn sizing_rtt(&self) -> Option<Duration> {
-        if self.clean_rtt_sizing {
+        let probing = self
+            .transit_recv
+            .as_ref()
+            .is_some_and(|recv| recv.clean_policy);
+        if self.clean_rtt_sizing && probing {
             self.clean_rtt.or(self.rtt)
         } else {
             self.rtt

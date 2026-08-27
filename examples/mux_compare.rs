@@ -88,8 +88,9 @@ struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     r_clean: bool,
     /// Use the clean-probe RTT for stream autotune and the transit rate
-    /// meter too, not just the transit growth policy.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    /// meter too, not just the transit growth policy (the library default;
+    /// pass false to A/B raw-RTT sizing).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     r_clean_all: bool,
     /// Per-stream window autotune gain (window targets gain x rate x RTT).
     #[arg(long, default_value_t = 1.5)]

@@ -131,8 +131,11 @@ pub struct RammuxConfig {
     pub transit_clean_probe: bool,
     /// Use the clean-probe RTT for every window-sizing decision: the
     /// per-stream window autotune and the transit rate meter, in addition
-    /// to the transit growth policy. Without [`Self::transit_clean_probe`]
-    /// the only clean sample is the connection's first ping.
+    /// to the transit growth policy. Defaults to `true`; measured
+    /// performance-neutral against raw-RTT sizing, and it keeps a single
+    /// RTT concept in the sizing paths. Only effective together with
+    /// [`Self::transit_clean_probe`] - without the probe nothing keeps
+    /// clean samples fresh, and sizing falls back to the raw RTT.
     ///
     /// This value is a local knob and does not have to be negotiated.
     pub clean_rtt_sizing: bool,
@@ -177,7 +180,7 @@ impl RammuxConfig {
             transit_min_rtt_filter: false,
             transit_bw_gate: false,
             transit_clean_probe: false,
-            clean_rtt_sizing: false,
+            clean_rtt_sizing: true,
             stream_window_gain: 1.5,
             stream_window_growth: 2,
         }
