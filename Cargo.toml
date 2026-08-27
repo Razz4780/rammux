@@ -27,4 +27,11 @@ tokio = { version = "1", features = ["net", "sync", "time"] }
 clap = { version = "4", features = ["derive"] }
 rstest = "0.26"
 socket2 = "0.6"
+yamux = "0.13"
+tokio-util = { version = "0.7", features = ["compat"] }
+hyper = { version = "1", features = ["http2", "client", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
 tokio = { version = "1", features = ["full", "test-util"] }
