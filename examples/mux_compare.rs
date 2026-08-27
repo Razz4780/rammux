@@ -85,6 +85,9 @@ struct Args {
     r_transit_kb: u32,
     #[arg(long, default_value_t = 4096)]
     r_transit_max_kb: u32,
+    /// Link-clearing probe interval (= probe timeout), seconds.
+    #[arg(long, default_value_t = 5.0)]
+    r_ping_interval_s: f64,
     /// Per-stream window autotune gain (window targets gain x rate x RTT).
     #[arg(long, default_value_t = 1.5)]
     r_stream_gain: f64,
@@ -296,6 +299,7 @@ fn rammux_config(args: &Args) -> RammuxConfig {
     config.local_transit_window = args.r_transit_kb * 1024;
     config.remote_transit_window = args.r_transit_kb * 1024;
     config.transit_window_max = args.r_transit_max_kb * 1024;
+    config.ping_interval = Duration::from_secs_f64(args.r_ping_interval_s);
     config.stream_window_gain = args.r_stream_gain;
     config.stream_window_growth = args.r_stream_grow;
     config.max_inbound_streams = args.streams as u32 + 2;
