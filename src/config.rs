@@ -2,6 +2,9 @@
 
 use std::{fmt, num::NonZeroU32, time::Duration};
 
+/// Default [`RammuxConfig::ping_interval`].
+pub(crate) const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Role in a rammux connection.
 ///
 /// The only difference between the roles in a rammux connection
@@ -72,12 +75,15 @@ pub struct RammuxConfig {
     /// This value has to be negotiated beforehand and
     /// must match the peer's [`RammuxConfig::local_recv_window`].
     pub remote_recv_window: u32,
-    /// Interval on which `PING` frames will be sent to the peer.
+    /// Interval on which the link-clearing `PING` probe runs.
     ///
-    /// This interval also determines `PING` response timeout - if we don't receive
-    /// the response before it's time to send the next `PING`, the connection fails.
+    /// The probe is rammux's only `PING` mechanism: it pauses data output,
+    /// drains the link with a `CLEAR_LINK` exchange, and measures RTT with
+    /// a `PING` exchange over the empty link. The interval is also the
+    /// probe's timeout - a probe that does not complete within one
+    /// interval fails the connection, making the probe the liveness check.
     ///
-    /// This value is a local know and does not have to be negotiated.
+    /// This value is a local knob and does not have to be negotiated.
     pub ping_interval: Duration,
     /// Size of the global local receive window shared between all streams.
     ///
@@ -114,31 +120,6 @@ pub struct RammuxConfig {
     ///
     /// This value is a local knob and does not have to be negotiated.
     pub transit_window_max: u32,
-    /// Use a sliding-window minimum of measured RTTs for transit window autotuning,
-    /// instead of the latest sample.
-    ///
-    /// This value is a local knob and does not have to be negotiated.
-    pub transit_min_rtt_filter: bool,
-    /// Allow transit window growth only while the payload arrival rate
-    /// exceeds the best rate observed so far.
-    ///
-    /// This value is a local knob and does not have to be negotiated.
-    pub transit_bw_gate: bool,
-    /// Size the transit window from RTT samples taken over a cooperatively
-    /// cleared link (`CLEAR_LINK` probes), grow-only.
-    ///
-    /// Requires a peer that supports `CLEAR_LINK`; negotiate beforehand.
-    pub transit_clean_probe: bool,
-    /// Use the clean-probe RTT for every window-sizing decision: the
-    /// per-stream window autotune and the transit rate meter, in addition
-    /// to the transit growth policy. Defaults to `true`; measured
-    /// performance-neutral against raw-RTT sizing, and it keeps a single
-    /// RTT concept in the sizing paths. Only effective together with
-    /// [`Self::transit_clean_probe`] - without the probe nothing keeps
-    /// clean samples fresh, and sizing falls back to the raw RTT.
-    ///
-    /// This value is a local knob and does not have to be negotiated.
-    pub clean_rtt_sizing: bool,
     /// Per-stream receive window autotune gain: each stream's window
     /// targets `gain x consumption rate x RTT`.
     ///
@@ -172,15 +153,11 @@ impl RammuxConfig {
             max_outbound_streams: 128,
             local_recv_window: NonZeroU32::new(64 * 1024).unwrap(),
             remote_recv_window: 64 * 1024,
-            ping_interval: Duration::from_secs(5),
+            ping_interval: DEFAULT_PING_INTERVAL,
             global_recv_window: 4 * 1024 * 1024,
             local_transit_window: 0,
             remote_transit_window: 0,
             transit_window_max: 4 * 1024 * 1024,
-            transit_min_rtt_filter: false,
-            transit_bw_gate: false,
-            transit_clean_probe: false,
-            clean_rtt_sizing: true,
             stream_window_gain: 1.5,
             stream_window_growth: 2,
         }

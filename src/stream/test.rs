@@ -24,10 +24,6 @@ const CONFIG: RammuxConfig = RammuxConfig {
     local_transit_window: 0,
     remote_transit_window: 0,
     transit_window_max: 4 * 1024 * 1024,
-    transit_min_rtt_filter: false,
-    transit_bw_gate: false,
-    transit_clean_probe: false,
-    clean_rtt_sizing: false,
     stream_window_gain: 1.5,
     stream_window_growth: 2,
 };

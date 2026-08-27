@@ -9,15 +9,9 @@ use std::{
     time::Duration,
 };
 
-/// How often the cooperative link-clearing probe refreshes the clean RTT.
-const PROBE_INTERVAL: Duration = Duration::from_secs(10);
-
 use async_selector::selector::Selector;
 use futures::{SinkExt, StreamExt};
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    time::Instant,
-};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{
     codec::{
@@ -26,12 +20,9 @@ use crate::{
         encoder::EncoderItem,
     },
     config::{RammuxConfig, RammuxRole},
-    connection::{
-        pings::OutboundPings,
-        state::{Active, ConnState},
-    },
+    connection::state::{Active, ConnState},
     error::{ErrorKind, RammuxError},
-    global_pool::{GlobalPool, ProbeState, TransitRecv, TransitSend},
+    global_pool::{GlobalPool, Probe, ProbeDone, ProbeFrame, TransitRecv, TransitSend},
     stream::RammuxDuplex,
     stream_id::StreamId,
 };
@@ -39,7 +30,6 @@ use crate::{
 pub use crate::connection::downgrade::Downgraded;
 
 mod downgrade;
-mod pings;
 mod state;
 
 /// State machine of a single rammux connection.
@@ -94,32 +84,15 @@ where
                 selector: Selector::new(GlobalPool {
                     rtt: None,
                     available: config.global_recv_window,
-                    min_rtt: Default::default(),
-                    probe: Default::default(),
-                    clean_rtt: None,
-                    last_probe: None,
-                    probe_send_clear: false,
-                    probe_force_ping: false,
-                    probe_mark_clean: false,
+                    probe: Probe::new(config.ping_interval),
                     transit_send: (config.remote_transit_window > 0).then(|| TransitSend {
                         credit: config.remote_transit_window,
                     }),
-                    transit_recv: NonZeroU32::new(config.local_transit_window).map(|initial| {
-                        let mut recv = TransitRecv::new(
-                            initial,
-                            config.transit_window_max,
-                            config.transit_min_rtt_filter,
-                            config.transit_bw_gate,
-                        );
-                        recv.clean_policy = config.transit_clean_probe;
-                        recv
-                    }),
-                    clean_rtt_sizing: config.clean_rtt_sizing,
+                    transit_recv: NonZeroU32::new(config.local_transit_window)
+                        .map(|initial| TransitRecv::new(initial, config.transit_window_max)),
                     stream_window_gain: config.stream_window_gain,
                     stream_window_growth: config.stream_window_growth,
                 }),
-                out_pings: OutboundPings::new(config.ping_interval),
-                in_ping: None,
             }),
             config,
             role,
@@ -145,39 +118,33 @@ where
             .ok_or(io::ErrorKind::UnexpectedEof)
             .map_err(io::Error::from)??;
 
-        if let DecodedFrame::Stream {
-            payload: StreamPayload::Data(data),
-            ..
-        } = &frame
-        {
-            // Transit credit is freed as soon as the data is stored in this muxer.
-            active
-                .selector
-                .strategy_mut()
-                .transit_recv_freed(data.as_ref().len());
+        match &frame {
+            // Past the peer's CLEAR_LINK its direction is drained: only
+            // probe frames (and a downgrade) may arrive until the probe
+            // runs its course on the peer's side.
+            DecodedFrame::Stream { .. } | DecodedFrame::SessionWindowUpdate { .. }
+                if active.selector.strategy().probe.peer_must_be_silent() =>
+            {
+                return Poll::Ready(Err(ErrorKind::Probe(
+                    "received a non-probe frame while the link is being cleared",
+                )));
+            },
+            DecodedFrame::Stream {
+                payload: StreamPayload::Data(data),
+                ..
+            } => {
+                // Transit credit is freed as soon as the data is stored in this muxer.
+                active
+                    .selector
+                    .strategy_mut()
+                    .transit_recv_freed(data.as_ref().len());
+            },
+            _ => {},
         }
 
         let progress = match frame {
             DecodedFrame::ClearLink => {
-                let global = active.selector.strategy_mut();
-                match global.probe {
-                    // Peer initiated a probe: stop data, answer with our own
-                    // CLEAR_LINK, and wait for the peer's probe ping.
-                    ProbeState::Idle | ProbeState::RespFinish => {
-                        global.probe = ProbeState::RespWait {
-                            since: Instant::now(),
-                        };
-                        global.probe_send_clear = true;
-                    },
-                    // Our own probe: this is the peer's response (or a
-                    // simultaneous initiation - same thing). The link towards
-                    // us is now drained; send the probe ping.
-                    ProbeState::InitWait { since } => {
-                        global.probe = ProbeState::InitPing { since };
-                        global.probe_force_ping = true;
-                    },
-                    ProbeState::InitPing { .. } | ProbeState::RespWait { .. } => {},
-                }
+                active.selector.strategy_mut().probe.on_clear_link()?;
                 RammuxProgress::Empty
             },
 
@@ -201,33 +168,18 @@ where
 
             DecodedFrame::Ping {
                 payload,
-                is_response: false,
+                is_response,
             } => {
-                if active.in_ping.replace(payload).is_some() {
-                    return Poll::Ready(Err(ErrorKind::UnexpectedPing(payload)));
-                }
-                let global = active.selector.strategy_mut();
-                if let ProbeState::RespWait { .. } = global.probe {
-                    // The peer's probe ping arrived: pong (prioritized), send
-                    // our own probe ping, and resume data.
-                    global.probe = ProbeState::RespFinish;
-                    global.probe_force_ping = true;
-                    active.selector.wake_all();
-                }
-                RammuxProgress::Empty
-            },
-
-            DecodedFrame::Ping {
-                payload,
-                is_response: true,
-            } => {
-                let elapsed = active.out_pings.received_response(payload)?;
-                let global = active.selector.strategy_mut();
-                let was_paused = global.probe_paused();
-                global.record_rtt(elapsed);
-                if was_paused && !global.probe_paused() {
-                    // Initiator side: clean sample recorded, data resumes.
-                    active.selector.wake_all();
+                let done = if is_response {
+                    active.selector.strategy_mut().probe.on_pong(payload)?
+                } else {
+                    active.selector.strategy_mut().probe.on_ping(payload)?
+                };
+                if let Some(ProbeDone { rtt, resume }) = done {
+                    active.selector.strategy_mut().rtt = Some(rtt);
+                    if resume {
+                        active.selector.wake_all();
+                    }
                 }
                 RammuxProgress::Empty
             },
@@ -349,72 +301,17 @@ where
         loop {
             std::task::ready!(active.codec.poll_ready_unpin(cx))?;
 
-            if let Some(payload) = active.in_ping.take() {
-                active
-                    .codec
-                    .start_send_unpin(EncoderItem::new_ping(payload, true))?;
-                continue;
-            }
-
-            if active.selector.strategy().probe_send_clear {
-                let global = active.selector.strategy_mut();
-                global.probe_send_clear = false;
-                active
-                    .codec
-                    .start_send_unpin(EncoderItem::new_clear_link())?;
-                continue;
-            }
-
-            if active.selector.strategy().probe_force_ping && active.out_pings.force_ready() {
-                let global = active.selector.strategy_mut();
-                global.probe_force_ping = false;
-                global.probe_mark_clean = true;
-                // Falls through to try_collect below, which sends it now.
-            }
-
-            if let Some(payload) = active.out_pings.try_collect() {
-                active
-                    .codec
-                    .start_send_unpin(EncoderItem::new_ping(payload, false))?;
-                continue;
-            }
-
-            {
-                // Cooperative link-clearing probe scheduling and timeout.
-                let probe_enabled = active
-                    .selector
-                    .strategy()
-                    .transit_recv
-                    .as_ref()
-                    .is_some_and(|recv| recv.clean_policy);
-                let global = active.selector.strategy_mut();
-                match global.probe {
-                    ProbeState::Idle if probe_enabled && active.out_pings.is_idle() => {
-                        let due = global
-                            .last_probe
-                            .is_none_or(|at| at.elapsed() > PROBE_INTERVAL);
-                        if due && global.rtt.is_some() {
-                            global.probe = ProbeState::InitWait {
-                                since: Instant::now(),
-                            };
-                            active
-                                .codec
-                                .start_send_unpin(EncoderItem::new_clear_link())?;
-                            continue;
-                        }
-                    },
-                    ProbeState::InitWait { since } | ProbeState::RespWait { since }
-                        if since.elapsed() > self.config.ping_interval =>
-                    {
-                        // The peer did not cooperate in time; abort the probe.
-                        global.probe = ProbeState::Idle;
-                        global.last_probe = Some(Instant::now());
-                        global.probe_send_clear = false;
-                        global.probe_force_ping = false;
-                        active.selector.wake_all();
-                    },
-                    _ => {},
+            if let Some((frame, resume)) = active.selector.strategy_mut().probe.next_frame() {
+                let item = match frame {
+                    ProbeFrame::Clear => EncoderItem::new_clear_link(),
+                    ProbeFrame::Ping(payload) => EncoderItem::new_ping(payload, false),
+                    ProbeFrame::Pong(payload) => EncoderItem::new_ping(payload, true),
+                };
+                active.codec.start_send_unpin(item)?;
+                if resume {
+                    active.selector.wake_all();
                 }
+                continue;
             }
 
             if active.selector.strategy().probe_paused() {
@@ -455,7 +352,14 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<RammuxProgress<IO>, ErrorKind>> {
-        let _ = self.state.active_mut()?.out_pings.poll_should_send(cx)?;
+        // Drive the probe clock: schedules probes and enforces their timeout.
+        let _ = self
+            .state
+            .active_mut()?
+            .selector
+            .strategy_mut()
+            .probe
+            .poll(cx)?;
         let mut inbound = Poll::Pending;
         // Drain up to one encoder batch of inbound frames first.
         // In particular, processing multiple WINDOW_UPDATEs can make several

@@ -1,39 +1,35 @@
-use std::{collections::VecDeque, num::NonZeroU32, ops::Not, time::Duration};
+use std::{
+    num::NonZeroU32,
+    ops::Not,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
-use tokio::time::Instant;
+use futures::FutureExt;
+use tokio::time::{Instant, Sleep};
+
+use crate::{error::ErrorKind, header::PingPayload};
 
 /// Global state shared by all rammux streams within a single rammux connection.
 ///
 /// Used as the polling strategy of the connection's task selector.
 pub struct GlobalPool {
     /// Last measured round-trip time of the connection.
+    ///
+    /// Every sample comes from the link-clearing probe, so it is measured
+    /// over a cooperatively drained link: the connection's own standing
+    /// queue cannot inflate it.
     pub rtt: Option<Duration>,
     /// Amount of bytes that are currently available in the pool.
     pub available: usize,
-    /// Sliding-window minimum of measured round-trip times.
-    pub min_rtt: MinRtt,
-    /// State of the cooperative link-clearing probe.
-    pub probe: ProbeState,
-    /// Latest RTT measured over a cooperatively cleared link
-    /// (or, before the first probe, the connection's first ping).
-    pub clean_rtt: Option<Duration>,
-    /// When the last probe finished, for scheduling.
-    pub last_probe: Option<Instant>,
-    /// A `CLEAR_LINK` frame should be sent as soon as possible.
-    pub probe_send_clear: bool,
-    /// Our next `PING` should be sent as soon as possible, and its
-    /// response is a clean sample.
-    pub probe_force_ping: bool,
-    /// The response to the ping currently in flight is a clean sample.
-    pub probe_mark_clean: bool,
+    /// The link-clearing probe: rammux's only `PING` mechanism, its RTT
+    /// estimator, and its liveness check.
+    pub probe: Probe,
     /// In-flight credit granted to us by the peer, if the transit window is enabled.
     pub transit_send: Option<TransitSend>,
     /// State of the transit window we grant to the peer, if enabled.
     pub transit_recv: Option<TransitRecv>,
-    /// Use the clean-probe RTT for every window-sizing decision
-    /// (stream autotune and the transit rate meter), not just the
-    /// transit growth policy.
-    pub clean_rtt_sizing: bool,
     /// Per-stream window autotune gain: the window targets
     /// `gain x rate x RTT`.
     pub stream_window_gain: f64,
@@ -47,16 +43,9 @@ impl Default for GlobalPool {
         Self {
             rtt: None,
             available: 0,
-            min_rtt: Default::default(),
-            probe: Default::default(),
-            clean_rtt: None,
-            last_probe: None,
-            probe_send_clear: false,
-            probe_force_ping: false,
-            probe_mark_clean: false,
+            probe: Probe::new(crate::config::DEFAULT_PING_INTERVAL),
             transit_send: None,
             transit_recv: None,
-            clean_rtt_sizing: false,
             stream_window_gain: 1.5,
             stream_window_growth: 2,
         }
@@ -64,82 +53,35 @@ impl Default for GlobalPool {
 }
 
 impl GlobalPool {
-    /// Records a fresh RTT measurement from a `PING` exchange.
-    pub fn record_rtt(&mut self, rtt: Duration) {
-        if self.rtt.is_none() {
-            // The connection starts with a ping on an empty link -
-            // the first sample is clean by construction.
-            self.clean_rtt = Some(rtt);
-        }
-        self.rtt = Some(rtt);
-        self.min_rtt.push(rtt);
-        if self.probe_mark_clean {
-            self.probe_mark_clean = false;
-            self.clean_rtt = Some(rtt);
-            match self.probe {
-                ProbeState::InitPing { .. } | ProbeState::RespFinish => {
-                    self.probe = ProbeState::Idle;
-                    self.last_probe = Some(Instant::now());
-                },
-                _ => {},
-            }
-        }
-    }
-
-    /// The RTT yardstick for window sizing.
-    ///
-    /// With [`Self::clean_rtt_sizing`] and a running link-clearing probe
-    /// this is the clean-probe sample - a value the connection's own
-    /// standing queue cannot inflate - falling back to the raw sample
-    /// until the first ping completes. Without the probe there is nothing
-    /// keeping clean samples fresh, so sizing uses the latest raw sample,
-    /// queueing included.
-    pub fn sizing_rtt(&self) -> Option<Duration> {
-        let probing = self
-            .transit_recv
-            .as_ref()
-            .is_some_and(|recv| recv.clean_policy);
-        if self.clean_rtt_sizing && probing {
-            self.clean_rtt.or(self.rtt)
-        } else {
-            self.rtt
-        }
-    }
-
-    /// Returns whether outbound frames other than probe/control frames
-    /// must be held back for a link-clearing probe.
+    /// Returns whether outbound frames other than probe frames
+    /// must be held back for the link-clearing probe.
     pub fn probe_paused(&self) -> bool {
-        matches!(
-            self.probe,
-            ProbeState::InitWait { .. } | ProbeState::InitPing { .. } | ProbeState::RespWait { .. }
-        )
+        self.probe.paused()
     }
 
     /// Notifies the transit window that `len` bytes of `DATA` payload were received
     /// and stored in this muxer.
     pub fn transit_recv_freed(&mut self, len: usize) {
-        let rtt = self.sizing_rtt();
+        let rtt = self.rtt;
         if let Some(recv) = self.transit_recv.as_mut() {
             let len = u32::try_from(len).unwrap_or(u32::MAX);
             recv.freed = recv.freed.saturating_add(len);
-            if recv.bw_gate || recv.clean_policy {
-                // Measure the arrival rate over buckets of at least
-                // max(2 x RTT, 10ms) - rates sampled over shorter horizons
-                // are burst artifacts, not throughput.
-                recv.rate_bucket_bytes += u64::from(len);
-                let bucket =
-                    (2 * rtt.unwrap_or(Duration::from_millis(5))).max(Duration::from_millis(10));
-                let elapsed = recv.rate_bucket_start.elapsed();
-                if elapsed >= bucket {
-                    let rate = recv.rate_bucket_bytes as f64 / elapsed.as_secs_f64();
-                    recv.rate_ema = if recv.rate_ema == 0.0 {
-                        rate
-                    } else {
-                        0.5 * recv.rate_ema + 0.5 * rate
-                    };
-                    recv.rate_bucket_bytes = 0;
-                    recv.rate_bucket_start = Instant::now();
-                }
+            // Measure the arrival rate over buckets of at least
+            // max(2 x RTT, 10ms) - rates sampled over shorter horizons
+            // are burst artifacts, not throughput.
+            recv.rate_bucket_bytes += u64::from(len);
+            let bucket =
+                (2 * rtt.unwrap_or(Duration::from_millis(5))).max(Duration::from_millis(10));
+            let elapsed = recv.rate_bucket_start.elapsed();
+            if elapsed >= bucket {
+                let rate = recv.rate_bucket_bytes as f64 / elapsed.as_secs_f64();
+                recv.rate_ema = if recv.rate_ema == 0.0 {
+                    rate
+                } else {
+                    0.5 * recv.rate_ema + 0.5 * rate
+                };
+                recv.rate_bucket_bytes = 0;
+                recv.rate_bucket_start = Instant::now();
             }
         }
     }
@@ -151,106 +93,352 @@ impl GlobalPool {
             return None;
         }
 
-        let rtt = if recv.min_rtt_filter {
-            self.min_rtt.get().or(self.rtt)
-        } else {
-            self.rtt
-        };
+        // Growth needs evidence of window limitation, judged against the
+        // clean-probe RTT - a yardstick our own queue cannot inflate.
+        // The measured arrival rate is capped by the current window, so
+        // it cannot size the next window directly (chicken-and-egg);
+        // instead it bounds growth: the window doubles while limited,
+        // ceilinged at 2 x rate x clean RTT, which stops growth at
+        // about twice the loop BDP once the link is the bottleneck.
+        // Grow-only.
         let elapsed = recv.last_update.elapsed();
-        let optimal = if recv.clean_policy {
-            // Growth needs evidence of window limitation, judged against the
-            // clean-probe RTT - a yardstick our own queue cannot inflate.
-            // The measured arrival rate is capped by the current window, so
-            // it cannot size the next window directly (chicken-and-egg);
-            // instead it bounds growth: the window doubles while limited,
-            // ceilinged at 2 x rate x clean RTT, which stops growth at
-            // about twice the loop BDP once the link is the bottleneck.
-            // Grow-only for now.
-            match self.clean_rtt {
-                Some(clean) if recv.rate_ema > 0.0 && elapsed < 2 * clean => {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let ceiling = (2.0 * clean.as_secs_f64() * recv.rate_ema) as u32;
-                    recv.current
-                        .saturating_mul(2)
-                        .min(ceiling)
-                        .max(recv.current)
-                },
-                _ => recv.current,
-            }
-        } else if recv.bw_gate {
-            // Growth trigger: evidence of window limitation - the window is
-            // cycling faster than the credit loop can breathe. Deliberately
-            // uses the latest RTT sample (the operational loop time, queueing
-            // included), like quiche's 2x smoothed-RTT rule: permissiveness
-            // here is safe because growth is still gated on the arrival rate.
-            // Growth gate: the bucket-measured, direction-pure arrival rate
-            // must demonstrably increase - under saturation it caps at the
-            // link share, so self-inflicted queueing can never feed growth.
-            let window_limited = self.rtt.is_some_and(|rtt| elapsed < 2 * rtt);
-            // The 1.25 margin keeps measurement noise on a rate plateau from
-            // producing record samples that would each double the window
-            // (compare BBR's 1.25x bandwidth probe): growth must demonstrably
-            // pay for itself.
-            if window_limited && recv.rate_ema > 0.0 && recv.rate_ema > recv.max_rate * 1.25 {
-                recv.max_rate = recv.rate_ema;
-                recv.current.saturating_mul(2)
-            } else {
-                // Deliberately asymmetric, like every battle-tested
-                // implementation: the autotuner never shrinks. Shrinking
-                // belongs to an external signal (memory pressure, idle).
+        let optimal = match self.rtt {
+            Some(rtt) if recv.rate_ema > 0.0 && elapsed < 2 * rtt => {
+                #[allow(clippy::cast_possible_truncation)]
+                let ceiling = (2.0 * rtt.as_secs_f64() * recv.rate_ema) as u32;
                 recv.current
-            }
-        } else {
-            rtt.map(|rtt| Self::get_optimal(recv.freed, elapsed, rtt))
-                .unwrap_or(recv.current)
+                    .saturating_mul(2)
+                    .min(ceiling)
+                    .max(recv.current)
+            },
+            _ => recv.current,
         };
-        let clamped = optimal
-            // Window cannot shrink below the initial size.
-            .max(recv.initial.get())
-            // Window cannot shrink by more than 25% in one round.
-            .max(recv.current - recv.current / 4)
-            // Window cannot grow by more than 100% in one round.
-            .min(recv.current.saturating_mul(2))
-            // Window cannot outgrow the configured limit.
-            .min(recv.max);
+        let clamped = optimal.min(recv.max);
 
-        let update = if clamped > recv.current {
-            recv.freed + (clamped - recv.current)
-        } else {
-            recv.freed - (recv.current - clamped)
-        };
+        let update = recv.freed + (clamped - recv.current);
         recv.current = clamped;
         recv.freed = 0;
         recv.last_update = Instant::now();
 
         (update > 0).then_some(update)
     }
-
-    /// Same policy as the per-stream receive window autotune.
-    #[allow(clippy::cast_possible_truncation)]
-    fn get_optimal(freed: u32, time_since_update: Duration, rtt: Duration) -> u32 {
-        let new_window =
-            1.5 * rtt.as_secs_f64() * f64::from(freed) / time_since_update.as_secs_f64();
-        new_window as u32
-    }
 }
 
-/// State machine of the cooperative link-clearing probe (`CLEAR_LINK`).
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ProbeState {
-    /// No probe in progress.
-    #[default]
+/// The cooperative link-clearing probe.
+///
+/// This is the only `PING` mechanism in rammux. Every interval, one side
+/// pauses its data output, both sides drain the link with a `CLEAR_LINK`
+/// exchange, and each measures RTT with a `PING` exchange over the empty
+/// link. A probe that does not complete within one interval kills the
+/// connection - it is also the liveness check.
+///
+/// The dance (I = initiator, R = responder; each direction of the
+/// transport is ordered, so a `CLEAR_LINK` frame is a drain barrier):
+///
+/// ```text
+/// I: pause data, send CLEAR_LINK
+/// R: receive CLEAR_LINK -> pause data, send CLEAR_LINK
+/// I: receive CLEAR_LINK (R->I is drained) -> send PING
+/// R: receive PING (I->R is drained) -> send PONG, own PING, resume data
+/// I: receive PONG (clean RTT), receive R's PING -> send PONG, resume data
+/// R: receive PONG (clean RTT)
+/// ```
+///
+/// Both sides can initiate simultaneously; each then treats the peer's
+/// `CLEAR_LINK` as the response to its own and both act as initiators.
+pub struct Probe {
+    /// In [`ProbeState::Idle`]: elapses when the next probe is due.
+    /// In every other state: elapses when the running probe times out.
+    sleep: Pin<Box<Sleep>>,
+    /// Interval between probes; also the running probe's timeout.
+    interval: Duration,
+    /// When the running probe started (left [`ProbeState::Idle`]).
+    started_at: Instant,
+    /// Protocol state.
+    state: ProbeState,
+    /// Response owed to the peer's probe `PING`.
+    pong: Option<PingPayload>,
+}
+
+/// See [`Probe`] doc for the dance these states walk through.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProbeState {
+    /// No probe in flight; data flows.
     Idle,
-    /// We initiated: data paused, `CLEAR_LINK` sent, waiting for the peer's.
-    InitWait { since: Instant },
-    /// Peer's `CLEAR_LINK` received: data paused, our probe ping in flight.
-    InitPing { since: Instant },
-    /// Peer initiated: data paused, our `CLEAR_LINK` queued,
-    /// waiting for the peer's probe ping request.
-    RespWait { since: Instant },
-    /// Pong and own probe ping queued, data resumed,
-    /// waiting for our response to record the clean sample.
-    RespFinish,
+    /// Data paused; our `CLEAR_LINK` waits to be sent, then `next`.
+    SendClear { next: AfterClear },
+    /// Initiator: `CLEAR_LINK` sent, waiting for the peer's.
+    AwaitClear,
+    /// Responder: `CLEAR_LINK` sent, waiting for the peer's probe `PING`.
+    AwaitPing,
+    /// Our probe `PING` waits to be sent over the drained link.
+    ///
+    /// `resume`: data flow resumes as soon as it is sent (responder side -
+    /// its pong and ping lead the resumed data on the drained link).
+    /// `peer_pinged`: the peer's own probe `PING` was already received.
+    SendPing { resume: bool, peer_pinged: bool },
+    /// Probe `PING` sent. The probe completes when the pong has arrived
+    /// (`rtt`) and the peer's own probe `PING` has been answered
+    /// (`peer_pinged`) - answering it after resuming data would let data
+    /// queue in front of our pong and contaminate the peer's sample.
+    AwaitPong {
+        payload: PingPayload,
+        sent_at: Instant,
+        resumed: bool,
+        peer_pinged: bool,
+        rtt: Option<Duration>,
+    },
+}
+
+/// Successor of [`ProbeState::SendClear`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AfterClear {
+    /// We initiated: wait for the peer's `CLEAR_LINK`.
+    AwaitClear,
+    /// The peer initiated: wait for the peer's probe `PING`.
+    AwaitPing,
+    /// Collision - the peer's `CLEAR_LINK` already arrived: follow our
+    /// `CLEAR_LINK` directly with the probe `PING`.
+    SendPing,
+}
+
+/// A completed probe.
+pub struct ProbeDone {
+    /// The clean RTT sample.
+    pub rtt: Duration,
+    /// Whether data flow resumes with this completion
+    /// (the caller should wake the streams).
+    pub resume: bool,
+}
+
+/// A probe frame ready to be encoded.
+pub enum ProbeFrame {
+    /// `CLEAR_LINK`.
+    Clear,
+    /// Our probe `PING` request.
+    Ping(PingPayload),
+    /// Response to the peer's probe `PING`.
+    Pong(PingPayload),
+}
+
+impl Probe {
+    /// Creates a new probe machine. The first probe is due immediately.
+    pub fn new(interval: Duration) -> Self {
+        Self {
+            sleep: Box::pin(tokio::time::sleep(Duration::ZERO)),
+            interval,
+            started_at: Instant::now(),
+            state: ProbeState::Idle,
+            pong: None,
+        }
+    }
+
+    /// Returns whether outbound frames other than probe frames must be
+    /// held back.
+    pub fn paused(&self) -> bool {
+        match self.state {
+            ProbeState::Idle => false,
+            ProbeState::AwaitPong { resumed, .. } => !resumed,
+            _ => true,
+        }
+    }
+
+    /// Returns whether the peer's data direction is drained: past its
+    /// `CLEAR_LINK`, only probe frames may arrive until the probe runs
+    /// its course.
+    pub fn peer_must_be_silent(&self) -> bool {
+        match self.state {
+            ProbeState::Idle | ProbeState::AwaitClear => false,
+            ProbeState::SendClear { next } => next != AfterClear::AwaitClear,
+            _ => true,
+        }
+    }
+
+    /// Drives the probe clock: schedules the next probe when due, and
+    /// fails when the running probe does not complete within one interval.
+    pub fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ErrorKind>> {
+        std::task::ready!(self.sleep.poll_unpin(cx));
+        match self.state {
+            ProbeState::Idle => {
+                // The next probe is due: pause data, queue our CLEAR_LINK.
+                self.begin(AfterClear::AwaitClear);
+                Poll::Ready(Ok(()))
+            },
+            _ => Poll::Ready(Err(ErrorKind::ProbeTimeout {
+                elapsed: self.started_at.elapsed(),
+            })),
+        }
+    }
+
+    /// Enters a probe: data pauses now, `CLEAR_LINK` goes out next.
+    fn begin(&mut self, next: AfterClear) {
+        self.started_at = Instant::now();
+        self.sleep.as_mut().reset(self.started_at + self.interval);
+        self.state = ProbeState::SendClear { next };
+    }
+
+    /// Completes a probe and schedules the next one.
+    fn finish(&mut self, rtt: Duration, resumed: bool) -> Option<ProbeDone> {
+        self.state = ProbeState::Idle;
+        self.sleep.as_mut().reset(Instant::now() + self.interval);
+        Some(ProbeDone {
+            rtt,
+            resume: !resumed,
+        })
+    }
+
+    /// Handles an inbound `CLEAR_LINK`.
+    pub fn on_clear_link(&mut self) -> Result<(), ErrorKind> {
+        match self.state {
+            // The peer initiated: pause data, answer with our own
+            // CLEAR_LINK, then wait for the peer's probe ping.
+            ProbeState::Idle => {
+                self.begin(AfterClear::AwaitPing);
+                Ok(())
+            },
+            // Collision before our CLEAR_LINK went out: the peer's counts
+            // as the response to ours, so ours is followed directly by the
+            // probe ping.
+            ProbeState::SendClear {
+                next: AfterClear::AwaitClear,
+            } => {
+                self.state = ProbeState::SendClear {
+                    next: AfterClear::SendPing,
+                };
+                Ok(())
+            },
+            // Our own probe: the peer's response (or a colliding
+            // initiation - same thing). The link toward us is drained;
+            // measure it.
+            ProbeState::AwaitClear => {
+                self.state = ProbeState::SendPing {
+                    resume: false,
+                    peer_pinged: false,
+                };
+                Ok(())
+            },
+            _ => Err(ErrorKind::Probe("unexpected CLEAR_LINK")),
+        }
+    }
+
+    /// Handles the peer's probe `PING` request.
+    pub fn on_ping(&mut self, payload: PingPayload) -> Result<Option<ProbeDone>, ErrorKind> {
+        if self.pong.is_some() {
+            return Err(ErrorKind::UnexpectedPing(payload));
+        }
+        match self.state {
+            // The peer's probe ping arrived over the drained link: pong
+            // it, send our own probe ping, and resume data right after.
+            ProbeState::AwaitPing => {
+                self.pong = Some(payload);
+                self.state = ProbeState::SendPing {
+                    resume: true,
+                    peer_pinged: true,
+                };
+                Ok(None)
+            },
+            ProbeState::SendPing {
+                resume,
+                peer_pinged: false,
+            } => {
+                self.pong = Some(payload);
+                self.state = ProbeState::SendPing {
+                    resume,
+                    peer_pinged: true,
+                };
+                Ok(None)
+            },
+            ProbeState::AwaitPong {
+                payload: ours,
+                sent_at,
+                resumed,
+                peer_pinged: false,
+                rtt,
+            } => {
+                self.pong = Some(payload);
+                match rtt {
+                    Some(rtt) => Ok(self.finish(rtt, resumed)),
+                    None => {
+                        self.state = ProbeState::AwaitPong {
+                            payload: ours,
+                            sent_at,
+                            resumed,
+                            peer_pinged: true,
+                            rtt,
+                        };
+                        Ok(None)
+                    },
+                }
+            },
+            _ => Err(ErrorKind::UnexpectedPing(payload)),
+        }
+    }
+
+    /// Handles the peer's `PING` response to our probe ping.
+    pub fn on_pong(&mut self, payload: PingPayload) -> Result<Option<ProbeDone>, ErrorKind> {
+        match self.state {
+            ProbeState::AwaitPong {
+                payload: expected,
+                sent_at,
+                resumed,
+                peer_pinged,
+                rtt: None,
+            } if expected == payload => {
+                let rtt = sent_at.elapsed();
+                if peer_pinged {
+                    Ok(self.finish(rtt, resumed))
+                } else {
+                    // The peer's own probe ping is still on its way; hold
+                    // the pause until we have answered it.
+                    self.state = ProbeState::AwaitPong {
+                        payload: expected,
+                        sent_at,
+                        resumed,
+                        peer_pinged,
+                        rtt: Some(rtt),
+                    };
+                    Ok(None)
+                }
+            },
+            _ => Err(ErrorKind::UnexpectedPing(payload)),
+        }
+    }
+
+    /// Next probe frame to send, if any, and whether sending it resumes
+    /// data flow (the caller should wake the streams).
+    pub fn next_frame(&mut self) -> Option<(ProbeFrame, bool)> {
+        if let Some(payload) = self.pong.take() {
+            return Some((ProbeFrame::Pong(payload), false));
+        }
+        match self.state {
+            ProbeState::SendClear { next } => {
+                self.state = match next {
+                    AfterClear::AwaitClear => ProbeState::AwaitClear,
+                    AfterClear::AwaitPing => ProbeState::AwaitPing,
+                    AfterClear::SendPing => ProbeState::SendPing {
+                        resume: false,
+                        peer_pinged: false,
+                    },
+                };
+                Some((ProbeFrame::Clear, false))
+            },
+            ProbeState::SendPing {
+                resume,
+                peer_pinged,
+            } => {
+                let payload = PingPayload::random();
+                self.state = ProbeState::AwaitPong {
+                    payload,
+                    sent_at: Instant::now(),
+                    resumed: resume,
+                    peer_pinged,
+                    rtt: None,
+                };
+                Some((ProbeFrame::Ping(payload), resume))
+            },
+            _ => None,
+        }
+    }
 }
 
 /// Sender side of the transit window: how many more bytes of `DATA` payload
@@ -264,24 +452,14 @@ pub struct TransitSend {
 /// Credit is freed as soon as `DATA` payload is received and stored in this muxer,
 /// independently of when the application reads it.
 pub struct TransitRecv {
-    /// Initial window size, also the shrink floor.
-    pub initial: NonZeroU32,
     /// Current window size.
     pub current: u32,
     /// Bytes freed since the last update.
     pub freed: u32,
     /// Autotune growth limit.
     pub max: u32,
-    /// Use the sliding-window minimum RTT instead of the latest sample.
-    pub min_rtt_filter: bool,
-    /// Gate growth on the payload arrival rate exceeding the best rate seen so far.
-    pub bw_gate: bool,
-    /// Size the window from the clean-probe RTT and the arrival rate; grow-only.
-    pub clean_policy: bool,
     /// Smoothed arrival rate, bytes per second.
     pub rate_ema: f64,
-    /// Best smoothed arrival rate observed, bytes per second.
-    pub max_rate: f64,
     /// Start of the current rate-measurement bucket.
     pub rate_bucket_start: Instant,
     /// Payload bytes received in the current rate-measurement bucket.
@@ -291,17 +469,12 @@ pub struct TransitRecv {
 }
 
 impl TransitRecv {
-    pub fn new(initial: NonZeroU32, max: u32, min_rtt_filter: bool, bw_gate: bool) -> Self {
+    pub fn new(initial: NonZeroU32, max: u32) -> Self {
         Self {
-            initial,
             current: initial.get(),
             freed: 0,
             max: max.max(initial.get()),
-            min_rtt_filter,
-            bw_gate,
-            clean_policy: false,
             rate_ema: 0.0,
-            max_rate: 0.0,
             rate_bucket_start: Instant::now(),
             rate_bucket_bytes: 0,
             last_update: Instant::now(),
@@ -313,33 +486,126 @@ impl TransitRecv {
     }
 }
 
-/// Sliding-window minimum RTT estimator.
-///
-/// Keeps a monotonic deque of samples from the last [`Self::WINDOW`].
-#[derive(Default)]
-pub struct MinRtt {
-    samples: VecDeque<(Instant, Duration)>,
-}
+#[cfg(test)]
+mod test {
+    use super::*;
 
-impl MinRtt {
-    const WINDOW: Duration = Duration::from_secs(600);
-
-    pub fn push(&mut self, rtt: Duration) {
-        let now = Instant::now();
-        while self.samples.back().is_some_and(|(_, d)| *d >= rtt) {
-            self.samples.pop_back();
-        }
-        self.samples.push_back((now, rtt));
-        while self
-            .samples
-            .front()
-            .is_some_and(|(at, _)| now.duration_since(*at) > Self::WINDOW)
-        {
-            self.samples.pop_front();
-        }
+    fn poll_probe(probe: &mut Probe) -> Poll<Result<(), ErrorKind>> {
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        probe.poll(&mut cx)
     }
 
-    pub fn get(&self) -> Option<Duration> {
-        self.samples.front().map(|(_, d)| *d)
+    fn frame_kind(frame: Option<(ProbeFrame, bool)>) -> Option<(&'static str, bool)> {
+        frame.map(|(frame, resume)| {
+            let kind = match frame {
+                ProbeFrame::Clear => "clear",
+                ProbeFrame::Ping(..) => "ping",
+                ProbeFrame::Pong(..) => "pong",
+            };
+            (kind, resume)
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initiator_flow() {
+        let mut probe = Probe::new(Duration::from_secs(5));
+        // Due immediately.
+        assert!(matches!(poll_probe(&mut probe), Poll::Ready(Ok(()))));
+        assert!(probe.paused());
+        assert_eq!(frame_kind(probe.next_frame()), Some(("clear", false)));
+        assert!(frame_kind(probe.next_frame()).is_none());
+        // Peer's CLEAR_LINK arrives: our ping goes out.
+        probe.on_clear_link().unwrap();
+        assert_eq!(frame_kind(probe.next_frame()), Some(("ping", false)));
+        assert!(probe.paused());
+        let ProbeState::AwaitPong { payload, .. } = probe.state else {
+            panic!("expected AwaitPong");
+        };
+        // Pong arrives first, then the peer's own ping (asymmetric order).
+        tokio::time::advance(Duration::from_millis(40)).await;
+        assert!(probe.on_pong(payload).unwrap().is_none());
+        assert!(
+            probe.paused(),
+            "pause holds until the peer's ping is answered"
+        );
+        let done = probe.on_ping(PingPayload::random()).unwrap().unwrap();
+        assert_eq!(done.rtt, Duration::from_millis(40));
+        assert!(done.resume);
+        assert!(!probe.paused());
+        // The owed pong goes out before resumed data.
+        assert_eq!(frame_kind(probe.next_frame()), Some(("pong", false)));
+        assert!(frame_kind(probe.next_frame()).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn responder_flow() {
+        let mut probe = Probe::new(Duration::from_secs(5));
+        probe
+            .sleep
+            .as_mut()
+            .reset(Instant::now() + Duration::from_secs(5));
+        // Peer initiates.
+        probe.on_clear_link().unwrap();
+        assert!(probe.paused());
+        assert!(probe.peer_must_be_silent());
+        assert_eq!(frame_kind(probe.next_frame()), Some(("clear", false)));
+        // Peer's probe ping arrives over the drained link.
+        assert!(probe.on_ping(PingPayload::random()).unwrap().is_none());
+        // Pong leads, then our own ping resumes data.
+        assert_eq!(frame_kind(probe.next_frame()), Some(("pong", false)));
+        assert_eq!(frame_kind(probe.next_frame()), Some(("ping", true)));
+        assert!(!probe.paused());
+        let ProbeState::AwaitPong { payload, .. } = probe.state else {
+            panic!("expected AwaitPong");
+        };
+        let done = probe.on_pong(payload).unwrap().unwrap();
+        assert!(!done.resume, "responder resumed at ping send already");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collision_flow() {
+        let mut probe = Probe::new(Duration::from_secs(5));
+        assert!(matches!(poll_probe(&mut probe), Poll::Ready(Ok(()))));
+        // The peer's CLEAR_LINK arrives before ours went out.
+        probe.on_clear_link().unwrap();
+        assert_eq!(frame_kind(probe.next_frame()), Some(("clear", false)));
+        assert_eq!(frame_kind(probe.next_frame()), Some(("ping", false)));
+        let ProbeState::AwaitPong { payload, .. } = probe.state else {
+            panic!("expected AwaitPong");
+        };
+        // Symmetric order: the peer's ping first, then its pong.
+        assert!(probe.on_ping(PingPayload::random()).unwrap().is_none());
+        assert_eq!(frame_kind(probe.next_frame()), Some(("pong", false)));
+        let done = probe.on_pong(payload).unwrap().unwrap();
+        assert!(done.resume);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_kills() {
+        let mut probe = Probe::new(Duration::from_secs(5));
+        assert!(matches!(poll_probe(&mut probe), Poll::Ready(Ok(()))));
+        assert_eq!(frame_kind(probe.next_frame()), Some(("clear", false)));
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(matches!(
+            poll_probe(&mut probe),
+            Poll::Ready(Err(ErrorKind::ProbeTimeout { .. }))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn strictness() {
+        let mut probe = Probe::new(Duration::from_secs(5));
+        probe
+            .sleep
+            .as_mut()
+            .reset(Instant::now() + Duration::from_secs(5));
+        // No bare pings: a PING outside a probe is a violation.
+        assert!(probe.on_ping(PingPayload::random()).is_err());
+        assert!(probe.on_pong(PingPayload::random()).is_err());
+        // Responder cannot receive a second CLEAR_LINK.
+        probe.on_clear_link().unwrap();
+        probe.next_frame();
+        assert!(probe.on_clear_link().is_err());
     }
 }

@@ -85,13 +85,6 @@ struct Args {
     r_transit_kb: u32,
     #[arg(long, default_value_t = 4096)]
     r_transit_max_kb: u32,
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    r_clean: bool,
-    /// Use the clean-probe RTT for stream autotune and the transit rate
-    /// meter too, not just the transit growth policy (the library default;
-    /// pass false to A/B raw-RTT sizing).
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    r_clean_all: bool,
     /// Per-stream window autotune gain (window targets gain x rate x RTT).
     #[arg(long, default_value_t = 1.5)]
     r_stream_gain: f64,
@@ -303,8 +296,6 @@ fn rammux_config(args: &Args) -> RammuxConfig {
     config.local_transit_window = args.r_transit_kb * 1024;
     config.remote_transit_window = args.r_transit_kb * 1024;
     config.transit_window_max = args.r_transit_max_kb * 1024;
-    config.transit_clean_probe = args.r_clean;
-    config.clean_rtt_sizing = args.r_clean_all;
     config.stream_window_gain = args.r_stream_gain;
     config.stream_window_growth = args.r_stream_grow;
     config.max_inbound_streams = args.streams as u32 + 2;

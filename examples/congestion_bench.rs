@@ -5,14 +5,10 @@
 //! and link queues to CSV on stdout.
 
 use std::{
-    collections::VecDeque,
-    io,
-    pin::Pin,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+        atomic::{AtomicU64, Ordering},
     },
-    task::{Context, Poll, Waker},
     time::Duration,
 };
 
@@ -27,7 +23,6 @@ use rammux::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::Notify,
     time::Instant,
 };
 
@@ -105,15 +100,6 @@ struct Args {
     /// Transit window autotune limit, KiB.
     #[arg(long, default_value_t = 4096)]
     transit_max_kb: u32,
-    /// Use the min-RTT filter for transit window autotuning.
-    #[arg(long, default_value_t = false)]
-    transit_minrtt: bool,
-    /// Gate transit window growth on arrival-rate increase.
-    #[arg(long, default_value_t = false)]
-    transit_bwgate: bool,
-    /// Clean-probe policy: CLEAR_LINK RTT probes drive a grow-only window.
-    #[arg(long, default_value_t = false)]
-    transit_clean: bool,
 
     // ---- sampling ----
     #[arg(long, default_value_t = 500)]
@@ -144,7 +130,7 @@ enum Direction {
 
 #[path = "support/emu.rs"]
 mod emu;
-use emu::{DirGauges, EmuOpts, EmuStream, emu_pair};
+use emu::{DirGauges, EmuOpts, emu_pair};
 
 // ---------------------------------------------------------------------------
 // Workload
@@ -160,9 +146,6 @@ fn rammux_config(args: &Args) -> RammuxConfig {
     config.local_transit_window = args.transit_kb * 1024;
     config.remote_transit_window = args.transit_kb * 1024;
     config.transit_window_max = args.transit_max_kb * 1024;
-    config.transit_min_rtt_filter = args.transit_minrtt;
-    config.transit_bw_gate = args.transit_bwgate;
-    config.transit_clean_probe = args.transit_clean;
     config
 }
 

@@ -6,10 +6,9 @@ use slab::Slab;
 use crate::{
     StreamId,
     codec::RammuxCodec,
-    connection::{downgrade::Downgraded, pings::OutboundPings},
+    connection::downgrade::Downgraded,
     error::ErrorKind,
     global_pool::GlobalPool,
-    header::PingPayload,
     stream::{handle::StreamHandle, updates::StreamUpdates},
 };
 
@@ -57,8 +56,6 @@ pub struct Active<IO> {
     pub codec: RammuxCodec<IO>,
     pub streams: ActiveStreams,
     pub selector: Selector<StreamUpdates, GlobalPool>,
-    pub out_pings: OutboundPings,
-    pub in_ping: Option<PingPayload>,
 }
 
 /// Stores active rammux streams.
