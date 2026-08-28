@@ -237,10 +237,13 @@ pub enum ProbeFrame {
 }
 
 impl Probe {
-    /// Creates a new probe machine. The first probe is due immediately.
+    /// Creates a new probe machine. The first probe is due after one
+    /// interval: probing at t=0 would bury our own `CLEAR_LINK` behind
+    /// the application's opening burst, so the exchange would cost a
+    /// full transport-buffer drain instead of ~1.5 RTT.
     pub fn new(interval: Duration, role: RammuxRole) -> Self {
         Self {
-            sleep: Box::pin(tokio::time::sleep(Duration::ZERO)),
+            sleep: Box::pin(tokio::time::sleep(interval)),
             interval,
             started_at: Instant::now(),
             state: ProbeState::Idle,
@@ -533,6 +536,16 @@ mod test {
         probe.poll(&mut cx)
     }
 
+    /// Waits out the initial interval and starts the first probe.
+    async fn start_probe(probe: &mut Probe) {
+        assert!(
+            matches!(poll_probe(probe), Poll::Pending),
+            "first probe is deferred"
+        );
+        tokio::time::advance(probe.interval).await;
+        assert!(matches!(poll_probe(probe), Poll::Ready(Ok(()))));
+    }
+
     fn frame_kind(frame: Option<(ProbeFrame, bool)>) -> Option<(&'static str, bool)> {
         frame.map(|(frame, resume)| {
             let kind = match frame {
@@ -548,8 +561,7 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn initiator_flow() {
         let mut probe = new_probe(RammuxRole::Client);
-        // Due immediately.
-        assert!(matches!(poll_probe(&mut probe), Poll::Ready(Ok(()))));
+        start_probe(&mut probe).await;
         assert!(probe.paused());
         assert_eq!(frame_kind(probe.next_frame()), Some(("clear+syn", false)));
         assert!(frame_kind(probe.next_frame()).is_none());
@@ -579,10 +591,6 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn responder_flow() {
         let mut probe = new_probe(RammuxRole::Server);
-        probe
-            .sleep
-            .as_mut()
-            .reset(Instant::now() + Duration::from_secs(5));
         // The peer initiates; we answer with a receipt.
         probe.on_clear_link(true).unwrap();
         assert!(probe.paused());
@@ -604,7 +612,7 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn collision_client_waits_for_receipt() {
         let mut probe = new_probe(RammuxRole::Client);
-        assert!(matches!(poll_probe(&mut probe), Poll::Ready(Ok(()))));
+        start_probe(&mut probe).await;
         assert_eq!(frame_kind(probe.next_frame()), Some(("clear+syn", false)));
         // The peer's colliding initiation is no license to ping: it
         // proves nothing about our own direction having drained.
@@ -622,7 +630,7 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn collision_server_demotes() {
         let mut probe = new_probe(RammuxRole::Server);
-        assert!(matches!(poll_probe(&mut probe), Poll::Ready(Ok(()))));
+        start_probe(&mut probe).await;
         assert_eq!(frame_kind(probe.next_frame()), Some(("clear+syn", false)));
         // The client's colliding initiation demotes us to responder:
         // we owe a receipt and wait for the client's ping.
@@ -637,7 +645,7 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn collision_server_demotes_before_send() {
         let mut probe = new_probe(RammuxRole::Server);
-        assert!(matches!(poll_probe(&mut probe), Poll::Ready(Ok(()))));
+        start_probe(&mut probe).await;
         // The client's initiation arrives before our own went out: our
         // queued CLEAR_LINK becomes the receipt - a single frame.
         probe.on_clear_link(true).unwrap();
@@ -649,7 +657,7 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn timeout_kills() {
         let mut probe = new_probe(RammuxRole::Client);
-        assert!(matches!(poll_probe(&mut probe), Poll::Ready(Ok(()))));
+        start_probe(&mut probe).await;
         assert_eq!(frame_kind(probe.next_frame()), Some(("clear+syn", false)));
         tokio::time::advance(Duration::from_secs(6)).await;
         assert!(matches!(
@@ -661,10 +669,6 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn strictness() {
         let mut probe = new_probe(RammuxRole::Server);
-        probe
-            .sleep
-            .as_mut()
-            .reset(Instant::now() + Duration::from_secs(5));
         // No bare pings, and no receipt without an initiation.
         assert!(probe.on_ping(PingPayload::random()).is_err());
         assert!(probe.on_pong(PingPayload::random()).is_err());
@@ -679,7 +683,7 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn strictness_collided_client() {
         let mut probe = new_probe(RammuxRole::Client);
-        assert!(matches!(poll_probe(&mut probe), Poll::Ready(Ok(()))));
+        start_probe(&mut probe).await;
         probe.next_frame();
         probe.on_clear_link(true).unwrap();
         // A second colliding initiation is a violation.
