@@ -72,11 +72,16 @@ impl RawHeader {
                 && u32::from(self.stream_id) == 0
             {
                 Ok(Header::SessionWindowUpdate { update: self.len })
-            } else if self.flags == RawFlags::SESSION | RawFlags::PING
+            } else if (self.flags == RawFlags::SESSION | RawFlags::PING
+                || self.flags == RawFlags::SESSION | RawFlags::PING | RawFlags::SYN)
                 && u32::from(self.stream_id) == 0
                 && self.len == 0
             {
-                Ok(Header::ClearLink)
+                // SYN marks a spontaneous link-clearing initiation;
+                // without it the frame is the responder's receipt.
+                Ok(Header::ClearLink {
+                    syn: self.flags.contains(RawFlags::SYN),
+                })
             } else {
                 Err(DecodeError {
                     header: self,
@@ -200,7 +205,10 @@ pub enum Header {
     SessionWindowUpdate {
         update: u32,
     },
-    ClearLink,
+    ClearLink {
+        /// Spontaneous initiation (`SYN` set) vs the responder's receipt.
+        syn: bool,
+    },
     Term,
 }
 

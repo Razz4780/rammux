@@ -84,7 +84,7 @@ where
                 selector: Selector::new(GlobalPool {
                     rtt: None,
                     available: config.global_recv_window,
-                    probe: Probe::new(config.ping_interval),
+                    probe: Probe::new(config.ping_interval, role),
                     transit_send: (config.remote_transit_window > 0).then(|| TransitSend {
                         credit: config.remote_transit_window,
                     }),
@@ -143,8 +143,8 @@ where
         }
 
         let progress = match frame {
-            DecodedFrame::ClearLink => {
-                active.selector.strategy_mut().probe.on_clear_link()?;
+            DecodedFrame::ClearLink { syn } => {
+                active.selector.strategy_mut().probe.on_clear_link(syn)?;
                 RammuxProgress::Empty
             },
 
@@ -303,7 +303,7 @@ where
 
             if let Some((frame, resume)) = active.selector.strategy_mut().probe.next_frame() {
                 let item = match frame {
-                    ProbeFrame::Clear => EncoderItem::new_clear_link(),
+                    ProbeFrame::Clear(syn) => EncoderItem::new_clear_link(syn),
                     ProbeFrame::Ping(payload) => EncoderItem::new_ping(payload, false),
                     ProbeFrame::Pong(payload) => EncoderItem::new_ping(payload, true),
                 };

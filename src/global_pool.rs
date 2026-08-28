@@ -9,7 +9,7 @@ use std::{
 use futures::FutureExt;
 use tokio::time::{Instant, Sleep};
 
-use crate::{error::ErrorKind, header::PingPayload};
+use crate::{config::RammuxRole, error::ErrorKind, header::PingPayload};
 
 /// Global state shared by all rammux streams within a single rammux connection.
 ///
@@ -43,7 +43,7 @@ impl Default for GlobalPool {
         Self {
             rtt: None,
             available: 0,
-            probe: Probe::new(crate::config::DEFAULT_PING_INTERVAL),
+            probe: Probe::new(crate::config::DEFAULT_PING_INTERVAL, RammuxRole::Client),
             transit_send: None,
             transit_recv: None,
             stream_window_gain: 1.5,
@@ -133,19 +133,27 @@ impl GlobalPool {
 /// connection - it is also the liveness check.
 ///
 /// The dance (I = initiator, R = responder; each direction of the
-/// transport is ordered, so a `CLEAR_LINK` frame is a drain barrier):
+/// transport is ordered, so a `CLEAR_LINK` frame is a drain barrier).
+/// An initiation carries `SYN`; the responder answers with a receipt
+/// (`CLEAR_LINK` without `SYN`), which it can only produce after
+/// consuming everything ahead of the initiation - receiving it therefore
+/// proves both directions are drained:
 ///
 /// ```text
-/// I: pause data, send CLEAR_LINK
-/// R: receive CLEAR_LINK -> pause data, send CLEAR_LINK
-/// I: receive CLEAR_LINK (R->I is drained) -> send PING
+/// I: pause data, send CLEAR_LINK+SYN
+/// R: receive CLEAR_LINK+SYN -> pause data, send CLEAR_LINK receipt
+/// I: receive receipt (both directions drained) -> send PING
 /// R: receive PING (I->R is drained) -> send PONG, own PING, resume data
 /// I: receive PONG (clean RTT), receive R's PING -> send PONG, resume data
 /// R: receive PONG (clean RTT)
 /// ```
 ///
-/// Both sides can initiate simultaneously; each then treats the peer's
-/// `CLEAR_LINK` as the response to its own and both act as initiators.
+/// Colliding initiations tie-break by role: the client stays initiator,
+/// the server demotes to responder - its own initiation stands as its
+/// pause marker and it still sends the receipt. A colliding initiation
+/// is no substitute for the receipt: it was sent spontaneously, so it
+/// proves nothing about our own direction having drained, and pinging on
+/// it would time the residue of our own queue into the sample.
 pub struct Probe {
     /// In [`ProbeState::Idle`]: elapses when the next probe is due.
     /// In every other state: elapses when the running probe times out.
@@ -158,6 +166,9 @@ pub struct Probe {
     state: ProbeState,
     /// Response owed to the peer's probe `PING`.
     pong: Option<PingPayload>,
+    /// Our role, used to tie-break colliding initiations:
+    /// the client stays initiator, the server demotes to responder.
+    role: RammuxRole,
 }
 
 /// See [`Probe`] doc for the dance these states walk through.
@@ -165,10 +176,16 @@ pub struct Probe {
 enum ProbeState {
     /// No probe in flight; data flows.
     Idle,
-    /// Data paused; our `CLEAR_LINK` waits to be sent, then `next`.
-    SendClear { next: AfterClear },
-    /// Initiator: `CLEAR_LINK` sent, waiting for the peer's.
-    AwaitClear,
+    /// Data paused; our `CLEAR_LINK` waits to be sent (`syn` - spontaneous
+    /// initiation or receipt), then `next`.
+    SendClear { syn: bool, next: AfterClear },
+    /// Initiator: `CLEAR_LINK` sent, waiting for the peer's receipt.
+    ///
+    /// `collided`: the peer initiated simultaneously. As the client we
+    /// keep the initiator role, the peer demotes to responder, and its
+    /// receipt is still owed - we must not ping before it arrives, since
+    /// only the receipt proves our own direction has drained.
+    AwaitClear { collided: bool },
     /// Responder: `CLEAR_LINK` sent, waiting for the peer's probe `PING`.
     AwaitPing,
     /// Our probe `PING` waits to be sent over the drained link.
@@ -193,13 +210,10 @@ enum ProbeState {
 /// Successor of [`ProbeState::SendClear`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum AfterClear {
-    /// We initiated: wait for the peer's `CLEAR_LINK`.
-    AwaitClear,
+    /// We initiated: wait for the peer's receipt.
+    AwaitClear { collided: bool },
     /// The peer initiated: wait for the peer's probe `PING`.
     AwaitPing,
-    /// Collision - the peer's `CLEAR_LINK` already arrived: follow our
-    /// `CLEAR_LINK` directly with the probe `PING`.
-    SendPing,
 }
 
 /// A completed probe.
@@ -213,8 +227,9 @@ pub struct ProbeDone {
 
 /// A probe frame ready to be encoded.
 pub enum ProbeFrame {
-    /// `CLEAR_LINK`.
-    Clear,
+    /// `CLEAR_LINK`; `true` marks a spontaneous initiation (`SYN`),
+    /// `false` the responder's receipt.
+    Clear(bool),
     /// Our probe `PING` request.
     Ping(PingPayload),
     /// Response to the peer's probe `PING`.
@@ -223,13 +238,14 @@ pub enum ProbeFrame {
 
 impl Probe {
     /// Creates a new probe machine. The first probe is due immediately.
-    pub fn new(interval: Duration) -> Self {
+    pub fn new(interval: Duration, role: RammuxRole) -> Self {
         Self {
             sleep: Box::pin(tokio::time::sleep(Duration::ZERO)),
             interval,
             started_at: Instant::now(),
             state: ProbeState::Idle,
             pong: None,
+            role,
         }
     }
 
@@ -248,8 +264,14 @@ impl Probe {
     /// its course.
     pub fn peer_must_be_silent(&self) -> bool {
         match self.state {
-            ProbeState::Idle | ProbeState::AwaitClear => false,
-            ProbeState::SendClear { next } => next != AfterClear::AwaitClear,
+            ProbeState::Idle => false,
+            // Until the peer is known to be in the exchange, its data
+            // is legitimate.
+            ProbeState::SendClear {
+                next: AfterClear::AwaitClear { collided },
+                ..
+            }
+            | ProbeState::AwaitClear { collided } => collided,
             _ => true,
         }
     }
@@ -261,7 +283,7 @@ impl Probe {
         match self.state {
             ProbeState::Idle => {
                 // The next probe is due: pause data, queue our CLEAR_LINK.
-                self.begin(AfterClear::AwaitClear);
+                self.begin(true, AfterClear::AwaitClear { collided: false });
                 Poll::Ready(Ok(()))
             },
             _ => Poll::Ready(Err(ErrorKind::ProbeTimeout {
@@ -271,16 +293,23 @@ impl Probe {
     }
 
     /// Enters a probe: data pauses now, `CLEAR_LINK` goes out next.
-    fn begin(&mut self, next: AfterClear) {
+    fn begin(&mut self, syn: bool, next: AfterClear) {
         self.started_at = Instant::now();
         self.sleep.as_mut().reset(self.started_at + self.interval);
-        self.state = ProbeState::SendClear { next };
+        self.state = ProbeState::SendClear { syn, next };
     }
 
     /// Completes a probe and schedules the next one.
+    ///
+    /// The next probe is jittered by +-10% so the two peers' probe clocks
+    /// do not stay phase-locked (probes re-anchor both sides' timers, so
+    /// without jitter, colliding initiations become the steady state).
     fn finish(&mut self, rtt: Duration, resumed: bool) -> Option<ProbeDone> {
         self.state = ProbeState::Idle;
-        self.sleep.as_mut().reset(Instant::now() + self.interval);
+        let jitter = 0.9 + 0.2 * rand::random::<f64>();
+        self.sleep
+            .as_mut()
+            .reset(Instant::now() + self.interval.mul_f64(jitter));
         Some(ProbeDone {
             rtt,
             resume: !resumed,
@@ -288,29 +317,59 @@ impl Probe {
     }
 
     /// Handles an inbound `CLEAR_LINK`.
-    pub fn on_clear_link(&mut self) -> Result<(), ErrorKind> {
-        match self.state {
-            // The peer initiated: pause data, answer with our own
-            // CLEAR_LINK, then wait for the peer's probe ping.
-            ProbeState::Idle => {
-                self.begin(AfterClear::AwaitPing);
+    ///
+    /// `syn` marks a spontaneous initiation; without it the frame is the
+    /// responder's receipt, sent only in response to our own initiation.
+    /// The receipt is the initiator's license to ping: the peer produced
+    /// it after consuming everything ahead of our `CLEAR_LINK`, so both
+    /// directions are provably drained. A colliding initiation carries no
+    /// such proof, which is why the demoted side still owes a receipt.
+    pub fn on_clear_link(&mut self, syn: bool) -> Result<(), ErrorKind> {
+        match (self.state, syn) {
+            // The peer initiated: pause data, answer with our receipt,
+            // then wait for the peer's probe ping.
+            (ProbeState::Idle, true) => {
+                self.begin(false, AfterClear::AwaitPing);
                 Ok(())
             },
-            // Collision before our CLEAR_LINK went out: the peer's counts
-            // as the response to ours, so ours is followed directly by the
-            // probe ping.
-            ProbeState::SendClear {
-                next: AfterClear::AwaitClear,
-            } => {
-                self.state = ProbeState::SendClear {
-                    next: AfterClear::SendPing,
+            (ProbeState::Idle, false) => {
+                Err(ErrorKind::Probe("CLEAR_LINK receipt without initiation"))
+            },
+            // Collision: the peer initiated simultaneously. The client
+            // stays initiator and waits for the demoted peer's receipt;
+            // the server becomes a plain responder - its own initiation
+            // stands as its pause marker and the receipt follows it.
+            (
+                ProbeState::SendClear {
+                    syn: true,
+                    next: AfterClear::AwaitClear { collided: false },
+                },
+                true,
+            ) => {
+                self.state = match self.role {
+                    RammuxRole::Client => ProbeState::SendClear {
+                        syn: true,
+                        next: AfterClear::AwaitClear { collided: true },
+                    },
+                    RammuxRole::Server => ProbeState::SendClear {
+                        syn: false,
+                        next: AfterClear::AwaitPing,
+                    },
                 };
                 Ok(())
             },
-            // Our own probe: the peer's response (or a colliding
-            // initiation - same thing). The link toward us is drained;
-            // measure it.
-            ProbeState::AwaitClear => {
+            (ProbeState::AwaitClear { collided: false }, true) => {
+                self.state = match self.role {
+                    RammuxRole::Client => ProbeState::AwaitClear { collided: true },
+                    RammuxRole::Server => ProbeState::SendClear {
+                        syn: false,
+                        next: AfterClear::AwaitPing,
+                    },
+                };
+                Ok(())
+            },
+            // The peer's receipt: both directions are drained, measure.
+            (ProbeState::AwaitClear { .. }, false) => {
                 self.state = ProbeState::SendPing {
                     resume: false,
                     peer_pinged: false,
@@ -337,38 +396,16 @@ impl Probe {
                 };
                 Ok(None)
             },
-            ProbeState::SendPing {
-                resume,
-                peer_pinged: false,
-            } => {
-                self.pong = Some(payload);
-                self.state = ProbeState::SendPing {
-                    resume,
-                    peer_pinged: true,
-                };
-                Ok(None)
-            },
+            // Initiator: the responder's own ping, strictly behind its
+            // pong on the wire, completes the probe.
             ProbeState::AwaitPong {
-                payload: ours,
-                sent_at,
                 resumed,
                 peer_pinged: false,
-                rtt,
+                rtt: Some(rtt),
+                ..
             } => {
                 self.pong = Some(payload);
-                match rtt {
-                    Some(rtt) => Ok(self.finish(rtt, resumed)),
-                    None => {
-                        self.state = ProbeState::AwaitPong {
-                            payload: ours,
-                            sent_at,
-                            resumed,
-                            peer_pinged: true,
-                            rtt,
-                        };
-                        Ok(None)
-                    },
-                }
+                Ok(self.finish(rtt, resumed))
             },
             _ => Err(ErrorKind::UnexpectedPing(payload)),
         }
@@ -411,16 +448,12 @@ impl Probe {
             return Some((ProbeFrame::Pong(payload), false));
         }
         match self.state {
-            ProbeState::SendClear { next } => {
+            ProbeState::SendClear { syn, next } => {
                 self.state = match next {
-                    AfterClear::AwaitClear => ProbeState::AwaitClear,
+                    AfterClear::AwaitClear { collided } => ProbeState::AwaitClear { collided },
                     AfterClear::AwaitPing => ProbeState::AwaitPing,
-                    AfterClear::SendPing => ProbeState::SendPing {
-                        resume: false,
-                        peer_pinged: false,
-                    },
                 };
-                Some((ProbeFrame::Clear, false))
+                Some((ProbeFrame::Clear(syn), false))
             },
             ProbeState::SendPing {
                 resume,
@@ -490,6 +523,10 @@ impl TransitRecv {
 mod test {
     use super::*;
 
+    fn new_probe(role: RammuxRole) -> Probe {
+        Probe::new(Duration::from_secs(5), role)
+    }
+
     fn poll_probe(probe: &mut Probe) -> Poll<Result<(), ErrorKind>> {
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
@@ -499,7 +536,8 @@ mod test {
     fn frame_kind(frame: Option<(ProbeFrame, bool)>) -> Option<(&'static str, bool)> {
         frame.map(|(frame, resume)| {
             let kind = match frame {
-                ProbeFrame::Clear => "clear",
+                ProbeFrame::Clear(true) => "clear+syn",
+                ProbeFrame::Clear(false) => "clear",
                 ProbeFrame::Ping(..) => "ping",
                 ProbeFrame::Pong(..) => "pong",
             };
@@ -509,20 +547,20 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn initiator_flow() {
-        let mut probe = Probe::new(Duration::from_secs(5));
+        let mut probe = new_probe(RammuxRole::Client);
         // Due immediately.
         assert!(matches!(poll_probe(&mut probe), Poll::Ready(Ok(()))));
         assert!(probe.paused());
-        assert_eq!(frame_kind(probe.next_frame()), Some(("clear", false)));
+        assert_eq!(frame_kind(probe.next_frame()), Some(("clear+syn", false)));
         assert!(frame_kind(probe.next_frame()).is_none());
-        // Peer's CLEAR_LINK arrives: our ping goes out.
-        probe.on_clear_link().unwrap();
+        // The peer's receipt arrives: both directions drained, ping.
+        probe.on_clear_link(false).unwrap();
         assert_eq!(frame_kind(probe.next_frame()), Some(("ping", false)));
         assert!(probe.paused());
         let ProbeState::AwaitPong { payload, .. } = probe.state else {
             panic!("expected AwaitPong");
         };
-        // Pong arrives first, then the peer's own ping (asymmetric order).
+        // Pong arrives first, then the peer's own ping (wire order).
         tokio::time::advance(Duration::from_millis(40)).await;
         assert!(probe.on_pong(payload).unwrap().is_none());
         assert!(
@@ -540,17 +578,17 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn responder_flow() {
-        let mut probe = Probe::new(Duration::from_secs(5));
+        let mut probe = new_probe(RammuxRole::Server);
         probe
             .sleep
             .as_mut()
             .reset(Instant::now() + Duration::from_secs(5));
-        // Peer initiates.
-        probe.on_clear_link().unwrap();
+        // The peer initiates; we answer with a receipt.
+        probe.on_clear_link(true).unwrap();
         assert!(probe.paused());
         assert!(probe.peer_must_be_silent());
         assert_eq!(frame_kind(probe.next_frame()), Some(("clear", false)));
-        // Peer's probe ping arrives over the drained link.
+        // The peer's probe ping arrives over the drained link.
         assert!(probe.on_ping(PingPayload::random()).unwrap().is_none());
         // Pong leads, then our own ping resumes data.
         assert_eq!(frame_kind(probe.next_frame()), Some(("pong", false)));
@@ -564,28 +602,55 @@ mod test {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn collision_flow() {
-        let mut probe = Probe::new(Duration::from_secs(5));
+    async fn collision_client_waits_for_receipt() {
+        let mut probe = new_probe(RammuxRole::Client);
         assert!(matches!(poll_probe(&mut probe), Poll::Ready(Ok(()))));
-        // The peer's CLEAR_LINK arrives before ours went out.
-        probe.on_clear_link().unwrap();
-        assert_eq!(frame_kind(probe.next_frame()), Some(("clear", false)));
+        assert_eq!(frame_kind(probe.next_frame()), Some(("clear+syn", false)));
+        // The peer's colliding initiation is no license to ping: it
+        // proves nothing about our own direction having drained.
+        probe.on_clear_link(true).unwrap();
+        assert!(probe.peer_must_be_silent());
+        assert!(
+            frame_kind(probe.next_frame()).is_none(),
+            "no ping before the receipt"
+        );
+        // The demoted server's receipt arrives: now we ping.
+        probe.on_clear_link(false).unwrap();
         assert_eq!(frame_kind(probe.next_frame()), Some(("ping", false)));
-        let ProbeState::AwaitPong { payload, .. } = probe.state else {
-            panic!("expected AwaitPong");
-        };
-        // Symmetric order: the peer's ping first, then its pong.
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collision_server_demotes() {
+        let mut probe = new_probe(RammuxRole::Server);
+        assert!(matches!(poll_probe(&mut probe), Poll::Ready(Ok(()))));
+        assert_eq!(frame_kind(probe.next_frame()), Some(("clear+syn", false)));
+        // The client's colliding initiation demotes us to responder:
+        // we owe a receipt and wait for the client's ping.
+        probe.on_clear_link(true).unwrap();
+        assert_eq!(frame_kind(probe.next_frame()), Some(("clear", false)));
+        assert!(matches!(probe.state, ProbeState::AwaitPing));
         assert!(probe.on_ping(PingPayload::random()).unwrap().is_none());
         assert_eq!(frame_kind(probe.next_frame()), Some(("pong", false)));
-        let done = probe.on_pong(payload).unwrap().unwrap();
-        assert!(done.resume);
+        assert_eq!(frame_kind(probe.next_frame()), Some(("ping", true)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collision_server_demotes_before_send() {
+        let mut probe = new_probe(RammuxRole::Server);
+        assert!(matches!(poll_probe(&mut probe), Poll::Ready(Ok(()))));
+        // The client's initiation arrives before our own went out: our
+        // queued CLEAR_LINK becomes the receipt - a single frame.
+        probe.on_clear_link(true).unwrap();
+        assert_eq!(frame_kind(probe.next_frame()), Some(("clear", false)));
+        assert!(matches!(probe.state, ProbeState::AwaitPing));
+        assert!(frame_kind(probe.next_frame()).is_none());
     }
 
     #[tokio::test(start_paused = true)]
     async fn timeout_kills() {
-        let mut probe = Probe::new(Duration::from_secs(5));
+        let mut probe = new_probe(RammuxRole::Client);
         assert!(matches!(poll_probe(&mut probe), Poll::Ready(Ok(()))));
-        assert_eq!(frame_kind(probe.next_frame()), Some(("clear", false)));
+        assert_eq!(frame_kind(probe.next_frame()), Some(("clear+syn", false)));
         tokio::time::advance(Duration::from_secs(6)).await;
         assert!(matches!(
             poll_probe(&mut probe),
@@ -595,17 +660,34 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn strictness() {
-        let mut probe = Probe::new(Duration::from_secs(5));
+        let mut probe = new_probe(RammuxRole::Server);
         probe
             .sleep
             .as_mut()
             .reset(Instant::now() + Duration::from_secs(5));
-        // No bare pings: a PING outside a probe is a violation.
+        // No bare pings, and no receipt without an initiation.
         assert!(probe.on_ping(PingPayload::random()).is_err());
         assert!(probe.on_pong(PingPayload::random()).is_err());
-        // Responder cannot receive a second CLEAR_LINK.
-        probe.on_clear_link().unwrap();
+        assert!(probe.on_clear_link(false).is_err());
+        // Responder cannot receive another CLEAR_LINK of either kind.
+        probe.on_clear_link(true).unwrap();
         probe.next_frame();
-        assert!(probe.on_clear_link().is_err());
+        assert!(probe.on_clear_link(true).is_err());
+        assert!(probe.on_clear_link(false).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn strictness_collided_client() {
+        let mut probe = new_probe(RammuxRole::Client);
+        assert!(matches!(poll_probe(&mut probe), Poll::Ready(Ok(()))));
+        probe.next_frame();
+        probe.on_clear_link(true).unwrap();
+        // A second colliding initiation is a violation.
+        assert!(probe.on_clear_link(true).is_err());
+        // The peer's ping cannot legally precede our own.
+        let ProbeState::AwaitClear { collided: true } = probe.state else {
+            panic!("expected collided AwaitClear");
+        };
+        assert!(probe.on_ping(PingPayload::random()).is_err());
     }
 }

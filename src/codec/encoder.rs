@@ -49,10 +49,15 @@ impl EncoderItem {
         }
     }
 
-    pub fn new_clear_link() -> Self {
+    pub fn new_clear_link(syn: bool) -> Self {
+        let flags = if syn {
+            RawFlags::SESSION | RawFlags::PING | RawFlags::SYN
+        } else {
+            RawFlags::SESSION | RawFlags::PING
+        };
         let header = RawHeader {
             stream_id: crate::StreamId::from_be_bytes([0, 0, 0]),
-            flags: RawFlags::SESSION | RawFlags::PING,
+            flags,
             len: 0,
         };
         let mut headers = [0; RawHeader::LEN * 2];
