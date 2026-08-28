@@ -90,6 +90,8 @@ where
                     }),
                     transit_recv: NonZeroU32::new(config.local_transit_window)
                         .map(|initial| TransitRecv::new(initial, config.transit_window_max)),
+                    dirty_rtt: None,
+                    stream_window_dirty_rtt: config.stream_window_dirty_rtt,
                     stream_window_gain: config.stream_window_gain,
                     stream_window_growth: config.stream_window_growth,
                 }),
@@ -175,8 +177,17 @@ where
                 } else {
                     active.selector.strategy_mut().probe.on_ping(payload)?
                 };
-                if let Some(ProbeDone { rtt, resume }) = done {
-                    active.selector.strategy_mut().rtt = Some(rtt);
+                if let Some(ProbeDone {
+                    rtt,
+                    dirty_rtt,
+                    resume,
+                }) = done
+                {
+                    let global = active.selector.strategy_mut();
+                    global.rtt = Some(rtt);
+                    if dirty_rtt.is_some() {
+                        global.dirty_rtt = dirty_rtt;
+                    }
                     if resume {
                         active.selector.wake_all();
                     }
