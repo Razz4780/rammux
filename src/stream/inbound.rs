@@ -282,7 +282,7 @@ impl RecvWindow {
         }
 
         let optimal = global
-            .rtt
+            .stream_rtt()
             .map(|rtt| {
                 Self::get_optimal(
                     self.freed,
