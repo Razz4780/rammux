@@ -75,6 +75,9 @@ struct Args {
     chunk_kb: usize,
     #[arg(long, default_value_t = 500)]
     sample_ms: u64,
+    /// Interval for CPU sampling from /proc/self/stat, milliseconds.
+    #[arg(long, default_value_t = 50)]
+    cpu_sample_ms: u64,
 
     // ---- rammux tuning ----
     #[arg(long, default_value_t = 64)]
@@ -157,6 +160,24 @@ fn chunk(args: &Args) -> Bytes {
 
 const ECHO_CHUNK: usize = 1024;
 
+/// Process-wide CPU time so far, in milliseconds.
+///
+/// `utime` and `stime` (fields 14 and 15 of `/proc/self/stat`) are summed
+/// over every thread of the process, so this covers both endpoints and the
+/// whole runtime. They are counted in `USER_HZ` ticks, which is 100 on
+/// Linux for every architecture this benchmark runs on.
+fn cpu_ms() -> Option<(u64, u64)> {
+    const USER_HZ: u64 = 100;
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // The comm field is parenthesised and may contain spaces; fields are
+    // counted from after its closing paren.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let utime: u64 = f.get(11)?.parse().ok()?;
+    let stime: u64 = f.get(12)?.parse().ok()?;
+    Some((utime * 1000 / USER_HZ, stime * 1000 / USER_HZ))
+}
+
 // ---------------------------------------------------------------------------
 // main + scaffolding
 // ---------------------------------------------------------------------------
@@ -185,6 +206,27 @@ async fn main() {
                 println!(
                     "{:.3},link,goodput,to_server_mbps={mbps:.2}",
                     metrics.started.elapsed().as_secs_f64(),
+                );
+            }
+        });
+    }
+
+    // CPU sampler: process-wide user and system time against bytes
+    // delivered, so cost per MiB can be taken over the steady-state window.
+    {
+        let metrics = metrics.clone();
+        let cpu_sample_ms = args.cpu_sample_ms;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(cpu_sample_ms));
+            loop {
+                interval.tick().await;
+                let Some((utime, stime)) = cpu_ms() else {
+                    return;
+                };
+                println!(
+                    "{:.3},proc,cpu,utime_ms={utime},stime_ms={stime},delivered={}",
+                    metrics.started.elapsed().as_secs_f64(),
+                    metrics.delivered.load(Ordering::Relaxed),
                 );
             }
         });
