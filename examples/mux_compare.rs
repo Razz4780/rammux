@@ -88,6 +88,9 @@ struct Args {
     r_transit_kb: u32,
     #[arg(long, default_value_t = 4096)]
     r_transit_max_kb: u32,
+    /// Max DATA frame payload, KiB.
+    #[arg(long, default_value_t = 16)]
+    r_frame_kb: u32,
     /// Link-clearing probe interval (= probe timeout), seconds.
     #[arg(long, default_value_t = 5.0)]
     r_ping_interval_s: f64,
@@ -338,6 +341,7 @@ fn stream_target(args: &Args) -> u64 {
 
 fn rammux_config(args: &Args) -> RammuxConfig {
     let mut config = RammuxConfig::new();
+    config.frame_limit = (args.r_frame_kb * 1024).try_into().unwrap();
     config.local_recv_window = (args.r_stream_window_kb * 1024).try_into().unwrap();
     config.remote_recv_window = args.r_stream_window_kb * 1024;
     config.global_recv_window = args.r_global_window_kb as usize * 1024;
