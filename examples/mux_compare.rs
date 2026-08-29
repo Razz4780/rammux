@@ -110,6 +110,9 @@ struct Args {
     /// Transit window autotune ceiling, as a multiple of the clean-RTT BDP.
     #[arg(long, default_value_t = 2.0)]
     r_transit_gain: f64,
+    /// Print rammux connection stats every 500ms (transit stalls, windows, RTTs).
+    #[arg(long, default_value_t = false)]
+    r_stats: bool,
 
     // ---- yamux tuning ----
     /// Max connection receive window in MiB; 0 keeps the yamux default (1 GiB).
@@ -447,10 +450,15 @@ where
                         Err(error) => return Err(error.to_string()),
                     }
                 }
-                let stats = conn.stats();
+                // Only pay for the snapshot when it is going to be printed:
+                // this loop is the connection's hot path, and charging
+                // rammux for a stat read that yamux and h2 never make would
+                // bias exactly the CPU-per-MiB comparison below.
+                let stats = args.r_stats.then(|| conn.stats());
                 tokio::select! {
                     biased;
-                    _ = stats_tick.tick() => {
+                    _ = stats_tick.tick(), if args.r_stats => {
+                        let stats = stats.expect("guarded by args.r_stats");
                         println!(
                             "{:.3},client,rstats,stall_ms={:.1},stalls={},transit_credit={},transit_window={},rtt_ms={:.2},dirty_rtt_ms={:.2}",
                             metrics.started.elapsed().as_secs_f64(),
@@ -479,10 +487,11 @@ where
         async move {
             let mut conn = server;
             loop {
-                let stats = conn.stats();
+                let stats = args.r_stats.then(|| conn.stats());
                 let progress = tokio::select! {
                     biased;
-                    _ = stats_tick.tick() => {
+                    _ = stats_tick.tick(), if args.r_stats => {
+                        let stats = stats.expect("guarded by args.r_stats");
                         println!(
                             "{:.3},server,rstats,stall_ms={:.1},stalls={},transit_credit={},transit_window={},rtt_ms={:.2},dirty_rtt_ms={:.2}",
                             metrics.started.elapsed().as_secs_f64(),
