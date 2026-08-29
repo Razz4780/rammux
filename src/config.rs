@@ -5,6 +5,27 @@ use std::{fmt, num::NonZeroU32, time::Duration};
 /// Default [`RammuxConfig::ping_interval`].
 pub(crate) const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Which RTT yardstick sizes the credit reserve that decides when a
+/// `SESSION_WINDOW_UPDATE` is sent.
+///
+/// The transit window bounds in-flight bytes, but a grant is only useful
+/// if it reaches the peer *before* the peer's credit runs out. Waiting
+/// until half the window is consumed costs a full BDP of window: with a
+/// trigger at fraction `f` of the window, the credit loop is
+/// `RTT + f x W / rate`, so line rate needs `W = BDP / (1 - f)`.
+/// Reserving credit instead of counting halves removes that penalty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitReserve {
+    /// Send the grant once half the window has been consumed.
+    HalfWindow,
+    /// Reserve `rate x clean RTT` of the peer's credit.
+    CleanRtt,
+    /// Reserve `rate x loaded RTT` of the peer's credit: the grant
+    /// travels behind whatever data is already queued towards the peer,
+    /// so the loaded loop is the honest flight time.
+    DirtyRtt,
+}
+
 /// Role in a rammux connection.
 ///
 /// The only difference between the roles in a rammux connection
@@ -137,6 +158,19 @@ pub struct RammuxConfig {
     ///
     /// This value is a local knob and does not have to be negotiated.
     pub stream_window_growth: u32,
+    /// When a `SESSION_WINDOW_UPDATE` is sent - see [`TransitReserve`].
+    ///
+    /// This value is a local knob and does not have to be negotiated.
+    pub transit_update_reserve: TransitReserve,
+    /// Transit window autotune ceiling, as a multiple of the clean-RTT
+    /// BDP: the window grows while limited, up to `gain x rate x clean RTT`.
+    ///
+    /// Sizing must stay on the clean RTT. Feeding the loaded RTT into the
+    /// ceiling runs away - a bigger window queues more, which raises the
+    /// loaded RTT, which raises the ceiling again.
+    ///
+    /// This value is a local knob and does not have to be negotiated.
+    pub transit_window_gain: f64,
 }
 
 impl RammuxConfig {
@@ -168,6 +202,8 @@ impl RammuxConfig {
             stream_window_dirty_rtt: false,
             stream_window_gain: 1.5,
             stream_window_growth: 2,
+            transit_update_reserve: TransitReserve::HalfWindow,
+            transit_window_gain: 2.0,
         }
     }
 }

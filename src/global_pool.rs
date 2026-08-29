@@ -9,7 +9,11 @@ use std::{
 use futures::FutureExt;
 use tokio::time::{Instant, Sleep};
 
-use crate::{config::RammuxRole, error::ErrorKind, header::PingPayload};
+use crate::{
+    config::{RammuxRole, TransitReserve},
+    error::ErrorKind,
+    header::PingPayload,
+};
 
 /// Global state shared by all rammux streams within a single rammux connection.
 ///
@@ -42,6 +46,24 @@ pub struct GlobalPool {
     /// Per-stream window growth limit: the window can at most multiply
     /// by this factor in a single update round.
     pub stream_window_growth: u32,
+    /// When a `SESSION_WINDOW_UPDATE` is due - see [`TransitReserve`].
+    pub transit_update_reserve: TransitReserve,
+    /// Transit window autotune ceiling, as a multiple of the clean-RTT BDP.
+    pub transit_window_gain: f64,
+    /// Set by a stream whose outbound poll was held back solely by an
+    /// exhausted transit window.
+    ///
+    /// Sticky: streams that returned pending on transit credit are not
+    /// polled again until a grant wakes them, so the flag has to survive
+    /// the passes in between. It is cleared when credit arrives and when
+    /// payload is actually emitted.
+    pub transit_blocked: bool,
+    /// When the current transit stall began, if the sender is stalled.
+    pub stalled_since: Option<Instant>,
+    /// Total time the sender spent stalled on transit credit.
+    pub stalled_total: Duration,
+    /// How many transit stalls the sender has entered.
+    pub stalled_events: u64,
 }
 
 impl Default for GlobalPool {
@@ -56,6 +78,12 @@ impl Default for GlobalPool {
             stream_window_dirty_rtt: false,
             stream_window_gain: 1.5,
             stream_window_growth: 2,
+            transit_update_reserve: TransitReserve::HalfWindow,
+            transit_window_gain: 2.0,
+            transit_blocked: false,
+            stalled_since: None,
+            stalled_total: Duration::ZERO,
+            stalled_events: 0,
         }
     }
 }
@@ -67,6 +95,28 @@ impl GlobalPool {
             self.dirty_rtt.or(self.rtt)
         } else {
             self.rtt
+        }
+    }
+
+    /// Accounts for one completed pass of the outbound loop.
+    ///
+    /// `blocked` means the transport was ready to accept more frames and at
+    /// least one stream had payload to write, but the transit window was
+    /// spent. That is the only state in which the credit-return loop - not
+    /// the link, the peer's stream windows, or the probe pause - is what
+    /// holds the sender back. Time spent with a merely *fully utilised*
+    /// transit window is not a stall: the link is busy draining it.
+    pub fn note_outbound_pass(&mut self, blocked: bool) {
+        match (blocked, self.stalled_since) {
+            (true, None) => {
+                self.stalled_since = Some(Instant::now());
+                self.stalled_events += 1;
+            },
+            (false, Some(at)) => {
+                self.stalled_total += at.elapsed();
+                self.stalled_since = None;
+            },
+            _ => {},
         }
     }
 
@@ -105,8 +155,13 @@ impl GlobalPool {
 
     /// Produces the next `SESSION_WINDOW_UPDATE` value, if one is due.
     pub fn transit_recv_update(&mut self) -> Option<u32> {
+        let loop_rtt = match self.transit_update_reserve {
+            TransitReserve::HalfWindow => None,
+            TransitReserve::CleanRtt => self.rtt,
+            TransitReserve::DirtyRtt => self.dirty_rtt.or(self.rtt),
+        };
         let recv = self.transit_recv.as_mut()?;
-        if recv.can_update().not() {
+        if recv.can_update(loop_rtt).not() {
             return None;
         }
 
@@ -118,11 +173,21 @@ impl GlobalPool {
         // ceilinged at 2 x rate x clean RTT, which stops growth at
         // about twice the loop BDP once the link is the bottleneck.
         // Grow-only.
+        //
+        // The ceiling stays a multiple of the *clean* BDP. Sizing from the
+        // loaded RTT runs away: a bigger window queues more, which raises
+        // the loaded RTT, which raises the ceiling. Measured - the window
+        // grew to 1476-2004 KiB where 768 was enough, and echo p50 went
+        // 46 -> 73 ms. Only the update *timing* may read the loaded RTT.
+        //
+        // The multiple is what the update rule costs. Waiting for half the
+        // window puts half of it out of reach, so line rate needs 2 x BDP.
+        let gain = self.transit_window_gain;
         let elapsed = recv.last_update.elapsed();
         let optimal = match self.rtt {
             Some(rtt) if recv.rate_ema > 0.0 && elapsed < 2 * rtt => {
-                #[allow(clippy::cast_possible_truncation)]
-                let ceiling = (2.0 * rtt.as_secs_f64() * recv.rate_ema) as u32;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let ceiling = (gain * rtt.as_secs_f64() * recv.rate_ema) as u32;
                 recv.current
                     .saturating_mul(2)
                     .min(ceiling)
@@ -672,8 +737,28 @@ impl TransitRecv {
         }
     }
 
-    fn can_update(&self) -> bool {
-        self.freed >= self.current / 2
+    /// Whether a `SESSION_WINDOW_UPDATE` is due.
+    ///
+    /// With `loop_rtt`, the grant is emitted while the peer still holds
+    /// `rate x loop_rtt` of credit - one loop's worth of sending, which
+    /// is what it takes for the grant to reach the peer before its
+    /// credit runs out. Without one (no reserve mode, no RTT sample yet,
+    /// or no arrival rate yet) this falls back to the half-window rule.
+    fn can_update(&self, loop_rtt: Option<Duration>) -> bool {
+        let Some(rtt) = loop_rtt.filter(|_| self.rate_ema > 0.0) else {
+            return self.freed >= self.current / 2;
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let reserve = (self.rate_ema * rtt.as_secs_f64()) as u32;
+        let threshold = self
+            .current
+            .saturating_sub(reserve)
+            // A badly queued link can want a reserve larger than the whole
+            // window. Grants smaller than a sixteenth of it buy nothing
+            // and cost a frame each, so that is the floor.
+            .max(self.current / 16)
+            .max(1);
+        self.freed >= threshold
     }
 }
 

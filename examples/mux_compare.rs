@@ -28,7 +28,7 @@ use clap::{Parser, ValueEnum};
 use emu::{EmuOpts, emu_pair};
 use futures::{SinkExt, StreamExt};
 use rammux::{
-    config::{RammuxConfig, RammuxRole},
+    config::{RammuxConfig, RammuxRole, TransitReserve},
     connection::{RammuxConnection, RammuxProgress},
 };
 use tokio::{
@@ -103,6 +103,13 @@ struct Args {
     /// Per-stream window growth limit per update round.
     #[arg(long, default_value_t = 2)]
     r_stream_grow: u32,
+    /// When SESSION_WINDOW_UPDATE is sent: half (half-window rule),
+    /// clean (reserve rate x clean RTT), dirty (reserve rate x loaded RTT).
+    #[arg(long, default_value = "half")]
+    r_transit_reserve: String,
+    /// Transit window autotune ceiling, as a multiple of the clean-RTT BDP.
+    #[arg(long, default_value_t = 2.0)]
+    r_transit_gain: f64,
 
     // ---- yamux tuning ----
     /// Max connection receive window in MiB; 0 keeps the yamux default (1 GiB).
@@ -352,6 +359,13 @@ fn rammux_config(args: &Args) -> RammuxConfig {
     config.stream_window_dirty_rtt = args.r_stream_dirty_rtt;
     config.stream_window_gain = args.r_stream_gain;
     config.stream_window_growth = args.r_stream_grow;
+    config.transit_window_gain = args.r_transit_gain;
+    config.transit_update_reserve = match args.r_transit_reserve.as_str() {
+        "half" => TransitReserve::HalfWindow,
+        "clean" => TransitReserve::CleanRtt,
+        "dirty" => TransitReserve::DirtyRtt,
+        other => panic!("unknown --r-transit-reserve {other}"),
+    };
     config.max_inbound_streams = args.streams as u32 + 2;
     config.max_outbound_streams = args.streams as u32 + 2;
     config
@@ -375,6 +389,7 @@ where
 
     // Client: open streams and run writers.
     let client_task = {
+        let mut stats_tick = tokio::time::interval(Duration::from_millis(500));
         let metrics = metrics.clone();
         async move {
             let mut conn = client;
@@ -432,9 +447,26 @@ where
                         Err(error) => return Err(error.to_string()),
                     }
                 }
-                match conn.progress().await {
-                    Ok(_) => {},
-                    Err(error) => return Err(error.to_string()),
+                let stats = conn.stats();
+                tokio::select! {
+                    biased;
+                    _ = stats_tick.tick() => {
+                        println!(
+                            "{:.3},client,rstats,stall_ms={:.1},stalls={},transit_credit={},transit_window={},rtt_ms={:.2},dirty_rtt_ms={:.2}",
+                            metrics.started.elapsed().as_secs_f64(),
+                            stats.transit_starved.as_secs_f64() * 1e3,
+                            stats.transit_starved_events,
+                            stats.transit_send_credit.map(|c| c as i64).unwrap_or(-1),
+                            stats.transit_recv_window.map(|w| w as i64).unwrap_or(-1),
+                            stats.rtt.map(|r| r.as_secs_f64() * 1e3).unwrap_or(-1.0),
+                            stats.dirty_rtt.map(|r| r.as_secs_f64() * 1e3).unwrap_or(-1.0),
+                        );
+                    }
+                    progress = conn.progress() => {
+                        if let Err(error) = progress {
+                            return Err(error.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -442,11 +474,30 @@ where
 
     // Server: read and count; echo the first stream in echo mode.
     let server_task = {
+        let mut stats_tick = tokio::time::interval(Duration::from_millis(500));
         let metrics = metrics.clone();
         async move {
             let mut conn = server;
             loop {
-                match conn.progress().await {
+                let stats = conn.stats();
+                let progress = tokio::select! {
+                    biased;
+                    _ = stats_tick.tick() => {
+                        println!(
+                            "{:.3},server,rstats,stall_ms={:.1},stalls={},transit_credit={},transit_window={},rtt_ms={:.2},dirty_rtt_ms={:.2}",
+                            metrics.started.elapsed().as_secs_f64(),
+                            stats.transit_starved.as_secs_f64() * 1e3,
+                            stats.transit_starved_events,
+                            stats.transit_send_credit.map(|c| c as i64).unwrap_or(-1),
+                            stats.transit_recv_window.map(|w| w as i64).unwrap_or(-1),
+                            stats.rtt.map(|r| r.as_secs_f64() * 1e3).unwrap_or(-1.0),
+                            stats.dirty_rtt.map(|r| r.as_secs_f64() * 1e3).unwrap_or(-1.0),
+                        );
+                        continue;
+                    }
+                    progress = conn.progress() => progress,
+                };
+                match progress {
                     Ok(RammuxProgress::Inbound(duplex)) => {
                         let metrics = metrics.clone();
                         tokio::spawn(async move {

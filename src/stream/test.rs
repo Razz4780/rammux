@@ -7,7 +7,7 @@ use futures::{FutureExt, SinkExt, StreamExt};
 use crate::{
     StreamId,
     buffer::Data,
-    config::RammuxConfig,
+    config::{RammuxConfig, TransitReserve},
     global_pool::GlobalPool,
     header::ControlFlags,
     stream::{FinState, RammuxDuplex, handle::StreamHandle, updates::StreamUpdates},
@@ -27,6 +27,8 @@ const CONFIG: RammuxConfig = RammuxConfig {
     stream_window_dirty_rtt: false,
     stream_window_gain: 1.5,
     stream_window_growth: 2,
+    transit_update_reserve: TransitReserve::HalfWindow,
+    transit_window_gain: 2.0,
 };
 
 fn new_stream(

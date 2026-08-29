@@ -5,6 +5,7 @@ use std::{
     convert::Infallible,
     io,
     num::NonZeroU32,
+    ops::Not,
     task::{Context, Poll},
     time::Duration,
 };
@@ -94,6 +95,12 @@ where
                     stream_window_dirty_rtt: config.stream_window_dirty_rtt,
                     stream_window_gain: config.stream_window_gain,
                     stream_window_growth: config.stream_window_growth,
+                    transit_update_reserve: config.transit_update_reserve,
+                    transit_window_gain: config.transit_window_gain,
+                    transit_blocked: false,
+                    stalled_since: None,
+                    stalled_total: Duration::ZERO,
+                    stalled_events: 0,
                 }),
             }),
             config,
@@ -161,6 +168,10 @@ where
                     .checked_add(update)
                     .ok_or(ErrorKind::Transit("transit window overflow"))?;
                 if update > 0 {
+                    // The grant is what the sender was stalled on, so the
+                    // stall ends here rather than on the next outbound pass.
+                    global.transit_blocked = false;
+                    global.note_outbound_pass(false);
                     // Streams gated on transit credit returned Pending without
                     // a stream-level wakeup source, so wake all of them.
                     active.selector.wake_all();
@@ -310,7 +321,15 @@ where
         let active = self.state.active_mut()?;
 
         loop {
-            std::task::ready!(active.codec.poll_ready_unpin(cx))?;
+            match active.codec.poll_ready_unpin(cx) {
+                // The transport itself is backed up: whatever the sender is
+                // waiting on, it is not a transit credit grant.
+                Poll::Pending => {
+                    active.selector.strategy_mut().note_outbound_pass(false);
+                    return Poll::Pending;
+                },
+                Poll::Ready(result) => result?,
+            }
 
             if let Some((frame, resume)) = active.selector.strategy_mut().probe.next_frame() {
                 let item = match frame {
@@ -327,7 +346,9 @@ where
 
             if active.selector.strategy().probe_paused() {
                 // Only probe and ping frames may travel while clearing the
-                // link; flush and wait.
+                // link; flush and wait. The probe pause is its own cost and
+                // must not be charged to the transit window.
+                active.selector.strategy_mut().note_outbound_pass(false);
                 let _ = active.codec.poll_flush_unpin(cx)?;
                 break Poll::Pending;
             }
@@ -340,6 +361,11 @@ where
             }
 
             if let Poll::Ready(Some((update, fin_state))) = active.selector.poll_next_unpin(cx) {
+                if update.data.is_empty().not() {
+                    let global = active.selector.strategy_mut();
+                    global.transit_blocked = false;
+                    global.note_outbound_pass(false);
+                }
                 let id = update.id;
                 let item = EncoderItem::from(update);
                 active.codec.start_send_unpin(item)?;
@@ -353,6 +379,11 @@ where
                 }
                 continue;
             } else {
+                // Every stream came back pending. If at least one of them had
+                // payload ready and only the spent transit window held it
+                // back, the sender is stalled on a credit grant.
+                let blocked = active.selector.strategy().transit_blocked;
+                active.selector.strategy_mut().note_outbound_pass(blocked);
                 let _ = active.codec.poll_flush_unpin(cx)?;
                 break Poll::Pending;
             }
@@ -470,6 +501,23 @@ where
                 )
             })
             .unwrap_or_default();
+        let dirty_rtt = self
+            .state
+            .active()
+            .ok()
+            .and_then(|active| active.selector.strategy().dirty_rtt);
+        let (transit_starved, transit_starved_events) = self
+            .state
+            .active()
+            .map(|active| {
+                let global = active.selector.strategy();
+                let pending = global
+                    .stalled_since
+                    .map(|at| at.elapsed())
+                    .unwrap_or_default();
+                (global.stalled_total + pending, global.stalled_events)
+            })
+            .unwrap_or_default();
         let (transit_send_credit, transit_recv_window) = self
             .state
             .active()
@@ -489,6 +537,9 @@ where
             available_global_recv_window,
             transit_send_credit,
             transit_recv_window,
+            transit_starved,
+            transit_starved_events,
+            dirty_rtt,
         }
     }
 }
@@ -525,6 +576,14 @@ pub struct RammuxStats {
     pub transit_send_credit: Option<u32>,
     /// Current size of the transit window we grant to the peer, if enabled.
     pub transit_recv_window: Option<u32>,
+    /// Loaded RTT from the latest probe, if measured.
+    pub dirty_rtt: Option<Duration>,
+    /// Total time the sender spent stalled on a transit credit grant: the
+    /// transport was writable and stream payload was ready, but the transit
+    /// window was spent.
+    pub transit_starved: Duration,
+    /// How many such stalls the sender entered.
+    pub transit_starved_events: u64,
 }
 
 #[cfg(test)]
