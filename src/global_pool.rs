@@ -209,10 +209,16 @@ enum ProbeState {
     StartupPing { peer_pinged: bool },
     /// Our opening `PING` is out. Completes like any exchange: our
     /// `PONG` is back and the peer's `PING` has been answered.
+    ///
+    /// `resumed`: data flows again. That happens as soon as both our
+    /// `PING` and the `PONG` we owe the peer have left - from then on
+    /// our data can only queue behind them, so neither sample can be
+    /// contaminated and there is nothing left to wait for.
     StartupAwaitPong {
         payload: PingPayload,
         sent_at: Instant,
         peer_pinged: bool,
+        resumed: bool,
         rtt: Option<Duration>,
     },
     /// No probe in flight; data flows.
@@ -321,7 +327,8 @@ impl Probe {
     pub fn paused(&self) -> bool {
         match self.state {
             ProbeState::Idle => false,
-            ProbeState::AwaitPong { resumed, .. } => !resumed,
+            ProbeState::AwaitPong { resumed, .. }
+            | ProbeState::StartupAwaitPong { resumed, .. } => !resumed,
             _ => true,
         }
     }
@@ -472,16 +479,18 @@ impl Probe {
                 payload: ours,
                 sent_at,
                 peer_pinged: false,
+                resumed,
                 rtt,
             } => {
                 self.pong = Some(payload);
                 match rtt {
-                    Some(rtt) => Ok(self.finish(rtt, false)),
+                    Some(rtt) => Ok(self.finish(rtt, resumed)),
                     None => {
                         self.state = ProbeState::StartupAwaitPong {
                             payload: ours,
                             sent_at,
                             peer_pinged: true,
+                            resumed,
                             rtt,
                         };
                         Ok(None)
@@ -521,16 +530,18 @@ impl Probe {
                 payload: expected,
                 sent_at,
                 peer_pinged,
+                resumed,
                 rtt: None,
             } if expected == payload => {
                 let rtt = sent_at.elapsed();
                 if peer_pinged {
-                    Ok(self.finish(rtt, false))
+                    Ok(self.finish(rtt, resumed))
                 } else {
                     self.state = ProbeState::StartupAwaitPong {
                         payload: expected,
                         sent_at,
                         peer_pinged,
+                        resumed,
                         rtt: Some(rtt),
                     };
                     Ok(None)
@@ -567,18 +578,30 @@ impl Probe {
     /// data flow (the caller should wake the streams).
     pub fn next_frame(&mut self) -> Option<(ProbeFrame, bool)> {
         if let Some(payload) = self.pong.take() {
-            return Some((ProbeFrame::Pong(payload), false));
+            // Answering the peer's opening ping is the last thing that
+            // has to precede our data; once it is out, data resumes.
+            let resume = match &mut self.state {
+                ProbeState::StartupAwaitPong { resumed, .. } if !*resumed => {
+                    *resumed = true;
+                    true
+                },
+                _ => false,
+            };
+            return Some((ProbeFrame::Pong(payload), resume));
         }
         match self.state {
             ProbeState::StartupPing { peer_pinged } => {
                 let payload = PingPayload::random();
+                // If we have already answered the peer's ping, this ping
+                // is the last frame that must precede our data.
                 self.state = ProbeState::StartupAwaitPong {
                     payload,
                     sent_at: Instant::now(),
                     peer_pinged,
+                    resumed: peer_pinged,
                     rtt: None,
                 };
-                Some((ProbeFrame::Ping(payload), false))
+                Some((ProbeFrame::Ping(payload), peer_pinged))
             },
             ProbeState::SendClear { syn, next } => {
                 if syn {
@@ -685,13 +708,18 @@ mod test {
             panic!("expected StartupAwaitPong");
         };
         assert!(probe.on_ping(PingPayload::random()).unwrap().is_none());
-        assert_eq!(frame_kind(probe.next_frame()), Some(("pong", false)));
-        let done = probe.on_pong(payload).unwrap().unwrap();
-        assert!(
-            done.resume,
-            "data resumes once the opening exchange is done"
+        assert!(probe.paused(), "still held: the owed pong has not left yet");
+        assert_eq!(
+            frame_kind(probe.next_frame()),
+            Some(("pong", true)),
+            "the owed pong releases the pause"
         );
-        assert!(!probe.paused());
+        assert!(
+            !probe.paused(),
+            "data resumes without waiting for our own pong"
+        );
+        let done = probe.on_pong(payload).unwrap().unwrap();
+        assert!(!done.resume, "already resumed at the pong");
         assert!(matches!(probe.state, ProbeState::Idle));
     }
 
