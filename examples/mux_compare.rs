@@ -28,7 +28,7 @@ use clap::{Parser, ValueEnum};
 use emu::{EmuOpts, emu_pair};
 use futures::{SinkExt, StreamExt};
 use rammux::{
-    config::{RammuxConfig, RammuxRole, TransitReserve},
+    config::{RammuxConfig, RammuxRole},
     connection::{RammuxConnection, RammuxProgress},
 };
 use tokio::{
@@ -63,6 +63,13 @@ struct Args {
     shared_capacity: bool,
     #[arg(long, default_value_t = 42)]
     seed: u64,
+    /// With --transport tcp: bind the server on this port (0 = ephemeral).
+    #[arg(long, default_value_t = 0)]
+    server_port: u16,
+    /// With --transport tcp: dial this address instead of the server's own,
+    /// so the connection can be routed through emu_proxy.
+    #[arg(long)]
+    dial: Option<String>,
 
     // ---- workload ----
     #[arg(long, default_value_t = 8)]
@@ -103,13 +110,6 @@ struct Args {
     /// Per-stream window growth limit per update round.
     #[arg(long, default_value_t = 2)]
     r_stream_grow: u32,
-    /// When SESSION_WINDOW_UPDATE is sent: half (half-window rule),
-    /// clean (reserve rate x clean RTT), dirty (reserve rate x loaded RTT).
-    #[arg(long, default_value = "half")]
-    r_transit_reserve: String,
-    /// Transit window autotune ceiling, as a multiple of the clean-RTT BDP.
-    #[arg(long, default_value_t = 2.0)]
-    r_transit_gain: f64,
     /// Print rammux connection stats every 500ms (transit stalls, windows, RTTs).
     #[arg(long, default_value_t = false)]
     r_stats: bool,
@@ -120,6 +120,14 @@ struct Args {
     y_conn_window_mb: usize,
     #[arg(long, default_value_t = 16)]
     y_split_kb: usize,
+
+    // ---- async-smux tuning ----
+    /// Frames the smux tx queue will hold before the writer blocks.
+    #[arg(long, default_value_t = 1024)]
+    s_tx_queue: usize,
+    /// Frames the smux rx queue will hold before the reader blocks.
+    #[arg(long, default_value_t = 1024)]
+    s_rx_queue: usize,
 
     // ---- hyper/h2 tuning ----
     #[arg(long, default_value_t = 64)]
@@ -137,6 +145,7 @@ enum Proto {
     Rammux,
     Yamux,
     H2,
+    Smux,
 }
 
 #[derive(Clone, Copy, ValueEnum, Debug, PartialEq)]
@@ -309,10 +318,14 @@ async fn run(args: &Args, metrics: Arc<Metrics>) -> Result<(), String> {
             dispatch(args, metrics, io_client, io_server).await
         },
         TransportKind::Tcp => {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let io_client = TcpStream::connect(listener.local_addr().unwrap())
+            let listener = TcpListener::bind(("127.0.0.1", args.server_port))
                 .await
                 .unwrap();
+            let target = match args.dial.as_deref() {
+                Some(addr) => addr.to_string(),
+                None => listener.local_addr().unwrap().to_string(),
+            };
+            let io_client = TcpStream::connect(target).await.unwrap();
             let io_server = listener.accept().await.unwrap().0;
             io_client.set_nodelay(true).unwrap();
             io_server.set_nodelay(true).unwrap();
@@ -334,6 +347,7 @@ where
         Proto::Rammux => run_rammux(args, metrics, io_client, io_server).await,
         Proto::Yamux => run_yamux(args, metrics, io_client, io_server).await,
         Proto::H2 => run_h2(args, metrics, io_client, io_server).await,
+        Proto::Smux => run_smux(args, metrics, io_client, io_server).await,
     }
 }
 
@@ -362,13 +376,6 @@ fn rammux_config(args: &Args) -> RammuxConfig {
     config.stream_window_dirty_rtt = args.r_stream_dirty_rtt;
     config.stream_window_gain = args.r_stream_gain;
     config.stream_window_growth = args.r_stream_grow;
-    config.transit_window_gain = args.r_transit_gain;
-    config.transit_update_reserve = match args.r_transit_reserve.as_str() {
-        "half" => TransitReserve::HalfWindow,
-        "clean" => TransitReserve::CleanRtt,
-        "dirty" => TransitReserve::DirtyRtt,
-        other => panic!("unknown --r-transit-reserve {other}"),
-    };
     config.max_inbound_streams = args.streams as u32 + 2;
     config.max_outbound_streams = args.streams as u32 + 2;
     config
@@ -731,6 +738,140 @@ fn spawn_yamux_server_stream(mut stream: yamux::Stream, metrics: Arc<Metrics>) {
             }
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// async-smux
+// ---------------------------------------------------------------------------
+//
+// smux v1: the frame set is Sync / Finish / Push / Nop, with no window-update
+// command, so there is no flow control of any kind. The only backpressure is
+// the bounded frame queue on each side, which is what `--s-tx-queue` and
+// `--s-rx-queue` size. That makes it the no-flow-control point of comparison
+// rather than a third window policy.
+
+async fn run_smux<IO>(
+    args: &Args,
+    metrics: Arc<Metrics>,
+    io_client: IO,
+    io_server: IO,
+) -> Result<(), String>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    use std::num::NonZeroUsize;
+
+    use async_smux::MuxBuilder;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let queue = |n: usize| NonZeroUsize::new(n.max(1)).expect("nonzero");
+    let (connector, _client_acceptor, client_worker) = MuxBuilder::client()
+        .with_max_tx_queue(queue(args.s_tx_queue))
+        .with_max_rx_queue(queue(args.s_rx_queue))
+        .with_connection(io_client)
+        .build();
+    let (_server_connector, mut acceptor, server_worker) = MuxBuilder::server()
+        .with_max_tx_queue(queue(args.s_tx_queue))
+        .with_max_rx_queue(queue(args.s_rx_queue))
+        .with_connection(io_server)
+        .build();
+    tokio::spawn(client_worker);
+    tokio::spawn(server_worker);
+
+    let target = stream_target(args);
+    let chunk = chunk(args);
+    let echo = args.workload == Workload::Echo;
+    let total = args.streams + usize::from(echo);
+
+    let client_task = {
+        let metrics = metrics.clone();
+        let chunk = chunk.clone();
+        async move {
+            for opened in 0..total {
+                let mut stream = connector.connect().map_err(|e| e.to_string())?;
+                let is_echo = echo && opened == 0;
+                let chunk = chunk.clone();
+                let metrics = metrics.clone();
+                tokio::spawn(async move {
+                    let marker: &[u8] = if is_echo { b"E" } else { b"D" };
+                    if stream.write_all(marker).await.is_err() {
+                        return;
+                    }
+                    // The marker byte counts toward the stream's payload.
+                    if is_echo {
+                        let payload = vec![0u8; ECHO_CHUNK];
+                        let mut buf = vec![0u8; ECHO_CHUNK];
+                        loop {
+                            let sent = Instant::now();
+                            if stream.write_all(&payload).await.is_err() {
+                                return;
+                            }
+                            let mut got = 0usize;
+                            while got < ECHO_CHUNK {
+                                match stream.read(&mut buf[got..]).await {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(n) => got += n,
+                                }
+                            }
+                            metrics.echo_sample(sent.elapsed());
+                        }
+                    } else {
+                        let mut sent = 1u64.min(target);
+                        while sent < target {
+                            let take = (chunk.len() as u64).min(target - sent) as usize;
+                            if stream.write_all(&chunk[..take]).await.is_err() {
+                                return;
+                            }
+                            sent += take as u64;
+                        }
+                        let _ = stream.shutdown().await;
+                    }
+                });
+            }
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    };
+
+    let server_task = {
+        let metrics = metrics.clone();
+        async move {
+            while let Some(mut stream) = acceptor.accept().await {
+                let metrics = metrics.clone();
+                tokio::spawn(async move {
+                    let mut marker = [0u8; 1];
+                    if stream.read_exact(&mut marker).await.is_err() {
+                        return;
+                    }
+                    let is_echo = marker[0] == b'E';
+                    if !is_echo {
+                        metrics.delivered.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let mut buf = vec![0u8; 256 * 1024];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                if is_echo {
+                                    if stream.write_all(&buf[..n]).await.is_err() {
+                                        return;
+                                    }
+                                } else {
+                                    metrics.delivered.fetch_add(n as u64, Ordering::Relaxed);
+                                }
+                            },
+                        }
+                    }
+                });
+            }
+            Err("smux acceptor closed".to_string())
+        }
+    };
+
+    tokio::select! {
+        r = client_task => r,
+        r = server_task => r,
+    }
 }
 
 // ---------------------------------------------------------------------------

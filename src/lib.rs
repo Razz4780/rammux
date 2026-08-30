@@ -73,6 +73,8 @@ use clap as _;
 use socket2 as _;
 // mux_compare example dependencies.
 #[cfg(test)]
+use async_smux as _;
+#[cfg(test)]
 use http as _;
 #[cfg(test)]
 use http_body as _;

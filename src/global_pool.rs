@@ -9,11 +9,7 @@ use std::{
 use futures::FutureExt;
 use tokio::time::{Instant, Sleep};
 
-use crate::{
-    config::{RammuxRole, TransitReserve},
-    error::ErrorKind,
-    header::PingPayload,
-};
+use crate::{config::RammuxRole, error::ErrorKind, header::PingPayload};
 
 /// Global state shared by all rammux streams within a single rammux connection.
 ///
@@ -46,10 +42,6 @@ pub struct GlobalPool {
     /// Per-stream window growth limit: the window can at most multiply
     /// by this factor in a single update round.
     pub stream_window_growth: u32,
-    /// When a `SESSION_WINDOW_UPDATE` is due - see [`TransitReserve`].
-    pub transit_update_reserve: TransitReserve,
-    /// Transit window autotune ceiling, as a multiple of the clean-RTT BDP.
-    pub transit_window_gain: f64,
     /// Set by a stream whose outbound poll was held back solely by an
     /// exhausted transit window.
     ///
@@ -78,8 +70,6 @@ impl Default for GlobalPool {
             stream_window_dirty_rtt: false,
             stream_window_gain: 1.5,
             stream_window_growth: 2,
-            transit_update_reserve: TransitReserve::HalfWindow,
-            transit_window_gain: 2.0,
             transit_blocked: false,
             stalled_since: None,
             stalled_total: Duration::ZERO,
@@ -155,13 +145,8 @@ impl GlobalPool {
 
     /// Produces the next `SESSION_WINDOW_UPDATE` value, if one is due.
     pub fn transit_recv_update(&mut self) -> Option<u32> {
-        let loop_rtt = match self.transit_update_reserve {
-            TransitReserve::HalfWindow => None,
-            TransitReserve::CleanRtt => self.rtt,
-            TransitReserve::DirtyRtt => self.dirty_rtt.or(self.rtt),
-        };
         let recv = self.transit_recv.as_mut()?;
-        if recv.can_update(loop_rtt).not() {
+        if recv.can_update().not() {
             return None;
         }
 
@@ -174,20 +159,14 @@ impl GlobalPool {
         // about twice the loop BDP once the link is the bottleneck.
         // Grow-only.
         //
-        // The ceiling stays a multiple of the *clean* BDP. Sizing from the
-        // loaded RTT runs away: a bigger window queues more, which raises
-        // the loaded RTT, which raises the ceiling. Measured - the window
-        // grew to 1476-2004 KiB where 768 was enough, and echo p50 went
-        // 46 -> 73 ms. Only the update *timing* may read the loaded RTT.
-        //
-        // The multiple is what the update rule costs. Waiting for half the
-        // window puts half of it out of reach, so line rate needs 2 x BDP.
-        let gain = self.transit_window_gain;
+        // The ceiling stays a multiple of the *clean* BDP. Sizing it from
+        // the loaded RTT runs away: a bigger window queues more, which
+        // raises the loaded RTT, which raises the ceiling again.
         let elapsed = recv.last_update.elapsed();
         let optimal = match self.rtt {
             Some(rtt) if recv.rate_ema > 0.0 && elapsed < 2 * rtt => {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let ceiling = (gain * rtt.as_secs_f64() * recv.rate_ema) as u32;
+                let ceiling = (2.0 * rtt.as_secs_f64() * recv.rate_ema) as u32;
                 recv.current
                     .saturating_mul(2)
                     .min(ceiling)
@@ -738,27 +717,8 @@ impl TransitRecv {
     }
 
     /// Whether a `SESSION_WINDOW_UPDATE` is due.
-    ///
-    /// With `loop_rtt`, the grant is emitted while the peer still holds
-    /// `rate x loop_rtt` of credit - one loop's worth of sending, which
-    /// is what it takes for the grant to reach the peer before its
-    /// credit runs out. Without one (no reserve mode, no RTT sample yet,
-    /// or no arrival rate yet) this falls back to the half-window rule.
-    fn can_update(&self, loop_rtt: Option<Duration>) -> bool {
-        let Some(rtt) = loop_rtt.filter(|_| self.rate_ema > 0.0) else {
-            return self.freed >= self.current / 2;
-        };
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let reserve = (self.rate_ema * rtt.as_secs_f64()) as u32;
-        let threshold = self
-            .current
-            .saturating_sub(reserve)
-            // A badly queued link can want a reserve larger than the whole
-            // window. Grants smaller than a sixteenth of it buy nothing
-            // and cost a frame each, so that is the floor.
-            .max(self.current / 16)
-            .max(1);
-        self.freed >= threshold
+    fn can_update(&self) -> bool {
+        self.freed >= self.current / 2
     }
 }
 

@@ -95,8 +95,6 @@ where
                     stream_window_dirty_rtt: config.stream_window_dirty_rtt,
                     stream_window_gain: config.stream_window_gain,
                     stream_window_growth: config.stream_window_growth,
-                    transit_update_reserve: config.transit_update_reserve,
-                    transit_window_gain: config.transit_window_gain,
                     transit_blocked: false,
                     stalled_since: None,
                     stalled_total: Duration::ZERO,
