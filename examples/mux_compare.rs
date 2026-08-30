@@ -99,7 +99,7 @@ struct Args {
     #[arg(long, default_value_t = 16)]
     r_frame_kb: u32,
     /// Link-clearing probe interval (= probe timeout), seconds.
-    #[arg(long, default_value_t = 5.0)]
+    #[arg(long, default_value_t = 20.0)]
     r_ping_interval_s: f64,
     /// Print rammux connection stats every 500ms (transit stalls, windows, RTTs).
     #[arg(long, default_value_t = false)]
@@ -455,13 +455,14 @@ where
                     _ = stats_tick.tick(), if args.r_stats => {
                         let stats = stats.expect("guarded by args.r_stats");
                         println!(
-                            "{:.3},client,rstats,stall_ms={:.1},stalls={},transit_credit={},transit_window={},rtt_ms={:.2}",
+                            "{:.3},client,rstats,stall_ms={:.1},stalls={},transit_credit={},transit_window={},rtt_ms={:.2},dirty_rtt_ms={:.2}",
                             metrics.started.elapsed().as_secs_f64(),
                             stats.transit_starved.as_secs_f64() * 1e3,
                             stats.transit_starved_events,
                             stats.transit_send_credit.map(|c| c as i64).unwrap_or(-1),
                             stats.transit_recv_window.map(|w| w as i64).unwrap_or(-1),
                             stats.rtt.map(|r| r.as_secs_f64() * 1e3).unwrap_or(-1.0),
+                            stats.dirty_rtt.map(|r| r.as_secs_f64() * 1e3).unwrap_or(-1.0),
                         );
                     }
                     progress = conn.progress() => {
@@ -487,13 +488,14 @@ where
                     _ = stats_tick.tick(), if args.r_stats => {
                         let stats = stats.expect("guarded by args.r_stats");
                         println!(
-                            "{:.3},server,rstats,stall_ms={:.1},stalls={},transit_credit={},transit_window={},rtt_ms={:.2}",
+                            "{:.3},server,rstats,stall_ms={:.1},stalls={},transit_credit={},transit_window={},rtt_ms={:.2},dirty_rtt_ms={:.2}",
                             metrics.started.elapsed().as_secs_f64(),
                             stats.transit_starved.as_secs_f64() * 1e3,
                             stats.transit_starved_events,
                             stats.transit_send_credit.map(|c| c as i64).unwrap_or(-1),
                             stats.transit_recv_window.map(|w| w as i64).unwrap_or(-1),
                             stats.rtt.map(|r| r.as_secs_f64() * 1e3).unwrap_or(-1.0),
+                            stats.dirty_rtt.map(|r| r.as_secs_f64() * 1e3).unwrap_or(-1.0),
                         );
                         continue;
                     }

@@ -3,7 +3,7 @@
 use std::{fmt, num::NonZeroU32, time::Duration};
 
 /// Default [`RammuxConfig::ping_interval`].
-pub(crate) const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(5);
+pub(crate) const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Role in a rammux connection.
 ///
@@ -132,7 +132,7 @@ impl RammuxConfig {
     /// 1. [`Self::frame_limit`] - 16kb
     /// 2. [`Self::max_inbound_streams`] and [`Self::max_outbound_streams`] - 128
     /// 3. [`Self::local_recv_window`] and [`Self::remote_recv_window`] - 64kb
-    /// 4. [`Self::ping_interval`] - 5s
+    /// 4. [`Self::ping_interval`] - 20s
     /// 5. [`Self::global_recv_window`] - 4mb
     /// 6. [`Self::local_transit_window`] and [`Self::remote_transit_window`] - 0 (disabled)
     /// 7. [`Self::transit_window_max`] - 4mb

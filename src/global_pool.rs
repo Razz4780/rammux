@@ -30,6 +30,11 @@ pub struct GlobalPool {
     pub transit_send: Option<TransitSend>,
     /// State of the transit window we grant to the peer, if enabled.
     pub transit_recv: Option<TransitRecv>,
+    /// Loaded RTT of the latest probe exchange: the round trip as it
+    /// actually is with the connection's queues standing, rather than
+    /// over the drained link. Stream receive windows size from this,
+    /// because a stream's credit loop runs through those queues.
+    pub dirty_rtt: Option<Duration>,
     /// Set by a stream whose outbound poll was held back solely by an
     /// exhausted transit window.
     ///
@@ -54,6 +59,7 @@ impl Default for GlobalPool {
             probe: Probe::idle(crate::config::DEFAULT_PING_INTERVAL, RammuxRole::Client),
             transit_send: None,
             transit_recv: None,
+            dirty_rtt: None,
             transit_blocked: false,
             stalled_since: None,
             stalled_total: Duration::ZERO,
@@ -205,6 +211,11 @@ pub struct Probe {
     /// Our role, used to tie-break colliding initiations:
     /// the client stays initiator, the server demotes to responder.
     role: RammuxRole,
+    /// When this side entered the exchange: our `CLEAR_LINK` went out
+    /// (initiator), or the peer's arrived (responder).
+    clear_at: Option<Instant>,
+    /// Loaded RTT of the most recent exchange - see [`ProbeDone::dirty_rtt`].
+    last_dirty: Option<Duration>,
 }
 
 /// See [`Probe`] doc for the dance these states walk through.
@@ -280,6 +291,11 @@ enum AfterClear {
 pub struct ProbeDone {
     /// The clean RTT sample, measured over the drained link.
     pub rtt: Duration,
+    /// The loaded RTT of the same exchange: the round trip through the
+    /// queues that were standing when it began. Measured from our
+    /// `CLEAR_LINK` to the peer's receipt (initiator), or from the peer's
+    /// `CLEAR_LINK` to its `PING` (responder).
+    pub dirty_rtt: Option<Duration>,
     /// Whether data flow resumes with this completion
     /// (the caller should wake the streams).
     pub resume: bool,
@@ -324,6 +340,8 @@ impl Probe {
             state: ProbeState::Idle,
             pong: None,
             role,
+            clear_at: None,
+            last_dirty: None,
         }
     }
 
@@ -393,6 +411,7 @@ impl Probe {
             .reset(Instant::now() + self.interval.mul_f64(jitter));
         Some(ProbeDone {
             rtt,
+            dirty_rtt: self.last_dirty.take(),
             resume: !resumed,
         })
     }
@@ -410,6 +429,7 @@ impl Probe {
             // The peer initiated: pause data, answer with our receipt,
             // then wait for the peer's probe ping.
             (ProbeState::Idle, true) => {
+                self.clear_at = Some(Instant::now());
                 self.begin(false, AfterClear::AwaitPing);
                 Ok(())
             },
@@ -449,9 +469,12 @@ impl Probe {
                 };
                 Ok(())
             },
-            // The peer's receipt: both directions are drained, so the
-            // ping that follows times the path and nothing else.
+            // The peer's receipt: both directions are drained, so the ping
+            // that follows times the path and nothing else. The time since
+            // our CLEAR_LINK went out is the loaded round trip - it carries
+            // both sides' standing queues.
             (ProbeState::AwaitClear { .. }, false) => {
+                self.last_dirty = self.clear_at.map(|at| at.elapsed());
                 self.state = ProbeState::SendPing {
                     resume: false,
                     peer_pinged: false,
@@ -501,6 +524,7 @@ impl Probe {
             // The peer's probe ping arrived over the drained link: pong
             // it, send our own probe ping, and resume data right after.
             ProbeState::AwaitPing => {
+                self.last_dirty = self.clear_at.map(|at| at.elapsed());
                 self.pong = Some(payload);
                 self.state = ProbeState::SendPing {
                     resume: true,
@@ -604,6 +628,9 @@ impl Probe {
                 Some((ProbeFrame::Ping(payload), peer_pinged))
             },
             ProbeState::SendClear { syn, next } => {
+                if syn {
+                    self.clear_at = Some(Instant::now());
+                }
                 self.state = match next {
                     AfterClear::AwaitClear { collided } => ProbeState::AwaitClear { collided },
                     AfterClear::AwaitPing => ProbeState::AwaitPing,
@@ -804,6 +831,39 @@ mod test {
         };
         let done = probe.on_pong(payload).unwrap().unwrap();
         assert!(!done.resume, "responder resumed at ping send already");
+    }
+
+    /// A peer's probe re-anchors our own timer, so the two do not run
+    /// back-to-back: after answering one, the next spontaneous probe is a
+    /// full jittered interval away rather than whatever was left on the
+    /// clock when the peer interrupted us.
+    #[tokio::test(start_paused = true)]
+    async fn peer_probe_resets_our_timer() {
+        let mut probe = new_probe(RammuxRole::Server);
+        settle_startup(&mut probe).await;
+
+        // Sit most of the way to our own deadline, then let the peer go first.
+        tokio::time::advance(probe.interval.mul_f64(0.9)).await;
+        probe.on_clear_link(true).unwrap();
+        assert_eq!(frame_kind(probe.next_frame()), Some(("clear", false)));
+        assert!(probe.on_ping(PingPayload::random()).unwrap().is_none());
+        assert_eq!(frame_kind(probe.next_frame()), Some(("pong", false)));
+        assert_eq!(frame_kind(probe.next_frame()), Some(("ping", true)));
+        let ProbeState::AwaitPong { payload, .. } = probe.state else {
+            panic!("expected AwaitPong");
+        };
+        probe.on_pong(payload).unwrap().unwrap();
+        assert_eq!(probe.state, ProbeState::Idle);
+
+        // The 10% that was left on the old clock must not fire a probe.
+        tokio::time::advance(probe.interval.mul_f64(0.5)).await;
+        assert!(poll_probe(&mut probe).is_pending());
+        assert!(probe.next_frame().is_none(), "probe ran back-to-back");
+
+        // A full interval past completion, past the +10% jitter bound, it does.
+        tokio::time::advance(probe.interval.mul_f64(0.65)).await;
+        assert!(matches!(poll_probe(&mut probe), Poll::Ready(Ok(()))));
+        assert_eq!(frame_kind(probe.next_frame()), Some(("clear+syn", false)));
     }
 
     #[tokio::test(start_paused = true)]

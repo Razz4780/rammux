@@ -91,6 +91,7 @@ where
                     }),
                     transit_recv: NonZeroU32::new(config.local_transit_window)
                         .map(|initial| TransitRecv::new(initial, config.transit_window_max)),
+                    dirty_rtt: None,
                     transit_blocked: false,
                     stalled_since: None,
                     stalled_total: Duration::ZERO,
@@ -182,9 +183,17 @@ where
                 } else {
                     active.selector.strategy_mut().probe.on_ping(payload)?
                 };
-                if let Some(ProbeDone { rtt, resume }) = done {
+                if let Some(ProbeDone {
+                    rtt,
+                    dirty_rtt,
+                    resume,
+                }) = done
+                {
                     let global = active.selector.strategy_mut();
                     global.rtt = Some(rtt);
+                    if dirty_rtt.is_some() {
+                        global.dirty_rtt = dirty_rtt;
+                    }
                     if resume {
                         active.selector.wake_all();
                     }
@@ -499,6 +508,11 @@ where
                 (global.stalled_total + pending, global.stalled_events)
             })
             .unwrap_or_default();
+        let dirty_rtt = self
+            .state
+            .active()
+            .ok()
+            .and_then(|active| active.selector.strategy().dirty_rtt);
         let (transit_send_credit, transit_recv_window) = self
             .state
             .active()
@@ -520,6 +534,7 @@ where
             transit_recv_window,
             transit_starved,
             transit_starved_events,
+            dirty_rtt,
         }
     }
 }
@@ -552,6 +567,8 @@ pub struct RammuxStats {
     pub rtt: Option<Duration>,
     /// Bytes available in the global receive window pool.
     pub available_global_recv_window: usize,
+    /// Loaded RTT of the latest probe exchange, if one has completed.
+    pub dirty_rtt: Option<Duration>,
     /// Remaining in-flight credit granted to us by the peer, if the transit window is enabled.
     pub transit_send_credit: Option<u32>,
     /// Current size of the transit window we grant to the peer, if enabled.

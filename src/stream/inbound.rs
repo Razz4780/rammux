@@ -252,8 +252,10 @@ impl InboundTraffic {
     }
 }
 
-/// A stream's receive window targets `WINDOW_GAIN x consumption rate x RTT`.
-const WINDOW_GAIN: f64 = 1.5;
+/// A stream's receive window targets `WINDOW_GAIN x consumption rate x RTT`,
+/// so at a gain of 2 it aims at twice the bandwidth-delay product of the
+/// stream's own credit loop.
+const WINDOW_GAIN: f64 = 2.0;
 
 /// A stream's receive window can at most multiply by this in one update round.
 const MAX_GROWTH: u32 = 2;
@@ -287,8 +289,14 @@ impl RecvWindow {
             return 0;
         }
 
+        // The yardstick is the loaded RTT: a stream's window governs how
+        // often credit has to be exchanged while data is flowing, and those
+        // updates travel through the queues that are standing, not over the
+        // drained link the clean sample measures. Before the first probe
+        // completes there is no loaded sample, and the clean one stands in.
         let optimal = global
-            .rtt
+            .dirty_rtt
+            .or(global.rtt)
             .map(|rtt| Self::get_optimal(self.freed, self.last_update.elapsed(), rtt))
             .unwrap_or(self.current);
         let clamped = optimal
