@@ -91,10 +91,6 @@ where
                     }),
                     transit_recv: NonZeroU32::new(config.local_transit_window)
                         .map(|initial| TransitRecv::new(initial, config.transit_window_max)),
-                    dirty_rtt: None,
-                    stream_window_dirty_rtt: config.stream_window_dirty_rtt,
-                    stream_window_gain: config.stream_window_gain,
-                    stream_window_growth: config.stream_window_growth,
                     transit_blocked: false,
                     stalled_since: None,
                     stalled_total: Duration::ZERO,
@@ -186,17 +182,9 @@ where
                 } else {
                     active.selector.strategy_mut().probe.on_ping(payload)?
                 };
-                if let Some(ProbeDone {
-                    rtt,
-                    dirty_rtt,
-                    resume,
-                }) = done
-                {
+                if let Some(ProbeDone { rtt, resume }) = done {
                     let global = active.selector.strategy_mut();
                     global.rtt = Some(rtt);
-                    if dirty_rtt.is_some() {
-                        global.dirty_rtt = dirty_rtt;
-                    }
                     if resume {
                         active.selector.wake_all();
                     }
@@ -499,11 +487,6 @@ where
                 )
             })
             .unwrap_or_default();
-        let dirty_rtt = self
-            .state
-            .active()
-            .ok()
-            .and_then(|active| active.selector.strategy().dirty_rtt);
         let (transit_starved, transit_starved_events) = self
             .state
             .active()
@@ -537,7 +520,6 @@ where
             transit_recv_window,
             transit_starved,
             transit_starved_events,
-            dirty_rtt,
         }
     }
 }
@@ -574,8 +556,6 @@ pub struct RammuxStats {
     pub transit_send_credit: Option<u32>,
     /// Current size of the transit window we grant to the peer, if enabled.
     pub transit_recv_window: Option<u32>,
-    /// Loaded RTT from the latest probe, if measured.
-    pub dirty_rtt: Option<Duration>,
     /// Total time the sender spent stalled on a transit credit grant: the
     /// transport was writable and stream payload was ready, but the transit
     /// window was spent.

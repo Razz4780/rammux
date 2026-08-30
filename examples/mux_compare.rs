@@ -101,15 +101,6 @@ struct Args {
     /// Link-clearing probe interval (= probe timeout), seconds.
     #[arg(long, default_value_t = 5.0)]
     r_ping_interval_s: f64,
-    /// Size stream windows from the probe's loaded (dirty) RTT.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-    r_stream_dirty_rtt: bool,
-    /// Per-stream window autotune gain (window targets gain x rate x RTT).
-    #[arg(long, default_value_t = 1.5)]
-    r_stream_gain: f64,
-    /// Per-stream window growth limit per update round.
-    #[arg(long, default_value_t = 2)]
-    r_stream_grow: u32,
     /// Print rammux connection stats every 500ms (transit stalls, windows, RTTs).
     #[arg(long, default_value_t = false)]
     r_stats: bool,
@@ -373,9 +364,6 @@ fn rammux_config(args: &Args) -> RammuxConfig {
     config.remote_transit_window = args.r_transit_kb * 1024;
     config.transit_window_max = args.r_transit_max_kb * 1024;
     config.ping_interval = Duration::from_secs_f64(args.r_ping_interval_s);
-    config.stream_window_dirty_rtt = args.r_stream_dirty_rtt;
-    config.stream_window_gain = args.r_stream_gain;
-    config.stream_window_growth = args.r_stream_grow;
     config.max_inbound_streams = args.streams as u32 + 2;
     config.max_outbound_streams = args.streams as u32 + 2;
     config
@@ -467,14 +455,13 @@ where
                     _ = stats_tick.tick(), if args.r_stats => {
                         let stats = stats.expect("guarded by args.r_stats");
                         println!(
-                            "{:.3},client,rstats,stall_ms={:.1},stalls={},transit_credit={},transit_window={},rtt_ms={:.2},dirty_rtt_ms={:.2}",
+                            "{:.3},client,rstats,stall_ms={:.1},stalls={},transit_credit={},transit_window={},rtt_ms={:.2}",
                             metrics.started.elapsed().as_secs_f64(),
                             stats.transit_starved.as_secs_f64() * 1e3,
                             stats.transit_starved_events,
                             stats.transit_send_credit.map(|c| c as i64).unwrap_or(-1),
                             stats.transit_recv_window.map(|w| w as i64).unwrap_or(-1),
                             stats.rtt.map(|r| r.as_secs_f64() * 1e3).unwrap_or(-1.0),
-                            stats.dirty_rtt.map(|r| r.as_secs_f64() * 1e3).unwrap_or(-1.0),
                         );
                     }
                     progress = conn.progress() => {
@@ -500,14 +487,13 @@ where
                     _ = stats_tick.tick(), if args.r_stats => {
                         let stats = stats.expect("guarded by args.r_stats");
                         println!(
-                            "{:.3},server,rstats,stall_ms={:.1},stalls={},transit_credit={},transit_window={},rtt_ms={:.2},dirty_rtt_ms={:.2}",
+                            "{:.3},server,rstats,stall_ms={:.1},stalls={},transit_credit={},transit_window={},rtt_ms={:.2}",
                             metrics.started.elapsed().as_secs_f64(),
                             stats.transit_starved.as_secs_f64() * 1e3,
                             stats.transit_starved_events,
                             stats.transit_send_credit.map(|c| c as i64).unwrap_or(-1),
                             stats.transit_recv_window.map(|w| w as i64).unwrap_or(-1),
                             stats.rtt.map(|r| r.as_secs_f64() * 1e3).unwrap_or(-1.0),
-                            stats.dirty_rtt.map(|r| r.as_secs_f64() * 1e3).unwrap_or(-1.0),
                         );
                         continue;
                     }

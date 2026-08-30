@@ -30,18 +30,6 @@ pub struct GlobalPool {
     pub transit_send: Option<TransitSend>,
     /// State of the transit window we grant to the peer, if enabled.
     pub transit_recv: Option<TransitRecv>,
-    /// Loaded RTT from the latest probe, if measured.
-    pub dirty_rtt: Option<Duration>,
-    /// Size stream receive windows from [`Self::dirty_rtt`] rather than
-    /// the clean sample: a stream's credit loop runs through the queues
-    /// that are actually standing, not over an empty link.
-    pub stream_window_dirty_rtt: bool,
-    /// Per-stream window autotune gain: the window targets
-    /// `gain x rate x RTT`.
-    pub stream_window_gain: f64,
-    /// Per-stream window growth limit: the window can at most multiply
-    /// by this factor in a single update round.
-    pub stream_window_growth: u32,
     /// Set by a stream whose outbound poll was held back solely by an
     /// exhausted transit window.
     ///
@@ -66,10 +54,6 @@ impl Default for GlobalPool {
             probe: Probe::idle(crate::config::DEFAULT_PING_INTERVAL, RammuxRole::Client),
             transit_send: None,
             transit_recv: None,
-            dirty_rtt: None,
-            stream_window_dirty_rtt: false,
-            stream_window_gain: 1.5,
-            stream_window_growth: 2,
             transit_blocked: false,
             stalled_since: None,
             stalled_total: Duration::ZERO,
@@ -79,15 +63,6 @@ impl Default for GlobalPool {
 }
 
 impl GlobalPool {
-    /// The RTT yardstick for per-stream receive window sizing.
-    pub fn stream_rtt(&self) -> Option<Duration> {
-        if self.stream_window_dirty_rtt {
-            self.dirty_rtt.or(self.rtt)
-        } else {
-            self.rtt
-        }
-    }
-
     /// Accounts for one completed pass of the outbound loop.
     ///
     /// `blocked` means the transport was ready to accept more frames and at
@@ -230,12 +205,6 @@ pub struct Probe {
     /// Our role, used to tie-break colliding initiations:
     /// the client stays initiator, the server demotes to responder.
     role: RammuxRole,
-    /// When this side entered the exchange: our `CLEAR_LINK` was sent
-    /// (initiator) or the peer's was received (responder).
-    clear_at: Option<Instant>,
-    /// Loaded ("dirty") RTT of the most recent exchange - see
-    /// [`ProbeDone::dirty_rtt`].
-    last_dirty: Option<Duration>,
 }
 
 /// See [`Probe`] doc for the dance these states walk through.
@@ -311,12 +280,6 @@ enum AfterClear {
 pub struct ProbeDone {
     /// The clean RTT sample, measured over the drained link.
     pub rtt: Duration,
-    /// The loaded RTT of the same exchange: how long a frame actually
-    /// took to make the round trip through the queues that were standing
-    /// when the exchange began. Measured from our `CLEAR_LINK` to the
-    /// peer's receipt (initiator), or from the peer's `CLEAR_LINK` to its
-    /// `PING` (responder).
-    pub dirty_rtt: Option<Duration>,
     /// Whether data flow resumes with this completion
     /// (the caller should wake the streams).
     pub resume: bool,
@@ -361,8 +324,6 @@ impl Probe {
             state: ProbeState::Idle,
             pong: None,
             role,
-            clear_at: None,
-            last_dirty: None,
         }
     }
 
@@ -432,7 +393,6 @@ impl Probe {
             .reset(Instant::now() + self.interval.mul_f64(jitter));
         Some(ProbeDone {
             rtt,
-            dirty_rtt: self.last_dirty.take(),
             resume: !resumed,
         })
     }
@@ -450,7 +410,6 @@ impl Probe {
             // The peer initiated: pause data, answer with our receipt,
             // then wait for the peer's probe ping.
             (ProbeState::Idle, true) => {
-                self.clear_at = Some(Instant::now());
                 self.begin(false, AfterClear::AwaitPing);
                 Ok(())
             },
@@ -490,11 +449,9 @@ impl Probe {
                 };
                 Ok(())
             },
-            // The peer's receipt: both directions are drained, measure.
-            // The elapsed time since our CLEAR_LINK went out is the
-            // loaded round trip - it carries both sides' standing queues.
+            // The peer's receipt: both directions are drained, so the
+            // ping that follows times the path and nothing else.
             (ProbeState::AwaitClear { .. }, false) => {
-                self.last_dirty = self.clear_at.map(|at| at.elapsed());
                 self.state = ProbeState::SendPing {
                     resume: false,
                     peer_pinged: false,
@@ -544,7 +501,6 @@ impl Probe {
             // The peer's probe ping arrived over the drained link: pong
             // it, send our own probe ping, and resume data right after.
             ProbeState::AwaitPing => {
-                self.last_dirty = self.clear_at.map(|at| at.elapsed());
                 self.pong = Some(payload);
                 self.state = ProbeState::SendPing {
                     resume: true,
@@ -648,9 +604,6 @@ impl Probe {
                 Some((ProbeFrame::Ping(payload), peer_pinged))
             },
             ProbeState::SendClear { syn, next } => {
-                if syn {
-                    self.clear_at = Some(Instant::now());
-                }
                 self.state = match next {
                     AfterClear::AwaitClear { collided } => ProbeState::AwaitClear { collided },
                     AfterClear::AwaitPing => ProbeState::AwaitPing,

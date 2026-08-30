@@ -120,23 +120,6 @@ pub struct RammuxConfig {
     ///
     /// This value is a local knob and does not have to be negotiated.
     pub transit_window_max: u32,
-    /// Size stream receive windows from the probe's loaded ("dirty")
-    /// RTT rather than its clean sample. Stream windows govern how often
-    /// window updates must be exchanged while data is flowing, so the
-    /// operational loop time is arguably the right yardstick.
-    ///
-    /// This value is a local knob and does not have to be negotiated.
-    pub stream_window_dirty_rtt: bool,
-    /// Per-stream receive window autotune gain: each stream's window
-    /// targets `gain x consumption rate x RTT`.
-    ///
-    /// This value is a local knob and does not have to be negotiated.
-    pub stream_window_gain: f64,
-    /// Per-stream receive window growth limit: a window can at most
-    /// multiply by this factor in a single update round. Must be >= 1.
-    ///
-    /// This value is a local knob and does not have to be negotiated.
-    pub stream_window_growth: u32,
 }
 
 impl RammuxConfig {
@@ -165,9 +148,6 @@ impl RammuxConfig {
             local_transit_window: 0,
             remote_transit_window: 0,
             transit_window_max: 4 * 1024 * 1024,
-            stream_window_dirty_rtt: false,
-            stream_window_gain: 1.5,
-            stream_window_growth: 2,
         }
     }
 }
