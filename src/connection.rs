@@ -183,17 +183,15 @@ where
                 } else {
                     active.selector.strategy_mut().probe.on_ping(payload)?
                 };
-                if let Some(ProbeDone {
-                    rtt,
-                    dirty_rtt,
-                    resume,
-                }) = done
-                {
-                    let global = active.selector.strategy_mut();
+                let global = active.selector.strategy_mut();
+                // Loaded-RTT samples come from the plain ping and from the
+                // probe's own CLEAR_LINK leg, so they are drained here
+                // rather than carried on probe completion.
+                if let Some(dirty_rtt) = global.probe.take_dirty_rtt() {
+                    global.dirty_rtt = Some(dirty_rtt);
+                }
+                if let Some(ProbeDone { rtt, resume }) = done {
                     global.rtt = Some(rtt);
-                    if dirty_rtt.is_some() {
-                        global.dirty_rtt = dirty_rtt;
-                    }
                     if resume {
                         active.selector.wake_all();
                     }
