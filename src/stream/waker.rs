@@ -1,3 +1,5 @@
+//! A single-slot [`Waker`] store.
+
 use std::task::Waker;
 
 /// Slot for a single [`Waker`].

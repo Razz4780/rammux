@@ -1,3 +1,5 @@
+//! Identifiers of virtual rammux streams.
+
 use std::fmt;
 
 use rand::{

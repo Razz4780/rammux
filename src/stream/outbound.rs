@@ -12,6 +12,8 @@ use crate::{
     stream::{FinState, waker::WakerSlot},
 };
 
+/// The sending half of a virtual stream: payload waiting for the wire,
+/// and the peer's receive window that paces it.
 pub struct OutboundTraffic(OutboundState);
 
 impl OutboundTraffic {

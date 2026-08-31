@@ -1,3 +1,5 @@
+//! The downgrade handshake that hands the transport back.
+
 use std::{
     io,
     pin::Pin,

@@ -1,3 +1,6 @@
+//! A stream's side of the connection's task selector: what it wants to
+//! put on the wire next.
+
 use std::{
     ops::ControlFlow,
     pin::Pin,
@@ -19,9 +22,14 @@ use crate::{
     stream::{FinState, SharedStreamState},
 };
 
+/// One stream's entry in the connection's selector: polled for whatever
+/// that stream wants to put on the wire next.
 pub(crate) struct StreamUpdates {
+    /// Stream being polled.
     pub(super) id: StreamId,
+    /// Whether the next frame still has to carry `SYN`.
     pub(super) syn: bool,
+    /// State shared with the application-facing handle.
     pub(super) state: Arc<Mutex<SharedStreamState>>,
 }
 
@@ -110,10 +118,16 @@ impl Task<GlobalPool> for StreamUpdates {
     }
 }
 
+/// What a stream wants to send: window credit, payload, or both, plus
+/// whatever lifecycle bits are due. Converts into one or two frames.
 pub struct StreamUpdate {
+    /// Stream this belongs to.
     pub id: StreamId,
+    /// Receive window credit to return, `0` for none.
     pub window_update: u32,
+    /// Payload to send, empty for none.
     pub data: Bytes,
+    /// Lifecycle bits to carry.
     pub flags: ControlFlags,
 }
 

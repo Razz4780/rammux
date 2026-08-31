@@ -1,3 +1,5 @@
+//! The connection's handle on a virtual stream.
+
 use std::sync::{Arc, Mutex};
 
 use crate::{

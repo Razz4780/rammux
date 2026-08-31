@@ -170,10 +170,12 @@ bitflags! {
         /// 1. `PING` requests
         /// 2. `DATA` and `WINDOW_UPDATE` frames that initiate a new stream.
         const SYN           = 0b00100000;
-        /// Marks a session-level frame.
+        /// Marks a session-level frame: one about the connection rather
+        /// than any one stream.
         ///
-        /// Currently only valid combined with [`Self::WINDOW_UPDATE`],
-        /// forming a `SESSION_WINDOW_UPDATE` frame.
+        /// Valid in two combinations, both with `stream_id = 0`: with
+        /// [`Self::WINDOW_UPDATE`] it forms a `SESSION_WINDOW_UPDATE`,
+        /// and with [`Self::PING`] (and `len = 0`) a `CLEAR_LINK`.
         const SESSION       = 0b01000000;
     }
 }
@@ -188,27 +190,42 @@ impl RawFlags {
 /// Clean enum representing a valid rammux frame header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Header {
+    /// An RTT measurement request or its response.
     Ping {
+        /// Opaque payload the responder echoes back verbatim.
         payload: PingPayload,
+        /// Whether this is the response rather than the request.
         is_response: bool,
     },
+    /// Returns receive window credit for one stream.
     WindowUpdate {
+        /// Stream the credit belongs to.
         stream_id: StreamId,
+        /// Stream lifecycle bits carried along.
         flags: ControlFlags,
+        /// Bytes of credit returned.
         len: u32,
     },
+    /// Stream payload, followed by `len` bytes on the wire.
     Data {
+        /// Stream the payload belongs to.
         stream_id: StreamId,
+        /// Stream lifecycle bits carried along.
         flags: ControlFlags,
+        /// Payload length in bytes.
         len: u32,
     },
+    /// Returns credit for the session-level transit window.
     SessionWindowUpdate {
+        /// Bytes of credit returned.
         update: u32,
     },
+    /// Drain barrier of the link-clearing probe.
     ClearLink {
         /// Spontaneous initiation (`SYN` set) vs the responder's receipt.
         syn: bool,
     },
+    /// The sender's end of the rammux session.
     Term,
 }
 

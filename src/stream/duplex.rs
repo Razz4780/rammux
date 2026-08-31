@@ -1,3 +1,5 @@
+//! The application-facing handle on a virtual stream.
+
 use std::{
     io,
     pin::Pin,

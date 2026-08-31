@@ -8,8 +8,8 @@
 
 `rammux` is a Tokio-based stream multiplexer for reliable byte stream transports.
 It lets two peers run many independent bidirectional byte streams over one
-`AsyncRead + AsyncWrite` connection while keeping stream lifecycle, per-stream flow
-control, keepalive, and shutdown in one place.
+`AsyncRead + AsyncWrite` connection while keeping stream lifecycle, flow control,
+RTT measurement, and shutdown in one place.
 
 ## When would you want to use it?
 
@@ -24,6 +24,8 @@ or QUIC.
 - `RammuxConnection<IO>`: the protocol driver that owns the transport
 - `RammuxDuplex`: a virtual bidirectional byte stream
 - per-stream flow control with local receive window autotuning
+- a session-level transit window that bounds total data in flight
+- on-demand RTT measurement, loaded and over a drained link
 - fair round-robin scheduling and data framing across ready streams
 - graceful downgrade back to the original transport
 
@@ -39,7 +41,12 @@ While you do that, the driver:
 1. reads inbound frames,
 2. writes outbound frames,
 3. yields new inbound streams,
-4. initiates and handles `PING` exchanges.
+4. answers the peer's `PING`s and runs the exchanges you start.
+
+The driver runs no timers. Nothing wakes its task but the transport, so the
+schedule for RTT measurement - and every deadline on it - belongs to your
+application. `RammuxConnection` reports each transition of that state machine so
+you can impose one; see the `RTT measurement` section of its API docs.
 
 Each accepted or created stream is represented as `RammuxDuplex`, which
 implements:
@@ -65,12 +72,21 @@ that restore the receive window. This lets the peer continue writing.
 
 This implementation also maintains a local global receive window pool.
 Streams that sustain high throughput can temporarily borrow from that pool so the peer
-spends less time waiting for window updates. RTT sampled from `PING`
-request/response frames is used to tune the receive window toward roughly
-`1.5 * bandwidth-delay-product`.
+spends less time waiting for window updates. Each stream's window is tuned toward
+roughly `2 * bandwidth-delay-product`, measured against the *loaded* RTT - the
+round trip as it actually is with the connection's queues standing, which is the
+loop a stream's own window updates travel through.
+
+Beyond that, a session-level *transit window* can bound the total `DATA` payload
+in flight across all streams at once. Per-stream windows govern how much a
+receiver will buffer; the transit window governs how much may be on the link,
+which is what keeps a bulk stream from filling the path and delaying everything
+sharing it. Its credit is returned as soon as data is received, independently of
+when the application reads it, and it autotunes against the *clean* RTT measured
+over a drained link.
 
 Those tuning details are local behavior. On the wire, the peer only sees normal
-`WINDOW_UPDATE` frames.
+`WINDOW_UPDATE` and `SESSION_WINDOW_UPDATE` frames.
 
 ## Shutdown and transport recovery
 

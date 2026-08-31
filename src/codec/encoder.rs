@@ -1,3 +1,5 @@
+//! Turning outbound rammux frames into bytes.
+
 use std::io;
 
 use bytes::{Buf, Bytes};
@@ -7,9 +9,17 @@ use crate::{
     header::{ControlFlags, PingPayload, RawFlags, RawHeader},
 };
 
+/// One outbound write: up to two frame headers and their payload, held
+/// as a contiguous byte source the codec drains.
+///
+/// Two headers, because a stream's window update and its data go out as
+/// a pair often enough to be worth coalescing into one write.
 pub struct EncoderItem {
+    /// Both headers back to back; `consumed` marks where the live one starts.
     headers: [u8; RawHeader::LEN * 2],
+    /// `DATA` payload following the headers, empty if there is none.
     data: Bytes,
+    /// Header bytes already written.
     consumed: usize,
 }
 

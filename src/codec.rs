@@ -1,3 +1,6 @@
+//! Framing: the `Sink`/`Stream` adapter that turns the IO transport into
+//! a flow of rammux frames.
+
 use std::{
     collections::VecDeque,
     io,

@@ -1,3 +1,6 @@
+//! Fixed-size buffers for inbound `DATA` payload, and the intrusive
+//! list that hands them to a stream's reader.
+
 use std::{fmt, mem::MaybeUninit, ops::Not, ptr::NonNull};
 
 use bytes::{Buf, Bytes};

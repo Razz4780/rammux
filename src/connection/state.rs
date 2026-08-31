@@ -1,3 +1,5 @@
+//! Lifecycle states of a [`RammuxConnection`](crate::connection::RammuxConnection).
+
 use std::collections::HashMap;
 
 use async_selector::selector::Selector;
@@ -52,9 +54,14 @@ impl<IO> ConnState<IO> {
     }
 }
 
+/// Everything a live connection owns.
 pub struct Active<IO> {
+    /// Framing over the IO transport.
     pub codec: RammuxCodec<IO>,
+    /// Streams this connection is serving.
     pub streams: ActiveStreams,
+    /// Round-robin over the streams that have something to send, with the
+    /// connection-wide state they share as its polling strategy.
     pub selector: Selector<StreamUpdates, GlobalPool>,
 }
 

@@ -14,6 +14,8 @@ use crate::{
     stream::{FinState, waker::WakerSlot},
 };
 
+/// The receiving half of a virtual stream: buffered payload waiting for
+/// the reader, and the receive window that paces its arrival.
 pub struct InboundTraffic(InboundState);
 
 impl InboundTraffic {
