@@ -209,7 +209,7 @@ where
                 ));
             },
             RammuxProgress::Downgraded(downgraded) => break Some(downgraded),
-            RammuxProgress::Empty => {},
+            RammuxProgress::Empty | RammuxProgress::Probe(..) => {},
         }
     };
 

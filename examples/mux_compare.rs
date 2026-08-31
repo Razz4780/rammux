@@ -12,6 +12,8 @@
 
 #[path = "support/emu.rs"]
 mod emu;
+#[path = "support/rtt.rs"]
+mod rtt;
 
 use std::{
     pin::Pin,
@@ -31,6 +33,7 @@ use rammux::{
     config::{RammuxConfig, RammuxRole},
     connection::{RammuxConnection, RammuxProgress},
 };
+use rtt::RttSchedule;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
@@ -99,7 +102,12 @@ struct Args {
     #[arg(long, default_value_t = 16)]
     r_frame_kb: u32,
     /// Link-clearing probe interval (= probe timeout), seconds.
+    ///
+    /// rammux runs no timers of its own; the harness drives the probes.
     #[arg(long, default_value_t = 20.0)]
+    r_probe_interval_s: f64,
+    /// Plain (loaded-RTT) ping interval (= give-up deadline), seconds.
+    #[arg(long, default_value_t = 5.0)]
     r_ping_interval_s: f64,
     /// Print rammux connection stats every 500ms (transit stalls, windows, RTTs).
     #[arg(long, default_value_t = false)]
@@ -354,6 +362,14 @@ fn stream_target(args: &Args) -> u64 {
 // rammux
 // ---------------------------------------------------------------------------
 
+/// The probe and ping schedule the harness imposes on a connection.
+fn rammux_schedule(args: &Args) -> RttSchedule {
+    RttSchedule::new(
+        Duration::from_secs_f64(args.r_probe_interval_s),
+        Duration::from_secs_f64(args.r_ping_interval_s),
+    )
+}
+
 fn rammux_config(args: &Args) -> RammuxConfig {
     let mut config = RammuxConfig::new();
     config.frame_limit = (args.r_frame_kb * 1024).try_into().unwrap();
@@ -363,7 +379,6 @@ fn rammux_config(args: &Args) -> RammuxConfig {
     config.local_transit_window = args.r_transit_kb * 1024;
     config.remote_transit_window = args.r_transit_kb * 1024;
     config.transit_window_max = args.r_transit_max_kb * 1024;
-    config.ping_interval = Duration::from_secs_f64(args.r_ping_interval_s);
     config.max_inbound_streams = args.streams as u32 + 2;
     config.max_outbound_streams = args.streams as u32 + 2;
     config
@@ -391,6 +406,7 @@ where
         let metrics = metrics.clone();
         async move {
             let mut conn = client;
+            let mut rtt = rammux_schedule(args);
             let mut opened = 0usize;
             let total = args.streams + usize::from(echo);
             loop {
@@ -450,7 +466,7 @@ where
                 // rammux for a stat read that yamux and h2 never make would
                 // bias exactly the CPU-per-MiB comparison below.
                 let stats = args.r_stats.then(|| conn.stats());
-                tokio::select! {
+                let due = tokio::select! {
                     biased;
                     _ = stats_tick.tick(), if args.r_stats => {
                         let stats = stats.expect("guarded by args.r_stats");
@@ -464,13 +480,20 @@ where
                             stats.rtt.map(|r| r.as_secs_f64() * 1e3).unwrap_or(-1.0),
                             stats.dirty_rtt.map(|r| r.as_secs_f64() * 1e3).unwrap_or(-1.0),
                         );
+                        continue;
                     }
+                    due = rtt.next() => due.map_err(|error| error.to_string())?,
                     progress = conn.progress() => {
-                        if let Err(error) = progress {
-                            return Err(error.to_string());
+                        match progress {
+                            Ok(RammuxProgress::Probe(event)) => rtt.observe(event),
+                            Ok(..) => {},
+                            Err(error) => return Err(error.to_string()),
                         }
+                        continue;
                     }
-                }
+                };
+                rtt.apply(due, &mut conn)
+                    .map_err(|error| error.to_string())?;
             }
         }
     };
@@ -481,6 +504,7 @@ where
         let metrics = metrics.clone();
         async move {
             let mut conn = server;
+            let mut rtt = rammux_schedule(args);
             loop {
                 let stats = args.r_stats.then(|| conn.stats());
                 let progress = tokio::select! {
@@ -499,9 +523,15 @@ where
                         );
                         continue;
                     }
+                    due = rtt.next() => {
+                        let due = due.map_err(|error| error.to_string())?;
+                        rtt.apply(due, &mut conn).map_err(|error| error.to_string())?;
+                        continue;
+                    }
                     progress = conn.progress() => progress,
                 };
                 match progress {
+                    Ok(RammuxProgress::Probe(event)) => rtt.observe(event),
                     Ok(RammuxProgress::Inbound(duplex)) => {
                         let metrics = metrics.clone();
                         tokio::spawn(async move {
@@ -946,10 +976,10 @@ where
                     let mut body = req.into_body();
                     tokio::spawn(async move {
                         while let Some(Ok(frame)) = body.frame().await {
-                            if let Ok(data) = frame.into_data() {
-                                if tx.send(data).await.is_err() {
-                                    return;
-                                }
+                            if let Ok(data) = frame.into_data()
+                                && tx.send(data).await.is_err()
+                            {
+                                return;
                             }
                         }
                     });

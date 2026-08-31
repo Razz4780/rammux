@@ -1,9 +1,6 @@
 //! rammux connection configuration.
 
-use std::{fmt, num::NonZeroU32, time::Duration};
-
-/// Default [`RammuxConfig::ping_interval`].
-pub(crate) const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(20);
+use std::{fmt, num::NonZeroU32};
 
 /// Role in a rammux connection.
 ///
@@ -75,16 +72,6 @@ pub struct RammuxConfig {
     /// This value has to be negotiated beforehand and
     /// must match the peer's [`RammuxConfig::local_recv_window`].
     pub remote_recv_window: u32,
-    /// Interval on which the link-clearing `PING` probe runs.
-    ///
-    /// The probe is rammux's only `PING` mechanism: it pauses data output,
-    /// drains the link with a `CLEAR_LINK` exchange, and measures RTT with
-    /// a `PING` exchange over the empty link. The interval is also the
-    /// probe's timeout - a probe that does not complete within one
-    /// interval fails the connection, making the probe the liveness check.
-    ///
-    /// This value is a local knob and does not have to be negotiated.
-    pub ping_interval: Duration,
     /// Size of the global local receive window shared between all streams.
     ///
     /// This pool will be used for autotuning local receive windows of streams
@@ -132,10 +119,9 @@ impl RammuxConfig {
     /// 1. [`Self::frame_limit`] - 16kb
     /// 2. [`Self::max_inbound_streams`] and [`Self::max_outbound_streams`] - 128
     /// 3. [`Self::local_recv_window`] and [`Self::remote_recv_window`] - 64kb
-    /// 4. [`Self::ping_interval`] - 20s
-    /// 5. [`Self::global_recv_window`] - 4mb
-    /// 6. [`Self::local_transit_window`] and [`Self::remote_transit_window`] - 0 (disabled)
-    /// 7. [`Self::transit_window_max`] - 4mb
+    /// 4. [`Self::global_recv_window`] - 4mb
+    /// 5. [`Self::local_transit_window`] and [`Self::remote_transit_window`] - 0 (disabled)
+    /// 6. [`Self::transit_window_max`] - 4mb
     pub const fn new() -> Self {
         Self {
             frame_limit: NonZeroU32::new(16 * 1024).unwrap(),
@@ -143,7 +129,6 @@ impl RammuxConfig {
             max_outbound_streams: 128,
             local_recv_window: NonZeroU32::new(64 * 1024).unwrap(),
             remote_recv_window: 64 * 1024,
-            ping_interval: DEFAULT_PING_INTERVAL,
             global_recv_window: 4 * 1024 * 1024,
             local_transit_window: 0,
             remote_transit_window: 0,

@@ -1,6 +1,6 @@
 //! rammux errors types.
 
-use std::{io, time::Duration};
+use std::io;
 
 use thiserror::Error;
 
@@ -50,16 +50,8 @@ impl RammuxError {
             | ErrorKind::Stream { .. }
             | ErrorKind::Transit(..)
             | ErrorKind::Probe(..) => true,
-            ErrorKind::Io(..)
-            | ErrorKind::AlreadyDowngraded
-            | ErrorKind::ProbeTimeout { .. }
-            | ErrorKind::Poisoned => false,
+            ErrorKind::Io(..) | ErrorKind::AlreadyDowngraded | ErrorKind::Poisoned => false,
         }
-    }
-
-    /// Returns whether this error originates from a link-clearing probe timeout.
-    pub fn is_probe_timeout(&self) -> bool {
-        matches!(&self.0, ErrorKind::ProbeTimeout { .. })
     }
 }
 
@@ -72,6 +64,7 @@ impl From<RammuxError> for io::Error {
     }
 }
 
+/// Internal, non-opaque form of [`RammuxError`].
 #[derive(Error, Debug)]
 pub enum ErrorKind {
     /// IO transport failed.
@@ -89,7 +82,7 @@ pub enum ErrorKind {
         #[source]
         error: StreamError,
     },
-    /// Received an unexpected `PING` frame.
+    /// Received a `PING` frame that no `PING` mechanism can account for.
     #[error("received an unexpected ping {0}")]
     UnexpectedPing(PingPayload),
     /// rammux protocol was violated on the session-level transit window.
@@ -98,15 +91,10 @@ pub enum ErrorKind {
     /// rammux protocol was violated on the link-clearing probe.
     #[error("peer violated the link-clearing probe protocol: {0}")]
     Probe(&'static str),
-    /// The link-clearing probe did not complete within one probe interval.
-    #[error("link-clearing probe timed out after {:.02}s", elapsed.as_secs_f32())]
-    ProbeTimeout {
-        /// Time elapsed since the probe started.
-        elapsed: Duration,
-    },
     /// rammux connection was downgraded and is no longer valid.
     #[error("connection already downgraded")]
     AlreadyDowngraded,
+    /// A previous error left the connection unusable.
     #[error("connection poisoned")]
     Poisoned,
 }

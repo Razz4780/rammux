@@ -55,7 +55,7 @@ async fn run_client(mut rammux: RammuxConnection<DuplexStream>) {
             RammuxProgress::Downgraded(..) => {
                 panic!("we don't expect downgrade fromt the other side")
             },
-            RammuxProgress::Empty => {},
+            RammuxProgress::Empty | RammuxProgress::Probe(..) => {},
         }
     }
 
@@ -85,7 +85,7 @@ async fn run_server(mut rammux: RammuxConnection<DuplexStream>) {
             RammuxProgress::Downgraded(..) => {
                 panic!("we don't expect downgrade before receving all data")
             },
-            RammuxProgress::Empty => {},
+            RammuxProgress::Empty | RammuxProgress::Probe(..) => {},
         }
     };
 
@@ -102,7 +102,7 @@ async fn run_server(mut rammux: RammuxConnection<DuplexStream>) {
         let progress = rammux.progress().await.expect("connection should not fail");
         match progress {
             RammuxProgress::Inbound(..) => panic!("we don't expect more streams"),
-            RammuxProgress::Empty => {},
+            RammuxProgress::Empty | RammuxProgress::Probe(..) => {},
             RammuxProgress::Downgraded(downgraded) => {
                 println!("[{role}] Peer started downgrade.");
                 break downgraded;

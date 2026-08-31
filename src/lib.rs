@@ -10,8 +10,8 @@
 //!
 //! The transport itself is driven by [`RammuxConnection`](connection::RammuxConnection).
 //! That connection owns protocol IO, handles stream creation, applies per-stream flow
-//! control, sends keepalive `PING`s, and performs graceful downgrade back to the
-//! underlying transport when rammux is finished.
+//! control, measures round trip times on demand, and performs graceful downgrade
+//! back to the underlying transport when rammux is finished.
 //!
 //! # Configuration and negotiation
 //!
@@ -50,6 +50,7 @@ pub mod connection;
 mod error;
 mod global_pool;
 mod header;
+mod probe;
 pub mod stream;
 mod stream_id;
 

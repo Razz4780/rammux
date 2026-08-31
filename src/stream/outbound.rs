@@ -36,7 +36,7 @@ impl OutboundTraffic {
     ///    window held it back.
     pub fn poll_update(
         &mut self,
-        mut transit_credit: Option<&mut u32>,
+        transit_credit: Option<&mut u32>,
         transit_blocked: &mut bool,
     ) -> Poll<(Bytes, bool)> {
         let credit_cap = transit_credit.as_deref().copied().unwrap_or(u32::MAX);
@@ -58,7 +58,7 @@ impl OutboundTraffic {
                     .min(frame_limit.get())
                     .min(credit_cap);
                 *recv_window -= chunk_len;
-                if let Some(credit) = transit_credit.as_deref_mut() {
+                if let Some(credit) = transit_credit {
                     *credit -= chunk_len;
                 }
                 let chunk = ready_data.split_to(crate::safe_cast_usize(chunk_len));
@@ -85,7 +85,7 @@ impl OutboundTraffic {
                     .min(frame_limit.get())
                     .min(credit_cap);
                 *recv_window -= chunk_len;
-                if let Some(credit) = transit_credit.as_deref_mut() {
+                if let Some(credit) = transit_credit {
                     *credit -= chunk_len;
                 }
                 let chunk = ready_data.split_to(crate::safe_cast_usize(chunk_len));

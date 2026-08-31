@@ -16,10 +16,10 @@ use bytes::Bytes;
 use clap::{Parser, ValueEnum};
 use futures::{SinkExt, StreamExt};
 use rammux::{
-    RammuxError,
     config::{RammuxConfig, RammuxRole},
     connection::{RammuxConnection, RammuxProgress},
 };
+use rtt::RttSchedule;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -86,7 +86,13 @@ struct Args {
     reader_delay_us: u64,
 
     // ---- rammux config ----
+    /// Link-clearing probe interval (= probe timeout), milliseconds.
+    ///
+    /// rammux runs no timers of its own; the harness drives the probes.
     #[arg(long, default_value_t = 5000)]
+    probe_interval_ms: u64,
+    /// Plain (loaded-RTT) ping interval (= give-up deadline), milliseconds.
+    #[arg(long, default_value_t = 1000)]
     ping_interval_ms: u64,
     #[arg(long, default_value_t = 4096)]
     global_window_kb: u32,
@@ -130,18 +136,27 @@ enum Direction {
 
 #[path = "support/emu.rs"]
 mod emu;
+#[path = "support/rtt.rs"]
+mod rtt;
 use emu::{DirGauges, EmuOpts, emu_pair};
 
 // ---------------------------------------------------------------------------
 // Workload
 // ---------------------------------------------------------------------------
 
+/// The probe and ping schedule the harness imposes on a connection.
+fn rammux_schedule(args: &Args) -> RttSchedule {
+    RttSchedule::new(
+        Duration::from_millis(args.probe_interval_ms),
+        Duration::from_millis(args.ping_interval_ms),
+    )
+}
+
 fn rammux_config(args: &Args) -> RammuxConfig {
     let mut config = RammuxConfig::new();
     config.frame_limit = (args.frame_limit_kb * 1024).try_into().unwrap();
     config.local_recv_window = (args.stream_window_kb * 1024).try_into().unwrap();
     config.remote_recv_window = args.stream_window_kb * 1024;
-    config.ping_interval = Duration::from_millis(args.ping_interval_ms);
     config.global_recv_window = args.global_window_kb as usize * 1024;
     config.local_transit_window = args.transit_kb * 1024;
     config.remote_transit_window = args.transit_kb * 1024;
@@ -159,13 +174,14 @@ async fn drive_conn<IO>(
     args: &Args,
     counters: Arc<Counters>,
     started: Instant,
-) -> Result<(), RammuxError>
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
     let role = conn.role();
     let is_client = role == RammuxRole::Client;
     let mut to_start = if is_client { args.streams } else { 0 };
+    let mut rtt = rammux_schedule(args);
 
     let mut sample = tokio::time::interval(Duration::from_millis(args.sample_ms));
     sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -188,12 +204,14 @@ where
                     );
                 },
                 Ok(None) => break,
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
         }
 
         tokio::select! {
+            due = rtt.next() => rtt.apply(due?, &mut conn)?,
             progress = conn.progress() => match progress? {
+                RammuxProgress::Probe(event) => rtt.observe(event),
                 RammuxProgress::Inbound(duplex) => {
                     let write = args.direction == Direction::Bi;
                     let read = true;

@@ -19,7 +19,6 @@ const CONFIG: RammuxConfig = RammuxConfig {
     max_outbound_streams: 4,
     local_recv_window: NonZeroU32::new(12).unwrap(),
     remote_recv_window: 14,
-    ping_interval: Duration::from_secs(1),
     global_recv_window: 32,
     local_transit_window: 0,
     remote_transit_window: 0,

@@ -55,7 +55,7 @@ async fn run_client(mut rammux: RammuxConnection<DuplexStream>) {
                 println!("[{role}] Peer started downgrade.");
                 break downgraded;
             },
-            RammuxProgress::Empty => {},
+            RammuxProgress::Empty | RammuxProgress::Probe(..) => {},
         }
     };
 
@@ -111,7 +111,7 @@ async fn run_server(mut rammux: RammuxConnection<DuplexStream>) {
                     });
                 }
             },
-            RammuxProgress::Empty => {},
+            RammuxProgress::Empty | RammuxProgress::Probe(..) => {},
         }
     }
 
@@ -124,7 +124,7 @@ async fn run_server(mut rammux: RammuxConnection<DuplexStream>) {
                 match progress {
                     RammuxProgress::Inbound(..) => panic!("we don't expect any more streams"),
                     RammuxProgress::Downgraded(..) => panic!("we don't expect downgrade from the other side"),
-                    RammuxProgress::Empty => {},
+                    RammuxProgress::Empty | RammuxProgress::Probe(..) => {},
                 }
             }
         }
