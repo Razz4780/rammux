@@ -1,0 +1,27 @@
+[package]
+name = "rammux-perf"
+version = "0.0.0"
+description = "Comparative benchmarks for rammux against other stream multiplexers"
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rammux.workspace = true
+
+async_smux.workspace = true
+bytes.workspace = true
+clap.workspace = true
+futures.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["http2", "client", "server"] }
+hyper-util.workspace = true
+rand.workspace = true
+socket2.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tokio-util.workspace = true
+yamux.workspace = true

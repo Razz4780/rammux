@@ -50,7 +50,7 @@ jobs:
       - name: Run examples
         run: |
           set -euo pipefail
-          cargo run ${{ matrix.profile }} --example downgrade
-          cargo run ${{ matrix.profile }} --example flow_control
-          cargo run ${{ matrix.profile }} --example negotiation
-          cargo run ${{ matrix.profile }} --example heavy_io -- --transport unix rammux
+          cargo run ${{ matrix.profile }} -p rammux --example downgrade
+          cargo run ${{ matrix.profile }} -p rammux --example flow_control
+          cargo run ${{ matrix.profile }} -p rammux --example negotiation
+          cargo run ${{ matrix.profile }} -p rammux --example heavy_io -- --transport unix rammux

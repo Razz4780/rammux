@@ -19,17 +19,17 @@
 //! constructing both peers, the application must ensure that both sides use a compatible
 //! [`RammuxConfig`](config::RammuxConfig) and complementary [`RammuxRole`](config::RammuxRole)s.
 //!
-//! See [examples/negotiation.rs](https://github.com/Razz4780/rammux/blob/main/examples/negotiation.rs)
+//! See [examples/negotiation.rs](https://github.com/Razz4780/rammux/blob/main/rammux/examples/negotiation.rs)
 //! for one way to negotiate config out of band.
 //!
 //! # Protocol
 //!
-//! See [PROTOCOL.md](https://github.com/Razz4780/rammux/blob/main/PROTOCOL.md).
+//! See [PROTOCOL.md](https://github.com/Razz4780/rammux/blob/main/rammux/PROTOCOL.md).
 //!
 //! # Examples
 //!
 //! Usage examples live in the
-//! [examples directory](https://github.com/Razz4780/rammux/tree/main/examples):
+//! [examples directory](https://github.com/Razz4780/rammux/tree/main/rammux/examples):
 //!
 //! - `negotiation.rs`: out-of-band config negotiation
 //! - `flow_control.rs`: per-stream flow control and fairness
@@ -70,22 +70,3 @@ const fn safe_cast_usize(value: u32) -> usize {
 // clap is used in examples.
 #[cfg(test)]
 use clap as _;
-#[cfg(test)]
-use socket2 as _;
-// mux_compare example dependencies.
-#[cfg(test)]
-use async_smux as _;
-#[cfg(test)]
-use http as _;
-#[cfg(test)]
-use http_body as _;
-#[cfg(test)]
-use http_body_util as _;
-#[cfg(test)]
-use hyper as _;
-#[cfg(test)]
-use hyper_util as _;
-#[cfg(test)]
-use tokio_util as _;
-#[cfg(test)]
-use yamux as _;

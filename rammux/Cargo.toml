@@ -1,0 +1,29 @@
+[package]
+name = "rammux"
+version = "0.1.2"
+description = "Asynchronous stream multiplexer"
+readme = "README.md"
+keywords = ["multiplexer", "network", "protocol"]
+categories = ["network-programming"]
+publish = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-selector.workspace = true
+bitflags.workspace = true
+bytes.workspace = true
+futures.workspace = true
+rand.workspace = true
+slab.workspace = true
+static_assertions.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+clap.workspace = true
+rstest.workspace = true
+tokio = { workspace = true, features = ["full", "test-util"] }

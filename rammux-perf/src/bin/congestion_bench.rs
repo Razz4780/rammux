@@ -19,7 +19,10 @@ use rammux::{
     config::{RammuxConfig, RammuxRole},
     connection::{RammuxConnection, RammuxProgress},
 };
-use rtt::RttSchedule;
+use rammux_perf::{
+    emu::{DirGauges, EmuOpts, emu_pair},
+    rtt::RttSchedule,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -133,12 +136,6 @@ enum Direction {
     Uni,
     Bi,
 }
-
-#[path = "support/emu.rs"]
-mod emu;
-#[path = "support/rtt.rs"]
-mod rtt;
-use emu::{DirGauges, EmuOpts, emu_pair};
 
 // ---------------------------------------------------------------------------
 // Workload

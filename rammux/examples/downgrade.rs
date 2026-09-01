@@ -10,7 +10,7 @@ const DATA: Bytes = Bytes::from_static(&[21; 64 * 1024]);
 
 /// This example presents the correct downgrade flow.
 ///
-/// See [PROTOCOL.md](https://github.com/Razz4780/rammux/blob/main/PROTOCOL.md) and [`Downgraded`](rammux::Downgraded)
+/// See [PROTOCOL.md](https://github.com/Razz4780/rammux/blob/main/rammux/PROTOCOL.md) and [`Downgraded`](rammux::Downgraded)
 /// doc for more info.
 #[tokio::main]
 async fn main() {

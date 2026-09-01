@@ -10,11 +10,6 @@
 //! * echo: N unbounded bulk streams plus one 1 KiB echo stream; every echo
 //!   round trip is reported (application-level latency under load).
 
-#[path = "support/emu.rs"]
-mod emu;
-#[path = "support/rtt.rs"]
-mod rtt;
-
 use std::{
     pin::Pin,
     sync::{
@@ -27,13 +22,15 @@ use std::{
 
 use bytes::Bytes;
 use clap::{Parser, ValueEnum};
-use emu::{EmuOpts, emu_pair};
 use futures::{SinkExt, StreamExt};
 use rammux::{
     config::{RammuxConfig, RammuxRole},
     connection::{RammuxConnection, RammuxProgress},
 };
-use rtt::RttSchedule;
+use rammux_perf::{
+    emu::{EmuOpts, emu_pair},
+    rtt::RttSchedule,
+};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},

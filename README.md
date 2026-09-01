@@ -61,7 +61,7 @@ If the connection stops being polled, all stream IO stalls with it.
 rammux does not define an in-band handshake. Before running the protocol,
 the application must agree on compatible configuration and roles.
 
-[examples/negotiation.rs](https://github.com/Razz4780/rammux/blob/main/examples/negotiation.rs) shows an example out-of-band negotiation flow.
+[examples/negotiation.rs](https://github.com/Razz4780/rammux/blob/main/rammux/examples/negotiation.rs) shows an example out-of-band negotiation flow.
 
 ## Flow control
 
@@ -95,7 +95,7 @@ The protocol always ends with a downgrade handshake that allows for reclaiming t
 
 ## Examples
 
-Usage examples live in the [examples directory](https://github.com/Razz4780/rammux/tree/main/examples):
+Usage examples live in the [examples directory](https://github.com/Razz4780/rammux/tree/main/rammux/examples):
 - `examples/negotiation.rs`: negotiate config out of band
 - `examples/flow_control.rs`: show blocked and active streams coexisting
 - `examples/downgrade.rs`: orderly shutdown and transport recovery

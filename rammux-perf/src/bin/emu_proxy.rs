@@ -12,11 +12,8 @@
 //! Every contender, Rust included, must go through it for a run to be
 //! comparable: the two extra loopback hops are part of the measurement.
 
-#[path = "support/emu.rs"]
-mod emu;
-
 use clap::Parser;
-use emu::{EmuOpts, emu_pair};
+use rammux_perf::emu::{EmuOpts, emu_pair};
 use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Parser, Debug)]
