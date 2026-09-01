@@ -56,8 +56,8 @@ fn new_stream(
 }
 
 /// Closing both directions at once takes two frames, because a frame
-/// carries at most one of them: the window update ends reading, the data
-/// frame behind it ends writing.
+/// carries at most one of them: the data frame ends writing, the window
+/// update behind it ends reading.
 #[tokio::test]
 async fn rammux_duplex_drop_closes_both() {
     let (_, mut selector, duplex) = new_stream(GlobalPool::default());
@@ -67,8 +67,8 @@ async fn rammux_duplex_drop_closes_both() {
     assert_eq!(
         update.flags(),
         ControlFlags {
-            fin_read: true,
-            fin_write: false,
+            fin_read: false,
+            fin_write: true,
             syn: true
         }
     );
@@ -84,8 +84,8 @@ async fn rammux_duplex_drop_closes_both() {
     assert_eq!(
         update.flags(),
         ControlFlags {
-            fin_read: false,
-            fin_write: true,
+            fin_read: true,
+            fin_write: false,
             syn: false
         },
         "SYN rides the first frame only"

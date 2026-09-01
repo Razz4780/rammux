@@ -39,12 +39,19 @@ impl Task<GlobalPool> for StreamUpdates {
 
     /// Produces the stream's next frame, at most one per poll.
     ///
-    /// Window updates go before payload. They cost no transit credit and
-    /// they are what lets the peer keep sending, so putting them behind
-    /// payload would make an exhausted transit window stall the *reverse*
-    /// direction too. A stream with both pending yields the update now
-    /// and the payload on the next poll - the selector comes straight
-    /// back, and the codec coalesces the pair into one write anyway.
+    /// Payload goes first. A stream that yields here is re-enqueued at
+    /// the *back* of the selector, so whichever frame loses this choice
+    /// waits for every other ready stream - and on a link where the
+    /// transit window is the binding constraint, that wait is a credit
+    /// grant, which is a round trip. Putting the window update first
+    /// costs exactly the streams that care about latency: a request's
+    /// reply queues behind a full rotation of the bulk senders.
+    ///
+    /// Both directions still get served, because payload the transit
+    /// window cannot carry reports pending and the update goes in its
+    /// place. A sender that never yields is impossible: it runs out of
+    /// transit credit or of the peer's stream window, and its update
+    /// leaves on the turn after that.
     fn poll_progress(
         self: Pin<&mut Self>,
         global: &mut GlobalPool,
@@ -54,7 +61,18 @@ impl Task<GlobalPool> for StreamUpdates {
         let mut guard = this.state.lock().unwrap();
 
         let mut flags = ControlFlags::default();
-        let frame = if let Poll::Ready((update, fin_read)) = guard.inbound.poll_update(global) {
+        let mut transit_blocked = false;
+        let outbound = guard
+            .outbound
+            .poll_update(global.send_budget, &mut transit_blocked);
+        let frame = if let Poll::Ready((payload, fin_write)) = outbound {
+            flags.fin_write = fin_write;
+            Some(StreamFrame::Data(Data {
+                stream_id: this.id,
+                flags,
+                payload: payload.into(),
+            }))
+        } else if let Poll::Ready((update, fin_read)) = guard.inbound.poll_update(global) {
             flags.fin_read = fin_read;
             Some(StreamFrame::WindowUpdate(StreamWindowUpdate {
                 stream_id: this.id,
@@ -62,24 +80,8 @@ impl Task<GlobalPool> for StreamUpdates {
                 update,
             }))
         } else {
-            let mut transit_blocked = false;
-            match guard
-                .outbound
-                .poll_update(global.send_budget, &mut transit_blocked)
-            {
-                Poll::Ready((payload, fin_write)) => {
-                    flags.fin_write = fin_write;
-                    Some(StreamFrame::Data(Data {
-                        stream_id: this.id,
-                        flags,
-                        payload: payload.into(),
-                    }))
-                },
-                Poll::Pending => {
-                    global.transit_blocked |= transit_blocked;
-                    None
-                },
-            }
+            global.transit_blocked |= transit_blocked;
+            None
         };
 
         let Some(mut frame) = frame else {
