@@ -1,39 +1,11 @@
-//! Scheduling rammux's RTT measurement.
-//!
-//! A [`RammuxConnection`] runs no timers: the link-clearing probe and the
-//! plain ping are started by the application, and the connection never
-//! gives up on one by itself. This module is the other half of that
-//! arrangement - the policy the library used to hard-code, written once
-//! as an application would write it.
-//!
-//! The schedule here reproduces rammux's historical built-in behaviour:
-//!
-//! - a link-clearing probe every 20s (+-10% jitter), re-anchored whenever
-//!   one completes - including one the *peer* initiated, so two peers do
-//!   not run probes back to back;
-//! - a plain ping every 5s, giving up on one whose pong does not arrive
-//!   within the same 5s;
-//! - a probe that does not complete within one probe interval fails the
-//!   connection, which is what makes it the liveness check.
-//!
-//! Drive it alongside the connection:
-//!
-//! ```ignore
-//! let mut rtt = RttSchedule::new(probe_every, ping_every);
-//! loop {
-//!     tokio::select! {
-//!         progress = conn.progress() => match progress? {
-//!             RammuxProgress::Probe(event) => rtt.observe(event),
-//!             // ...
-//!         },
-//!         due = rtt.next() => rtt.apply(due?, &mut conn)?,
-//!     }
-//! }
-//! ```
+//! Leftover from previous agent work
 
-#![allow(dead_code)]
-
-use std::{fmt, time::Duration};
+use std::{
+    fmt,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use rammux::{
     RammuxError,
@@ -41,7 +13,7 @@ use rammux::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    time::Instant,
+    time::{Instant, Sleep},
 };
 
 /// What the schedule wants done next.
@@ -91,6 +63,8 @@ pub struct RttSchedule {
     probe_started: Option<Instant>,
     /// When the outstanding plain ping was sent, if one is outstanding.
     ping_sent: Option<Instant>,
+    /// Timer, armed for [`Self::deadline`].
+    sleep: Pin<Box<Sleep>>,
 }
 
 impl RttSchedule {
@@ -110,49 +84,58 @@ impl RttSchedule {
             next_ping: now + ping_every,
             probe_started: None,
             ping_sent: None,
+            sleep: Box::pin(tokio::time::sleep_until(now)),
         }
     }
 
-    /// Sleeps until something is due.
+    /// When the next thing is due.
     ///
-    /// # Cancellation safety
-    ///
-    /// This method is cancel safe: all of its state lives in `self`, so a
-    /// cancelled call loses nothing but the sleep.
-    pub async fn next(&mut self) -> Result<Due, ProbeTimeout> {
-        loop {
-            let deadlines = [
-                Some(self.next_probe),
-                Some(self.next_ping),
-                self.probe_started.map(|at| at + self.probe_every),
-                self.ping_sent.map(|at| at + self.ping_every),
-            ];
-            let at = deadlines.into_iter().flatten().min().expect("never empty");
-            tokio::time::sleep_until(at).await;
-
-            let now = Instant::now();
-            if let Some(started) = self
-                .probe_started
-                .filter(|at| *at + self.probe_every <= now)
-            {
-                return Err(ProbeTimeout {
-                    elapsed: now - started,
-                });
-            }
-            if self.ping_sent.is_some_and(|at| at + self.ping_every <= now) {
-                self.ping_sent = None;
-                return Ok(Due::AbandonPing);
-            }
-            if self.next_probe <= now {
-                return Ok(Due::Probe);
-            }
-            if self.next_ping <= now {
-                return Ok(Due::Ping);
-            }
-        }
+    /// Whichever deadline this picks, its check in [`Self::poll_next`] fires
+    /// once the timer reaches it, so a poll never comes back empty-handed.
+    fn deadline(&self) -> Instant {
+        [
+            Some(self.next_probe),
+            Some(self.next_ping),
+            self.probe_started.map(|at| at + self.probe_every),
+            self.ping_sent.map(|at| at + self.ping_every),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .expect("never empty")
     }
 
-    /// Carries out what [`Self::next`] returned.
+    /// Polls until something is due.
+    ///
+    /// All of the state lives in `self`, so a caller that stops polling
+    /// loses nothing but the timer registration.
+    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Result<Due, ProbeTimeout>> {
+        let at = self.deadline();
+        if self.sleep.deadline() != at {
+            self.sleep.as_mut().reset(at);
+        }
+        std::task::ready!(self.sleep.as_mut().poll(cx));
+
+        let now = Instant::now();
+        if let Some(started) = self
+            .probe_started
+            .filter(|at| *at + self.probe_every <= now)
+        {
+            return Poll::Ready(Err(ProbeTimeout {
+                elapsed: now - started,
+            }));
+        }
+        if self.ping_sent.is_some_and(|at| at + self.ping_every <= now) {
+            self.ping_sent = None;
+            return Poll::Ready(Ok(Due::AbandonPing));
+        }
+        if self.next_probe <= now {
+            return Poll::Ready(Ok(Due::Probe));
+        }
+        Poll::Ready(Ok(Due::Ping))
+    }
+
+    /// Carries out what [`Self::poll_next`] returned.
     pub fn apply<IO>(
         &mut self,
         due: Due,
