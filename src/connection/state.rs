@@ -11,7 +11,7 @@ use crate::{
     error::ErrorKind,
     global_pool::GlobalPool,
     stream::{handle::StreamHandle, updates::StreamUpdates},
-    transport::Transport,
+    transport::{StreamFrame, Transport},
 };
 
 /// Inner state of a [`RammuxConnection`](super::RammuxConnection).
@@ -64,6 +64,12 @@ pub struct Active<IO> {
     /// Round-robin over the streams that have something to send, with the
     /// connection-wide state they share as its polling strategy.
     pub selector: Selector<StreamUpdates, GlobalPool>,
+    /// Second half of a pair a stream produced, waiting for the transport
+    /// to take it. It goes out before the selector is polled again, so
+    /// the two frames stay back to back - see [`StreamOutput`].
+    ///
+    /// [`StreamOutput`]: crate::stream::updates::StreamOutput
+    pub pending_frame: Option<StreamFrame>,
 }
 
 /// Stores active rammux streams.

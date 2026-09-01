@@ -18,7 +18,11 @@ use crate::{
     connection::state::{Active, ConnState},
     error::{ErrorKind, RammuxError, StreamError},
     global_pool::GlobalPool,
-    stream::{FinState, RammuxDuplex, handle::StreamHandle},
+    stream::{
+        FinState, RammuxDuplex,
+        handle::StreamHandle,
+        updates::{StreamOutput, StreamUpdates},
+    },
     stream_id::StreamId,
     transport::{StreamFrame, Transport},
 };
@@ -106,6 +110,7 @@ where
                     available: config.global_recv_window,
                     ..Default::default()
                 }),
+                pending_frame: None,
             }),
             config,
             role,
@@ -253,7 +258,15 @@ where
             global.send_budget = budget;
             global.dirty_rtt = dirty_rtt;
 
-            let Poll::Ready(Some((frame, fin_state))) = active.selector.poll_next_unpin(cx) else {
+            // The other half of a pair goes out before anything else, so
+            // the two frames stay adjacent on the wire.
+            if let Some(frame) = active.pending_frame.take() {
+                Self::note_payload(&mut active.selector, &frame);
+                active.transport.start_send_unpin(frame)?;
+                continue;
+            }
+
+            let Poll::Ready(Some(output)) = active.selector.poll_next_unpin(cx) else {
                 // Every stream came back pending. If at least one of them
                 // had payload ready and only the spent transit window
                 // held it back, the sender is stalled on a credit grant.
@@ -263,13 +276,15 @@ where
                 return Poll::Pending;
             };
 
-            if let StreamFrame::Data(data) = &frame
-                && data.payload.is_empty().not()
-            {
-                active.selector.strategy_mut().transit_blocked = false;
-            }
-            let id = frame.stream_id();
-            active.transport.start_send_unpin(frame)?;
+            let StreamOutput {
+                first,
+                second,
+                fin_state,
+            } = output;
+            active.pending_frame = second;
+            Self::note_payload(&mut active.selector, &first);
+            let id = first.stream_id();
+            active.transport.start_send_unpin(first)?;
             if fin_state.is_dead() {
                 if id.initiated_by() == self.role {
                     active.streams.outbound.remove(id.slab_idx());
@@ -277,6 +292,16 @@ where
                     active.streams.inbound.remove(&id);
                 }
             }
+        }
+    }
+
+    /// Payload actually moving means the sender was not, after all, stuck
+    /// waiting on a transit credit grant.
+    fn note_payload(selector: &mut Selector<StreamUpdates, GlobalPool>, frame: &StreamFrame) {
+        if let StreamFrame::Data(data) = frame
+            && data.payload.is_empty().not()
+        {
+            selector.strategy_mut().transit_blocked = false;
         }
     }
 

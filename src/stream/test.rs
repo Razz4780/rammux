@@ -10,7 +10,11 @@ use crate::{
     config::RammuxConfig,
     global_pool::GlobalPool,
     header::ControlFlags,
-    stream::{FinState, RammuxDuplex, handle::StreamHandle, updates::StreamUpdates},
+    stream::{
+        FinState, RammuxDuplex,
+        handle::StreamHandle,
+        updates::{StreamOutput, StreamUpdates},
+    },
     transport::StreamFrame,
 };
 
@@ -55,40 +59,34 @@ fn new_stream(
     (handle, selector, duplex)
 }
 
-/// Closing both directions at once takes two frames, because a frame
-/// carries at most one of them: the data frame ends writing, the window
-/// update behind it ends reading.
+/// Closing both directions at once takes two frames - one carries each
+/// fin - and they come out as a pair, back to back.
 #[tokio::test]
 async fn rammux_duplex_drop_closes_both() {
     let (_, mut selector, duplex) = new_stream(GlobalPool::default());
     drop(duplex);
 
-    let (update, fin_state) = selector.next().await.unwrap();
-    assert_eq!(
-        update.flags(),
-        ControlFlags {
-            fin_read: false,
-            fin_write: true,
-            syn: true
-        }
-    );
-    assert_eq!(
+    let StreamOutput {
+        first,
+        second,
         fin_state,
-        FinState {
-            sent: false,
-            received: false
-        }
-    );
-
-    let (update, fin_state) = selector.next().await.unwrap();
+    } = selector.next().await.unwrap();
     assert_eq!(
-        update.flags(),
+        first.flags(),
         ControlFlags {
             fin_read: true,
             fin_write: false,
-            syn: false
+            syn: true
         },
-        "SYN rides the first frame only"
+        "the window update leads, and carries SYN"
+    );
+    assert_eq!(
+        second.expect("expected the payload frame too").flags(),
+        ControlFlags {
+            fin_read: false,
+            fin_write: true,
+            syn: false
+        }
     );
     assert_eq!(
         fin_state,
@@ -103,7 +101,11 @@ async fn rammux_duplex_drop_closes_both() {
 async fn rammux_sink_drop_closes_writing() {
     let (_, mut selector, duplex) = new_stream(GlobalPool::default());
     let _stream = duplex.into_split().1;
-    let (update, fin_state) = selector.next().await.unwrap();
+    let StreamOutput {
+        first: update,
+        fin_state,
+        ..
+    } = selector.next().await.unwrap();
     assert_eq!(
         update.flags(),
         ControlFlags {
@@ -125,7 +127,11 @@ async fn rammux_sink_drop_closes_writing() {
 async fn rammux_stream_drop_closes_reading() {
     let (_, mut selector, duplex) = new_stream(GlobalPool::default());
     let _sink = duplex.into_split().0;
-    let (update, fin_state) = selector.next().await.unwrap();
+    let StreamOutput {
+        first: update,
+        fin_state,
+        ..
+    } = selector.next().await.unwrap();
     assert_eq!(
         update.flags(),
         ControlFlags {
@@ -157,7 +163,7 @@ async fn local_receive_window_is_autotuned() {
             .received_data(Data::copy_from_slice(&data).into(), false, false)
             .unwrap();
         duplex.next().await.unwrap();
-        let (update, ..) = selector.next().await.unwrap();
+        let StreamOutput { first: update, .. } = selector.next().await.unwrap();
         assert_eq!(window_update(&update), CONFIG.local_recv_window.get());
     }
 
@@ -171,7 +177,7 @@ async fn local_receive_window_is_autotuned() {
             .received_data(Data::copy_from_slice(&data).into(), false, false)
             .unwrap();
         duplex.next().await.unwrap();
-        let (update, ..) = selector.next().await.unwrap();
+        let StreamOutput { first: update, .. } = selector.next().await.unwrap();
         assert!(window_update(&update) > current_window);
         current_window = window_update(&update);
     }
@@ -183,7 +189,7 @@ async fn local_receive_window_is_autotuned() {
             .received_data(Data::copy_from_slice(&data).into(), false, false)
             .unwrap();
         duplex.next().await.unwrap();
-        let (update, ..) = selector.next().await.unwrap();
+        let StreamOutput { first: update, .. } = selector.next().await.unwrap();
         assert!(window_update(&update) < current_window);
         current_window = window_update(&update);
     }
@@ -208,7 +214,11 @@ async fn remote_receive_window_is_respected() {
     for _ in 0..CONFIG.remote_recv_window {
         duplex.feed(Bytes::from_static(b"a")).await.unwrap();
         assert!(duplex.flush().now_or_never().is_none());
-        let (update, fin_state) = selector.next().await.unwrap();
+        let StreamOutput {
+            first: update,
+            fin_state,
+            ..
+        } = selector.next().await.unwrap();
         assert_eq!(payload_len(&update), 1);
         assert_eq!(
             fin_state,
@@ -224,7 +234,11 @@ async fn remote_receive_window_is_respected() {
     assert!(duplex.flush().now_or_never().is_none());
     assert!(selector.next().now_or_never().is_none());
     handle.received_window_update(8, false, false).unwrap();
-    let (update, fin_state) = selector.next().await.unwrap();
+    let StreamOutput {
+        first: update,
+        fin_state,
+        ..
+    } = selector.next().await.unwrap();
     assert_eq!(payload_len(&update), 1);
     assert_eq!(
         fin_state,
