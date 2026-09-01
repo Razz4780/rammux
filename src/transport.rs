@@ -730,9 +730,12 @@ where
                 return this.codec.poll_ready_unpin(cx).map_err(From::from);
             }
             if this.held.is_some() {
-                // The caller has a frame waiting on the Stream side;
-                // taking it is the progress signal, so there is nothing
-                // to register here.
+                // The caller has a frame waiting on the Stream side, and
+                // taking it is the only thing that gets us further. The
+                // read that produced it registered no waker - it returned
+                // ready - so wake ourselves rather than leave a caller
+                // that only drives the Sink parked forever.
+                cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
             // Only an inbound frame ends a probe, so read to make
