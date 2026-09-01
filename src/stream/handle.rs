@@ -3,9 +3,9 @@
 use std::sync::{Arc, Mutex};
 
 use crate::{
+    buffer::Data,
     error::StreamError,
     stream::{FinState, SharedStreamState},
-    transport::Payload,
 };
 
 /// Handle to a virtual rammux stream.
@@ -17,7 +17,7 @@ impl StreamHandle {
     /// Returns the new [`FinState`] of the whole stream.
     pub fn received_data(
         &mut self,
-        payload: Payload,
+        data: Data,
         fin_read: bool,
         fin_write: bool,
     ) -> Result<FinState, StreamError> {
@@ -27,7 +27,7 @@ impl StreamHandle {
             outbound,
             updates_poller,
         } = &mut *guard;
-        inbound.received_data(payload)?;
+        inbound.received_data(data)?;
         if fin_write {
             inbound.received_fin_write(updates_poller)?;
         }

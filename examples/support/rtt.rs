@@ -9,9 +9,8 @@
 //! The schedule here reproduces rammux's historical built-in behaviour:
 //!
 //! - a link-clearing probe every 20s (+-10% jitter), re-anchored whenever
-//!   one completes - including one the *peer* initiated and the
-//!   connection's own opening exchange, so two peers do not run probes
-//!   back to back;
+//!   one completes - including one the *peer* initiated, so two peers do
+//!   not run probes back to back;
 //! - a plain ping every 5s, giving up on one whose pong does not arrive
 //!   within the same 5s;
 //! - a probe that does not complete within one probe interval fails the
@@ -98,16 +97,16 @@ impl RttSchedule {
     /// Creates a schedule that probes every `probe_every` and pings every
     /// `ping_every`. Each interval doubles as that exchange's deadline.
     ///
-    /// Both start one interval out. A fresh connection already has its
-    /// opening `PING` exchange under way - the link is clear before
-    /// either side has sent anything - so the first clean sample is on
-    /// its way and there is nothing to hurry.
+    /// The first probe is due immediately: at connection open the link is
+    /// empty by construction, which is the cheapest moment to clear it,
+    /// and the session-level transit window cannot autotune until a clean
+    /// RTT has landed.
     pub fn new(probe_every: Duration, ping_every: Duration) -> Self {
         let now = Instant::now();
         Self {
             probe_every,
             ping_every,
-            next_probe: now + probe_every,
+            next_probe: now,
             next_ping: now + ping_every,
             probe_started: None,
             ping_sent: None,
@@ -166,8 +165,9 @@ impl RttSchedule {
         match due {
             Due::Probe => {
                 // Refused means a probe is already running - the peer's,
-                // say, or the connection's opening exchange. That resolves
-                // on its own, so come back rather than force it.
+                // say - or a plain ping is unanswered and its pong would
+                // be indistinguishable from the probe's own. Both resolve
+                // on their own, so come back rather than force it.
                 self.next_probe = now
                     + if conn.start_probe()? {
                         self.probe_every

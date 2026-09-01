@@ -10,7 +10,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::{Buf, Bytes};
+use bytes::Buf;
 use futures::{Sink, Stream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -61,21 +61,8 @@ impl<IO> RammuxCodec<IO> {
         }
     }
 
-    /// Recovers the IO transport along with bytes read off it but not yet
-    /// decoded into a frame.
-    ///
-    /// The decoder reads exactly one frame at a time and never runs past
-    /// it, so those bytes are only ever a partially filled header. A
-    /// partially read `DATA` payload is dropped instead: its header is
-    /// already consumed, so the bytes have no meaning outside the session.
-    pub fn into_parts(self) -> (IO, Bytes) {
-        let read = match self.decoder {
-            DecoderState::ReadingHeader { filled, buffer } => {
-                Bytes::copy_from_slice(&buffer[..filled])
-            },
-            DecoderState::ReadingData { .. } => Bytes::new(),
-        };
-        (self.io, read)
+    pub fn into_inner(self) -> IO {
+        self.io
     }
 }
 

@@ -9,16 +9,17 @@ use crate::{
     header::{ControlFlags, PingPayload, RawFlags, RawHeader},
 };
 
-/// One outbound frame, held as a byte source the codec drains.
+/// One outbound write: up to two frame headers and their payload, held
+/// as a contiguous byte source the codec drains.
 ///
-/// The codec queues these and writes a batch of them vectored, so an item
-/// never needs to hold more than one frame to keep writes coalesced.
+/// Two headers, because a stream's window update and its data go out as
+/// a pair often enough to be worth coalescing into one write.
 pub struct EncoderItem {
-    /// The frame header.
-    header: [u8; RawHeader::LEN],
-    /// `DATA` payload following it, empty if there is none.
+    /// Both headers back to back; `consumed` marks where the live one starts.
+    headers: [u8; RawHeader::LEN * 2],
+    /// `DATA` payload following the headers, empty if there is none.
     data: Bytes,
-    /// Bytes of this item already written.
+    /// Header bytes already written.
     consumed: usize,
 }
 
@@ -34,10 +35,12 @@ impl EncoderItem {
             flags,
             len: payload.len,
         };
+        let mut headers = [0_u8; RawHeader::LEN * 2];
+        headers[RawHeader::LEN..].copy_from_slice(&header.encode());
         Self {
-            header: header.encode(),
+            headers,
             data: Default::default(),
-            consumed: 0,
+            consumed: RawHeader::LEN,
         }
     }
 
@@ -47,10 +50,12 @@ impl EncoderItem {
             flags: RawFlags::SESSION | RawFlags::WINDOW_UPDATE,
             len: update,
         };
+        let mut headers = [0; RawHeader::LEN * 2];
+        headers[RawHeader::LEN..].copy_from_slice(&header.encode());
         Self {
-            header: header.encode(),
+            headers,
             data: Default::default(),
-            consumed: 0,
+            consumed: RawHeader::LEN,
         }
     }
 
@@ -65,18 +70,20 @@ impl EncoderItem {
             flags,
             len: 0,
         };
+        let mut headers = [0; RawHeader::LEN * 2];
+        headers[RawHeader::LEN..].copy_from_slice(&header.encode());
         Self {
-            header: header.encode(),
+            headers,
             data: Default::default(),
-            consumed: 0,
+            consumed: RawHeader::LEN,
         }
     }
 
     pub fn new_terminate() -> Self {
         Self {
-            header: [0_u8; RawHeader::LEN],
+            headers: [0_u8; RawHeader::LEN * 2],
             data: Default::default(),
-            consumed: 0,
+            consumed: RawHeader::LEN,
         }
     }
 
@@ -86,10 +93,12 @@ impl EncoderItem {
             flags: RawFlags::from(flags).union(RawFlags::WINDOW_UPDATE),
             len: update,
         };
+        let mut headers = [0; RawHeader::LEN * 2];
+        headers[8..].copy_from_slice(&header.encode());
         Self {
-            header: header.encode(),
+            headers,
             data: Default::default(),
-            consumed: 0,
+            consumed: RawHeader::LEN,
         }
     }
 
@@ -99,8 +108,41 @@ impl EncoderItem {
             flags: RawFlags::from(flags).union(RawFlags::DATA),
             len: u32::try_from(data.len()).expect("data too big"),
         };
+        let mut headers = [0; RawHeader::LEN * 2];
+        headers[8..].copy_from_slice(&header.encode());
         Self {
-            header: header.encode(),
+            headers,
+            data,
+            consumed: RawHeader::LEN,
+        }
+    }
+
+    pub fn new_window_update_and_data(
+        stream_id: StreamId,
+        flags: ControlFlags,
+        update: u32,
+        data: Bytes,
+    ) -> Self {
+        let flags = RawFlags::from(flags);
+        let header_1 = RawHeader {
+            stream_id,
+            flags: flags
+                .union(RawFlags::WINDOW_UPDATE)
+                .difference(RawFlags::FIN_WRITE),
+            len: update,
+        };
+        let header_2 = RawHeader {
+            stream_id,
+            flags: flags
+                .union(RawFlags::DATA)
+                .difference(RawFlags::FIN_READ | RawFlags::SYN),
+            len: u32::try_from(data.len()).expect("data too big"),
+        };
+        let mut headers = [0; RawHeader::LEN * 2];
+        headers[..8].copy_from_slice(&header_1.encode());
+        headers[8..].copy_from_slice(&header_2.encode());
+        Self {
+            headers,
             data,
             consumed: 0,
         }
@@ -109,13 +151,13 @@ impl EncoderItem {
 
 impl Buf for EncoderItem {
     fn remaining(&self) -> usize {
-        self.header.len() + self.data.len() - self.consumed
+        self.headers.len() + self.data.len() - self.consumed
     }
 
     fn chunk(&self) -> &[u8] {
-        match self.consumed.checked_sub(self.header.len()) {
+        match self.consumed.checked_sub(self.headers.len()) {
             Some(offset) => &self.data[offset..],
-            None => &self.header[self.consumed..],
+            None => &self.headers[self.consumed..],
         }
     }
 
@@ -129,7 +171,7 @@ impl Buf for EncoderItem {
     fn chunks_vectored<'a>(&'a self, dst: &mut [std::io::IoSlice<'a>]) -> usize {
         let mut idx = 0;
         let mut offset = self.consumed;
-        for chunk in [self.header.as_slice(), self.data.as_ref()] {
+        for chunk in [self.headers.as_slice(), self.data.as_ref()] {
             let data = chunk.get(offset..).unwrap_or_default();
             offset = offset.saturating_sub(chunk.len());
             if data.is_empty() {
@@ -254,6 +296,22 @@ mod test {
             Bytes::from_static(b"9999"),
         ),
         &[71, 99, 21, 20, 0, 0, 0, 4, 57, 57, 57, 57],
+    )]
+    #[case::both(
+        EncoderItem::new_window_update_and_data(
+            StreamId::from_be_bytes([7, 6, 5]),
+            ControlFlags {
+                syn: true,
+                fin_read: true,
+                fin_write: true,
+            },
+            12,
+            Bytes::from_static(b"2137"),
+        ),
+        &[
+            7, 6, 5, 42, 0, 0, 0, 12,
+            7, 6, 5, 20, 0, 0, 0, 4, 50, 49, 51, 55,
+        ],
     )]
     #[test]
     fn stream_update_frame(#[case] mut item: EncoderItem, #[case] mut expected: &[u8]) {

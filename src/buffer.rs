@@ -75,7 +75,7 @@ pub struct Data(
 );
 
 impl Data {
-    /// Copies `slice` into a fresh buffer.
+    #[cfg(test)]
     pub fn copy_from_slice(slice: &[u8]) -> Self {
         let mut buffer = Buffer::with_capactiy(slice.len());
         buffer.as_mut_slice().write_copy_of_slice(slice);

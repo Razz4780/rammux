@@ -23,8 +23,6 @@ or QUIC.
 
 - `RammuxConnection<IO>`: the protocol driver that owns the transport
 - `RammuxDuplex`: a virtual bidirectional byte stream
-- `Transport<IO>`: the layer below, a `Sink`/`Stream` of stream frames that
-  handles the transit window, pings and probes on its own
 - per-stream flow control with local receive window autotuning
 - a session-level transit window that bounds total data in flight
 - on-demand RTT measurement, loaded and over a drained link

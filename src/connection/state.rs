@@ -7,11 +7,11 @@ use slab::Slab;
 
 use crate::{
     StreamId,
+    codec::RammuxCodec,
     connection::downgrade::Downgraded,
     error::ErrorKind,
     global_pool::GlobalPool,
     stream::{handle::StreamHandle, updates::StreamUpdates},
-    transport::{StreamFrame, Transport},
 };
 
 /// Inner state of a [`RammuxConnection`](super::RammuxConnection).
@@ -44,7 +44,7 @@ impl<IO> ConnState<IO> {
 
     pub fn downgrade(&mut self, term_received: bool) -> Result<Downgraded<IO>, ErrorKind> {
         match std::mem::replace(self, Self::Downgraded) {
-            Self::Active(active) => Ok(Downgraded::new(active.transport, term_received)),
+            Self::Active(active) => Ok(Downgraded::new(active.codec, term_received)),
             Self::Poisoned => {
                 *self = Self::Poisoned;
                 Err(ErrorKind::Poisoned)
@@ -56,20 +56,13 @@ impl<IO> ConnState<IO> {
 
 /// Everything a live connection owns.
 pub struct Active<IO> {
-    /// Framing, RTT measurement and the transit window over the IO
-    /// transport.
-    pub transport: Transport<IO>,
+    /// Framing over the IO transport.
+    pub codec: RammuxCodec<IO>,
     /// Streams this connection is serving.
     pub streams: ActiveStreams,
     /// Round-robin over the streams that have something to send, with the
     /// connection-wide state they share as its polling strategy.
     pub selector: Selector<StreamUpdates, GlobalPool>,
-    /// Second half of a pair a stream produced, waiting for the transport
-    /// to take it. It goes out before the selector is polled again, so
-    /// the two frames stay back to back - see [`StreamOutput`].
-    ///
-    /// [`StreamOutput`]: crate::stream::updates::StreamOutput
-    pub pending_frame: Option<StreamFrame>,
 }
 
 /// Stores active rammux streams.

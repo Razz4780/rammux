@@ -12,13 +12,14 @@ use async_selector::{
     selector::{BorrowedMut, Removed},
     task::Task,
 };
+use bytes::Bytes;
 
 use crate::{
     StreamId,
+    codec::encoder::EncoderItem,
     global_pool::GlobalPool,
     header::ControlFlags,
     stream::{FinState, SharedStreamState},
-    transport::{Data, StreamFrame, StreamWindowUpdate},
 };
 
 /// One stream's entry in the connection's selector: polled for whatever
@@ -32,29 +33,10 @@ pub(crate) struct StreamUpdates {
     pub(super) state: Arc<Mutex<SharedStreamState>>,
 }
 
-/// What a stream wants on the wire next.
-///
-/// Usually one frame. A stream with both a window update and payload
-/// pending produces the pair, because the two have to be written
-/// back to back: a stream that yields is re-enqueued at the *back* of the
-/// selector, so a second frame left for the next turn waits out a full
-/// rotation of every other ready stream - and where the transit window is
-/// the binding constraint, that wait is a credit grant, which is a round
-/// trip. Splitting the pair across turns costs ~50ms of echo latency on a
-/// 25ms link.
-pub(crate) struct StreamOutput {
-    /// The frame to send now.
-    pub first: StreamFrame,
-    /// The frame to send immediately after it, if there is one.
-    pub second: Option<StreamFrame>,
-    /// State of the stream once both are out.
-    pub fin_state: FinState,
-}
-
 impl Task<GlobalPool> for StreamUpdates {
-    type Cont = StreamOutput;
-    type Break = StreamOutput;
-    type Output = StreamOutput;
+    type Cont = (StreamUpdate, FinState);
+    type Break = (StreamUpdate, FinState);
+    type Output = (StreamUpdate, FinState);
 
     fn poll_progress(
         self: Pin<&mut Self>,
@@ -62,83 +44,61 @@ impl Task<GlobalPool> for StreamUpdates {
         cx: &mut Context<'_>,
     ) -> Poll<ControlFlow<Self::Break, Self::Cont>> {
         let this = self.get_mut();
+        if global.probe_paused() {
+            // A link-clearing probe is in progress: no stream frames may
+            // travel until it completes.
+            let mut guard = this.state.lock().unwrap();
+            guard.updates_poller.register(cx.waker());
+            return Poll::Pending;
+        }
+        let mut update = StreamUpdate {
+            id: this.id,
+            window_update: 0,
+            data: Default::default(),
+            flags: ControlFlags::default(),
+        };
+        let mut is_pending = true;
+
         let mut guard = this.state.lock().unwrap();
-
-        let window_update = match guard.inbound.poll_update(global) {
-            Poll::Ready((update, fin_read)) => Some((update, fin_read)),
-            Poll::Pending => None,
-        };
+        if let Poll::Ready((window_update, fin_read)) = guard.inbound.poll_update(global) {
+            update.window_update = window_update;
+            update.flags.fin_read = fin_read;
+            is_pending = false;
+        }
         let mut transit_blocked = false;
-        let payload = match guard
+        let transit_credit = global
+            .transit_send
+            .as_mut()
+            .map(|transit| &mut transit.credit);
+        if let Poll::Ready((data, fin_write)) = guard
             .outbound
-            .poll_update(global.send_budget, &mut transit_blocked)
+            .poll_update(transit_credit, &mut transit_blocked)
         {
-            Poll::Ready((payload, fin_write)) => Some((payload, fin_write)),
-            Poll::Pending => None,
-        };
-
-        // The window update leads. It costs no transit credit and it is
-        // what lets the peer keep sending, so it must not queue behind
-        // payload an exhausted transit window is holding back.
-        let syn = std::mem::take(&mut this.syn);
-        let (first, second) = match (window_update, payload) {
-            (Some((update, fin_read)), payload) => (
-                StreamFrame::WindowUpdate(StreamWindowUpdate {
-                    stream_id: this.id,
-                    flags: ControlFlags {
-                        syn,
-                        fin_read,
-                        fin_write: false,
-                    },
-                    update,
-                }),
-                payload.map(|(payload, fin_write)| {
-                    StreamFrame::Data(Data {
-                        stream_id: this.id,
-                        flags: ControlFlags {
-                            syn: false,
-                            fin_read: false,
-                            fin_write,
-                        },
-                        payload: payload.into(),
-                    })
-                }),
-            ),
-            (None, Some((payload, fin_write))) => (
-                StreamFrame::Data(Data {
-                    stream_id: this.id,
-                    flags: ControlFlags {
-                        syn,
-                        fin_read: false,
-                        fin_write,
-                    },
-                    payload: payload.into(),
-                }),
-                None,
-            ),
-            (None, None) => {
-                this.syn = syn;
-                global.transit_blocked |= transit_blocked;
-                guard.updates_poller.register(cx.waker());
-                return Poll::Pending;
-            },
-        };
-
-        let fin_state = guard.inbound.fin_state().and(guard.outbound.fin_state());
+            update.data = data;
+            update.flags.fin_write = fin_write;
+            is_pending = false;
+        }
+        if is_pending {
+            global.transit_blocked |= transit_blocked;
+            guard.updates_poller.register(cx.waker());
+            return Poll::Pending;
+        }
+        let inbound_fin = guard.inbound.fin_state();
+        let outbound_fin = guard.outbound.fin_state();
         drop(guard);
 
-        let output = StreamOutput {
-            first,
-            second,
-            fin_state,
-        };
-        Poll::Ready(if fin_state.sent {
+        // At this point, `update` cannot be empty.
+        update.flags.syn = std::mem::take(&mut this.syn);
+
+        let fin_state = inbound_fin.and(outbound_fin);
+        let update = if fin_state.sent {
             // If we sent both fins, this stream of updates is done.
-            ControlFlow::Break(output)
+            ControlFlow::Break((update, fin_state))
         } else {
             // Otherwise, this stream of updates should be polled again.
-            ControlFlow::Continue(output)
-        })
+            ControlFlow::Continue((update, fin_state))
+        };
+        Poll::Ready(update)
     }
 
     fn transform_cont(
@@ -155,5 +115,38 @@ impl Task<GlobalPool> for StreamUpdates {
         value: Self::Break,
     ) -> Option<Self::Output> {
         Some(value)
+    }
+}
+
+/// What a stream wants to send: window credit, payload, or both, plus
+/// whatever lifecycle bits are due. Converts into one or two frames.
+pub struct StreamUpdate {
+    /// Stream this belongs to.
+    pub id: StreamId,
+    /// Receive window credit to return, `0` for none.
+    pub window_update: u32,
+    /// Payload to send, empty for none.
+    pub data: Bytes,
+    /// Lifecycle bits to carry.
+    pub flags: ControlFlags,
+}
+
+impl From<StreamUpdate> for EncoderItem {
+    fn from(value: StreamUpdate) -> Self {
+        if value.data.is_empty() {
+            // Single WINDOW_UPDATE frame.
+            EncoderItem::new_window_update(value.id, value.flags, value.window_update)
+        } else if value.window_update > 0 {
+            // Two frames, WINDOW_UPDATE and DATA.
+            EncoderItem::new_window_update_and_data(
+                value.id,
+                value.flags,
+                value.window_update,
+                value.data,
+            )
+        } else {
+            // Single DATA frame.
+            EncoderItem::new_data(value.id, value.flags, value.data)
+        }
     }
 }
