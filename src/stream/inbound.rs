@@ -12,6 +12,7 @@ use crate::{
     error::StreamError,
     global_pool::GlobalPool,
     stream::{FinState, waker::WakerSlot},
+    transport::Payload,
 };
 
 /// The receiving half of a virtual stream: buffered payload waiting for
@@ -203,10 +204,11 @@ impl InboundTraffic {
         }
     }
 
-    pub fn received_data(&mut self, data: Data) -> Result<(), StreamError> {
-        if data.as_ref().is_empty() {
+    pub fn received_data(&mut self, payload: Payload) -> Result<(), StreamError> {
+        if payload.is_empty() {
             return Ok(());
         }
+        let data_len = u32::try_from(payload.len()).expect("bounded by the frame limit");
 
         match &mut self.0 {
             InboundState::Open {
@@ -214,12 +216,11 @@ impl InboundTraffic {
                 reader,
                 recv_window,
             } => {
-                let data_len = u32::try_from(data.as_ref().len()).expect("ooga booga");
                 if recv_window.remaining() < data_len {
                     return Err(StreamError("exceeded available receive window"));
                 }
                 recv_window.consumed += data_len;
-                ready_data.push_back(data);
+                ready_data.push_back(payload.into_received());
                 reader.wake();
                 Ok(())
             },
@@ -237,7 +238,6 @@ impl InboundTraffic {
                 remaining_recv_window,
                 ..
             } => {
-                let data_len = u32::try_from(data.as_ref().len()).expect("ooga booga");
                 *remaining_recv_window = remaining_recv_window
                     .checked_sub(data_len)
                     .ok_or(StreamError("exceeded available receive window"))?;
@@ -294,11 +294,11 @@ impl RecvWindow {
         // The yardstick is the loaded RTT: a stream's window governs how
         // often credit has to be exchanged while data is flowing, and those
         // updates travel through the queues that are standing, not over the
-        // drained link the clean sample measures. Before the first probe
-        // completes there is no loaded sample, and the clean one stands in.
+        // drained link the clean sample measures. The opening exchange
+        // fills one in before any stream exists, so it is only missing on
+        // a connection that has never completed one.
         let optimal = global
             .dirty_rtt
-            .or(global.rtt)
             .map(|rtt| Self::get_optimal(self.freed, self.last_update.elapsed(), rtt))
             .unwrap_or(self.current);
         let clamped = optimal

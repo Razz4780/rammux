@@ -229,11 +229,17 @@ pub enum Header {
     Term,
 }
 
-/// Control flags extracted from [`RawFlags`].
+/// Stream lifecycle bits a frame can carry.
+///
+/// The two directions of a virtual stream close independently, so a frame
+/// can end one of them without ending the other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct ControlFlags {
+    /// The sender has stopped reading from this stream.
     pub fin_read: bool,
+    /// The sender has stopped writing to this stream.
     pub fin_write: bool,
+    /// The frame opens the stream.
     pub syn: bool,
 }
 

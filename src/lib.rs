@@ -13,6 +13,13 @@
 //! control, measures round trip times on demand, and performs graceful downgrade
 //! back to the underlying transport when rammux is finished.
 //!
+//! Underneath it sits [`Transport`](transport::Transport), the layer between
+//! raw bytes and stream multiplexing: a [`Sink`](futures::Sink) and
+//! [`Stream`](futures::Stream) of stream frames that handles the transit
+//! window, the plain ping and the link-clearing probe on its own. Use it
+//! directly if you want rammux's framing, pacing and RTT measurement
+//! without its stream layer.
+//!
 //! # Configuration and negotiation
 //!
 //! rammux does not define an in-band handshake for transport parameters. Before
@@ -53,6 +60,7 @@ mod header;
 mod probe;
 pub mod stream;
 mod stream_id;
+pub mod transport;
 
 pub use crate::{error::RammuxError, stream_id::StreamId};
 

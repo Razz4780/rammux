@@ -33,15 +33,18 @@ impl OutboundTraffic {
     /// Notes:
     /// 1. If `FIN_WRITE` has already been sent, this method will return `([], false)`.
     /// 2. This method is not responsible for registering [`Waker`] for updates.
-    /// 3. `transit_blocked` is set when this direction had payload ready
+    /// 3. `budget` is the most payload the transport will accept right
+    ///    now, or [`None`] when the transit window is disabled. The
+    ///    transport debits it when the frame is actually handed over.
+    /// 4. `transit_blocked` is set when this direction had payload ready
     ///    and stream-level window for it, and only the exhausted transit
     ///    window held it back.
     pub fn poll_update(
         &mut self,
-        transit_credit: Option<&mut u32>,
+        budget: Option<u32>,
         transit_blocked: &mut bool,
     ) -> Poll<(Bytes, bool)> {
-        let credit_cap = transit_credit.as_deref().copied().unwrap_or(u32::MAX);
+        let credit_cap = budget.unwrap_or(u32::MAX);
         match &mut self.0 {
             OutboundState::Open {
                 ready_data,
@@ -60,9 +63,6 @@ impl OutboundTraffic {
                     .min(frame_limit.get())
                     .min(credit_cap);
                 *recv_window -= chunk_len;
-                if let Some(credit) = transit_credit {
-                    *credit -= chunk_len;
-                }
                 let chunk = ready_data.split_to(crate::safe_cast_usize(chunk_len));
                 if ready_data.is_empty() {
                     writer.wake();
@@ -87,9 +87,6 @@ impl OutboundTraffic {
                     .min(frame_limit.get())
                     .min(credit_cap);
                 *recv_window -= chunk_len;
-                if let Some(credit) = transit_credit {
-                    *credit -= chunk_len;
-                }
                 let chunk = ready_data.split_to(crate::safe_cast_usize(chunk_len));
                 let fin = if ready_data.is_empty() {
                     writer.wake();
