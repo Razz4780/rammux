@@ -22,8 +22,7 @@ const RAMMUX: &str = r#"{ "protocol": "rammux",
     "transit_window": 262144, "transit_window_max": 4194304,
     "probe_interval": 20, "ping_interval": 5 }"#;
 const YAMUX: &str = r#"{ "protocol": "yamux", "global_recv_window": 1073741824 }"#;
-const H2: &str =
-    r#"{ "protocol": "h2", "global_recv_window": 1048576, "stream_recv_window": 262144 }"#;
+const H2: &str = r#"{ "protocol": "h2", "adaptive_window": true, "global_recv_window": 1048576, "stream_recv_window": 262144 }"#;
 
 /// The echo server, killed on drop.
 struct Server(Child);

@@ -190,40 +190,16 @@ impl YamuxMuxerConfig {
 /// HTTP/2 configuration. Both sides use the same values.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct H2MuxerConfig {
+    /// Enable adaptive flow control.
+    ///
+    /// Adaptive flow control overrides `stream_recv_window` and `gloval_recv_window`.
+    pub adaptive_window: bool,
     /// Fixed size of each stream's receive window.
+    ///
+    /// Ignored if `adaptive_window` is set.
     pub stream_recv_window: u32,
     /// Upper limit for the total size of all streams' receive windows.
-    pub global_recv_window: u32,
-}
-
-impl H2MuxerConfig {
-    /// Size limit for a single frame payload, in bytes.
-    const MAX_FRAME_SIZE: u32 = 16 * 1024;
-    /// Limit for the number of concurrent streams.
-    const MAX_CONCURRENT_STREAMS: u32 = 100;
-
-    /// The settings the client opens the connection with.
     ///
-    /// Mirrored by [`Self::to_server_builder`]: `h2` has one builder per role
-    /// but the same knobs on both, and the two have to agree.
-    pub fn to_client_builder(&self) -> h2::client::Builder {
-        let mut builder = h2::client::Builder::new();
-        builder
-            .initial_window_size(self.stream_recv_window)
-            .initial_connection_window_size(self.global_recv_window)
-            .max_frame_size(Self::MAX_FRAME_SIZE)
-            .max_concurrent_streams(Self::MAX_CONCURRENT_STREAMS);
-        builder
-    }
-
-    /// The same settings, for the server's side of the connection.
-    pub fn to_server_builder(&self) -> h2::server::Builder {
-        let mut builder = h2::server::Builder::new();
-        builder
-            .initial_window_size(self.stream_recv_window)
-            .initial_connection_window_size(self.global_recv_window)
-            .max_frame_size(Self::MAX_FRAME_SIZE)
-            .max_concurrent_streams(Self::MAX_CONCURRENT_STREAMS);
-        builder
-    }
+    /// Ignored if `adaptive_window` is set.
+    pub global_recv_window: u32,
 }

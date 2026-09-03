@@ -19,9 +19,9 @@ base64 = "0.23"
 bytes.workspace = true
 clap.workspace = true
 futures.workspace = true
-h2.workspace = true
+http-body.workspace = true
 http-body-util.workspace = true
-hyper = { workspace = true, features = ["http1", "client", "server"] }
+hyper = { workspace = true, features = ["http1", "http2", "client", "server"] }
 hyper-util.workspace = true
 rand.workspace = true
 rcgen.workspace = true

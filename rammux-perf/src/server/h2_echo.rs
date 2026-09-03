@@ -1,4 +1,6 @@
 use std::{
+    future::Ready,
+    io,
     ops::ControlFlow,
     pin::Pin,
     task::{Context, Poll},
@@ -10,14 +12,20 @@ use async_selector::{
     task::Task,
 };
 use bytes::Bytes;
-use futures::{FutureExt, StreamExt};
-use hyper::{Response, upgrade::Upgraded};
-use hyper_util::rt::TokioIo;
+use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, channel::mpsc};
+use hyper::{
+    Request, Response,
+    body::{Body, Incoming},
+    server::conn::http2::Connection,
+    service::Service,
+    upgrade::Upgraded,
+};
+use hyper_util::rt::TokioExecutor;
 
 use crate::{
     config::H2MuxerConfig,
     server::{EchoImpl, pipe::PipeBytes},
-    stream_util::H2Duplex,
+    stream_util::ChannelBody,
 };
 
 pub struct H2Echo;
@@ -30,13 +38,24 @@ impl EchoImpl for H2Echo {
     }
 
     async fn run_on(conn: Upgraded, config: Self::Config) -> anyhow::Result<()> {
-        let connection = config
-            .to_server_builder()
-            .handshake::<_, Bytes>(TokioIo::new(conn))
-            .await
-            .context("HTTP/2 handshake failed")?;
-        let mut selector: Selector<H2Task, ()> = Selector::default();
-        selector.push(H2Task::Connection(Box::new(connection)));
+        let (req_tx, req_rx) = mpsc::unbounded();
+        let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::default())
+            .auto_date_header(false)
+            .keep_alive_interval(None)
+            .max_frame_size(16 * 1024)
+            .max_concurrent_streams(100)
+            .initial_connection_window_size(config.global_recv_window)
+            .initial_stream_window_size(config.stream_recv_window)
+            .adaptive_window(config.adaptive_window)
+            .serve_connection(
+                conn,
+                MultiplexerService {
+                    requests_tx: req_tx,
+                },
+            );
+        let mut selector: Selector<H2Task, ()> = Default::default();
+        selector.push(H2Task::Connection(Box::new(conn)));
+        selector.push(H2Task::NewStreams(req_rx));
         loop {
             match selector.next().await.unwrap() {
                 ControlFlow::Continue(stream) => {
@@ -50,18 +69,100 @@ impl EchoImpl for H2Echo {
     }
 }
 
-type H2Connection = h2::server::Connection<TokioIo<Upgraded>, Bytes>;
+/// HTTP/2 [`Service`] that sends requests' and responses' bodies through an internal channel,
+/// feeding them back to the main echo loop.
+struct MultiplexerService {
+    requests_tx: mpsc::UnboundedSender<EmulatedStream>,
+}
+
+impl Service<Request<Incoming>> for MultiplexerService {
+    type Response = Response<ChannelBody>;
+    type Error = hyper::Error;
+    type Future = Ready<Result<Self::Response, Self::Error>>;
+
+    fn call(&self, req: Request<Incoming>) -> Self::Future {
+        let incoming = req.into_body();
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(1);
+        let stream = EmulatedStream {
+            incoming,
+            outgoing: outgoing_tx,
+        };
+        let _ = self.requests_tx.unbounded_send(stream);
+        let response = Response::new(ChannelBody(outgoing_rx));
+        std::future::ready(Ok(response))
+    }
+}
+
+/// Logical stream in a multiplexed echo.
+///
+/// Emulated using [`Response`] and [`Request`] bodies.
+struct EmulatedStream {
+    incoming: Incoming,
+    outgoing: mpsc::Sender<Bytes>,
+}
+
+impl Sink<Bytes> for EmulatedStream {
+    type Error = io::Error;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.get_mut()
+            .outgoing
+            .poll_ready_unpin(cx)
+            .map_err(io::Error::other)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
+        self.get_mut()
+            .outgoing
+            .start_send_unpin(item)
+            .map_err(io::Error::other)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.get_mut()
+            .outgoing
+            .poll_flush_unpin(cx)
+            .map_err(io::Error::other)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.get_mut()
+            .outgoing
+            .poll_close_unpin(cx)
+            .map_err(io::Error::other)
+    }
+}
+
+impl Stream for EmulatedStream {
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            let result = std::task::ready!(Pin::new(&mut this.incoming).poll_frame(cx));
+            match result {
+                None => break Poll::Ready(None),
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        break Poll::Ready(Some(Ok(data)));
+                    }
+                },
+                Some(Err(error)) => break Poll::Ready(Some(Err(io::Error::other(error)))),
+            }
+        }
+    }
+}
 
 enum H2Task {
-    /// Boxed: a connection dwarfs a pipe, and there is exactly one of it.
-    Connection(Box<H2Connection>),
-    Stream(PipeBytes<H2Duplex>),
+    Connection(Box<Connection<Upgraded, MultiplexerService, TokioExecutor>>),
+    NewStreams(mpsc::UnboundedReceiver<EmulatedStream>),
+    Stream(PipeBytes<EmulatedStream>),
 }
 
 impl Task for H2Task {
-    type Cont = H2Duplex;
+    type Cont = EmulatedStream;
     type Break = anyhow::Result<()>;
-    type Output = ControlFlow<anyhow::Result<()>, Self::Cont>;
+    type Output = ControlFlow<anyhow::Result<()>, EmulatedStream>;
 
     fn poll_progress(
         self: Pin<&mut Self>,
@@ -69,26 +170,17 @@ impl Task for H2Task {
         cx: &mut Context<'_>,
     ) -> Poll<ControlFlow<Self::Break, Self::Cont>> {
         match self.get_mut() {
-            // Accepting drives the whole connection, the open streams'
-            // frames included, so this is the only place it is polled.
-            Self::Connection(connection) => match std::task::ready!(connection.poll_accept(cx)) {
-                None => Poll::Ready(ControlFlow::Break(Ok(()))),
-                Some(Err(error)) => Poll::Ready(ControlFlow::Break(Err(anyhow::Error::new(error)))),
-                Some(Ok((request, mut respond))) => {
-                    // Headers go out now; the body follows as the echo
-                    // produces it, so this is not the end of the stream.
-                    match respond.send_response(Response::new(()), false) {
-                        Ok(send) => Poll::Ready(ControlFlow::Continue(H2Duplex::accepted(
-                            request.into_body(),
-                            send,
-                        ))),
-                        Err(error) => {
-                            Poll::Ready(ControlFlow::Break(Err(anyhow::Error::new(error))))
-                        },
-                    }
-                },
+            Self::Connection(connection) => connection
+                .poll_unpin(cx)
+                .map_err(anyhow::Error::new)
+                .map(ControlFlow::Break),
+            Self::NewStreams(unbounded_receiver) => {
+                match std::task::ready!(unbounded_receiver.poll_next_unpin(cx)) {
+                    Some(stream) => Poll::Ready(ControlFlow::Continue(stream)),
+                    None => Poll::Ready(ControlFlow::Break(Ok(()))),
+                }
             },
-            Self::Stream(pipe) => pipe
+            Self::Stream(pipe_bytes) => pipe_bytes
                 .poll_unpin(cx)
                 .map_err(anyhow::Error::new)
                 .map(ControlFlow::Break),
@@ -110,7 +202,8 @@ impl Task for H2Task {
     ) -> Option<Self::Output> {
         match task.into_inner() {
             Self::Connection(..) => Some(ControlFlow::Break(value)),
-            // We wait for the result from the connection.
+            // we wait for the result from the connection
+            Self::NewStreams(..) => None,
             Self::Stream(..) => None,
         }
     }
