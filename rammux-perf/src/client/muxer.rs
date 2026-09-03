@@ -6,7 +6,6 @@ use std::{
     pin::Pin,
     rc::Rc,
     task::{Context, Poll},
-    time::Duration,
 };
 
 use anyhow::Context as _;
@@ -20,7 +19,7 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use rammux::{
-    config::{RammuxConfig, RammuxRole},
+    config::RammuxRole,
     connection::{Downgraded, RammuxConnection, RammuxProgress},
 };
 use tokio_util::{
@@ -82,26 +81,13 @@ enum RammuxState {
 
 impl RammuxMuxer {
     pub fn new(upgraded: Upgraded, config: &RammuxMuxerConfig) -> Self {
-        let mut rammux = RammuxConfig::new();
-        rammux.frame_limit = config.frame_limit;
-        rammux.local_recv_window = config.stream_recv_window;
-        rammux.remote_recv_window = config.stream_recv_window.get();
-        rammux.global_recv_window = config.global_recv_window;
-        rammux.local_transit_window = config.transit_window;
-        rammux.remote_transit_window = config.transit_window;
-        rammux.transit_window_max = config.transit_window_max;
-        rammux.max_inbound_streams = config.max_streams;
-        rammux.max_outbound_streams = config.max_streams;
         Self {
             state: RammuxState::Active(Box::new(RammuxConnection::new(
                 RammuxRole::Client,
                 TokioIo::new(upgraded),
-                rammux,
+                config.to_rammux_config(),
             ))),
-            schedule: RttSchedule::new(
-                Duration::from_secs(config.probe_interval.get()),
-                Duration::from_secs(config.ping_interval.get()),
-            ),
+            schedule: RttSchedule::new(config.probe_interval(), config.ping_interval()),
         }
     }
 }
@@ -188,19 +174,14 @@ pub struct YamuxMuxer {
 }
 
 impl YamuxMuxer {
-    pub fn new(upgraded: Upgraded, config: &YamuxMuxerConfig) -> Self {
-        let mut yamux = yamux::Config::default();
-        yamux.set_read_after_close(true);
-        yamux.set_split_send_size(config.split_send_size);
-        yamux.set_max_num_streams(config.max_num_streams);
-        yamux.set_max_connection_receive_window(Some(config.max_connection_receive_window));
-        Self {
+    pub fn new(upgraded: Upgraded, config: &YamuxMuxerConfig) -> anyhow::Result<Self> {
+        Ok(Self {
             connection: yamux::Connection::new(
                 TokioIo::new(upgraded).compat(),
-                yamux,
+                config.to_yamux_config()?,
                 yamux::Mode::Client,
             ),
-        }
+        })
     }
 }
 

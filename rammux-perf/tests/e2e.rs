@@ -21,10 +21,11 @@ const RAMMUX: &str = r#"{ "protocol": "rammux", "frame_limit": 16384,
     "stream_recv_window": 262144, "global_recv_window": 4194304,
     "transit_window": 262144, "transit_window_max": 4194304,
     "probe_interval": 20, "ping_interval": 5, "max_streams": 128 }"#;
-const YAMUX: &str =
-    r#"{ "protocol": "yamux", "frame_limit": 16384, "max_conn_receive_window": 4194304 }"#;
-const H2: &str = r#"{ "protocol": "h2", "adaptive_window": true, "frame_limit": 16384,
-    "max_send_buf_size": 262144, "initial_stream_window": 262144, "initial_connection_window": 1048576 }"#;
+const YAMUX: &str = r#"{ "protocol": "yamux", "split_send_size": 16384,
+    "max_connection_receive_window": 4194304, "max_num_streams": 8 }"#;
+const H2: &str = r#"{ "protocol": "h2", "adaptive_window": true, "max_frame_size": 16384,
+    "max_concurrent_streams": 8, "max_send_buf_size": 262144,
+    "initial_connection_window_size": 1048576, "initial_stream_window_size": 262144 }"#;
 
 /// The echo server, killed on drop.
 struct Server(Child);

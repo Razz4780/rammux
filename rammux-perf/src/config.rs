@@ -2,9 +2,11 @@ use std::{
     net::SocketAddr,
     num::{NonZeroU32, NonZeroU64, NonZeroUsize},
     path::PathBuf,
+    time::Duration,
 };
 
 use hyper::header::HeaderName;
+use rammux::config::RammuxConfig;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -144,6 +146,37 @@ pub struct RammuxMuxerConfig {
     pub max_streams: u32,
 }
 
+impl RammuxMuxerConfig {
+    /// The [`RammuxConfig`] both sides run with.
+    ///
+    /// One place for this, because it is easy to get one of the mirrored
+    /// windows wrong in one of two copies and impossible to notice until the
+    /// peer rejects a frame.
+    pub fn to_rammux_config(&self) -> RammuxConfig {
+        let mut config = RammuxConfig::new();
+        config.frame_limit = self.frame_limit;
+        config.local_recv_window = self.stream_recv_window;
+        config.remote_recv_window = self.stream_recv_window.get();
+        config.global_recv_window = self.global_recv_window;
+        config.local_transit_window = self.transit_window;
+        config.remote_transit_window = self.transit_window;
+        config.transit_window_max = self.transit_window_max;
+        config.max_inbound_streams = self.max_streams;
+        config.max_outbound_streams = self.max_streams;
+        config
+    }
+
+    /// The probe schedule both sides run with.
+    pub fn probe_interval(&self) -> Duration {
+        Duration::from_secs(self.probe_interval.get())
+    }
+
+    /// The plain ping schedule both sides run with.
+    pub fn ping_interval(&self) -> Duration {
+        Duration::from_secs(self.ping_interval.get())
+    }
+}
+
 /// yamux configuration. Both sides use the same values.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct YamuxMuxerConfig {
@@ -155,6 +188,31 @@ pub struct YamuxMuxerConfig {
     pub max_connection_receive_window: usize,
     /// Limit for the number of concurrent streams.
     pub max_num_streams: usize,
+}
+
+impl YamuxMuxerConfig {
+    /// The [`yamux::Config`] both sides run with.
+    ///
+    /// yamux asserts its window constraint inside each setter, against
+    /// whatever the other setting is at that moment - so the check happens
+    /// here first, as an error rather than a panic in a connection task, and
+    /// the setters run in an order that cannot trip it for a valid config.
+    pub fn to_yamux_config(&self) -> anyhow::Result<yamux::Config> {
+        const DEFAULT_STREAM_WINDOW: usize = 256 * 1024;
+        anyhow::ensure!(
+            self.max_connection_receive_window >= self.max_num_streams * DEFAULT_STREAM_WINDOW,
+            "max_connection_receive_window ({}) must be at least 256 KiB * max_num_streams ({})",
+            self.max_connection_receive_window,
+            self.max_num_streams,
+        );
+        let mut config = yamux::Config::default();
+        config
+            .set_max_num_streams(self.max_num_streams)
+            .set_max_connection_receive_window(Some(self.max_connection_receive_window))
+            .set_split_send_size(self.split_send_size)
+            .set_read_after_close(true);
+        Ok(config)
+    }
 }
 
 /// HTTP/2 configuration. Both sides use the same values.

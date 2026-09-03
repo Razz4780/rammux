@@ -13,7 +13,7 @@ use futures::{FutureExt, StreamExt};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
-use yamux::{Config, Connection, Mode, Stream};
+use yamux::{Connection, Mode, Stream};
 
 use crate::{
     config::YamuxMuxerConfig,
@@ -30,13 +30,11 @@ impl EchoImpl for YamuxEcho {
     }
 
     async fn run_on(conn: Upgraded, config: Self::Config) -> anyhow::Result<()> {
-        let mut yamux_config = Config::default();
-        yamux_config
-            .set_max_connection_receive_window(Some(config.max_connection_receive_window))
-            .set_max_num_streams(config.max_num_streams)
-            .set_split_send_size(config.split_send_size)
-            .set_read_after_close(true);
-        let connection = Connection::new(TokioIo::new(conn).compat(), yamux_config, Mode::Server);
+        let connection = Connection::new(
+            TokioIo::new(conn).compat(),
+            config.to_yamux_config()?,
+            Mode::Server,
+        );
         let mut selector: Selector<YamuxTask, ()> = Selector::default();
         selector.push(YamuxTask::Connection(connection));
         loop {

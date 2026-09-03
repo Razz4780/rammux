@@ -2,7 +2,6 @@ use std::{
     ops::ControlFlow,
     pin::Pin,
     task::{Context, Poll},
-    time::Duration,
 };
 
 use anyhow::Context as _;
@@ -14,7 +13,7 @@ use futures::{FutureExt, StreamExt};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use rammux::{
-    config::{RammuxConfig, RammuxRole},
+    config::RammuxRole,
     connection::{Downgraded, RammuxConnection, RammuxProgress},
     stream::RammuxDuplex,
 };
@@ -39,23 +38,15 @@ impl EchoImpl for RammuxEcho {
     }
 
     async fn run_on(conn: Upgraded, config: Self::Config) -> anyhow::Result<()> {
-        let mut rammux_config = RammuxConfig::new();
-        rammux_config.frame_limit = config.frame_limit;
-        rammux_config.global_recv_window = config.global_recv_window;
-        rammux_config.local_recv_window = config.stream_recv_window;
-        rammux_config.remote_recv_window = config.stream_recv_window.get();
-        rammux_config.local_transit_window = config.transit_window;
-        rammux_config.remote_recv_window = config.transit_window;
-        rammux_config.transit_window_max = config.transit_window_max;
-        rammux_config.max_inbound_streams = config.max_streams;
-        rammux_config.max_outbound_streams = config.max_streams;
-        let probe_interval = Duration::from_secs(config.probe_interval.get());
-        let ping_interval = Duration::from_secs(config.ping_interval.get());
-
-        let connection =
-            RammuxConnection::new(RammuxRole::Server, TokioIo::new(conn), rammux_config);
-        let mut selector: Selector<RammuxTask, RttSchedule> =
-            Selector::new(RttSchedule::new(probe_interval, ping_interval));
+        let connection = RammuxConnection::new(
+            RammuxRole::Server,
+            TokioIo::new(conn),
+            config.to_rammux_config(),
+        );
+        let mut selector: Selector<RammuxTask, RttSchedule> = Selector::new(RttSchedule::new(
+            config.probe_interval(),
+            config.ping_interval(),
+        ));
         selector.push(RammuxTask::Connection(connection));
         let downgraded = loop {
             match selector.next().await.unwrap() {
