@@ -1,6 +1,7 @@
 use std::{future::Ready, net::SocketAddr, path::Path};
 
 use anyhow::Context;
+use base64::Engine;
 use futures::TryFutureExt;
 use hyper::{
     HeaderMap, Method, Request, Response, StatusCode,
@@ -9,19 +10,19 @@ use hyper::{
     upgrade::{OnUpgrade, Upgraded},
 };
 use hyper_util::rt::TokioIo;
+use serde::de::DeserializeOwned;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tracing::{Instrument, Level};
 
 use crate::{
-    config::ServerConfig,
+    config::{MuxerConfig, ServerConfig},
     server::{h2_echo::H2Echo, rammux_echo::RammuxEcho, yamux_echo::YamuxEcho},
     signal::ExitSignal,
     tls,
 };
 
 mod h2_echo;
-mod http_util;
 mod pipe;
 mod rammux_echo;
 mod yamux_echo;
@@ -133,16 +134,29 @@ impl HttpUpgradeService {
         upgrade: OnUpgrade,
         headers: &HeaderMap,
     ) -> anyhow::Result<()> {
-        let echo = std::panic::catch_unwind(|| E::build_from(headers))
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "failed to build {} config from headers - panic",
-                    E::protocol_name()
-                )
-            })?
-            .with_context(|| {
-                format!("failed to build {} config from headers", E::protocol_name())
-            })?;
+        let config = std::panic::catch_unwind(|| {
+            let config = headers
+                .get(MuxerConfig::HEADER_NAME)
+                .context("header not found")?
+                .as_bytes();
+            let config = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(config)
+                .context("header is not valid base64")?;
+            serde_json::from_slice(&config).context("failed to deserialize muxer config")
+        })
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "failed to build {} config from headers - panic",
+                E::protocol_name()
+            )
+        })?
+        .with_context(|| {
+            format!(
+                "failed to deserialize {} config from {} header",
+                E::protocol_name(),
+                MuxerConfig::HEADER_NAME
+            )
+        })?;
 
         tokio::spawn(
             async move {
@@ -156,7 +170,7 @@ impl HttpUpgradeService {
                         return;
                     },
                 };
-                match echo.run_on(upgraded).await {
+                match E::run_on(upgraded, config).await {
                     Ok(()) => tracing::info!(
                         upgrade_protocol = E::protocol_name(),
                         "Upgraded HTTP/1.1 connection finished",
@@ -232,9 +246,12 @@ impl Service<Request<Incoming>> for HttpUpgradeService {
 
 /// Echo implementation with some multiplexing protocol.
 trait EchoImpl: Sized {
+    type Config: DeserializeOwned + Send + 'static;
+
     fn protocol_name() -> &'static str;
 
-    fn build_from(headers: &HeaderMap) -> anyhow::Result<Self>;
-
-    fn run_on(self, conn: Upgraded) -> impl Future<Output = anyhow::Result<()>> + Send;
+    fn run_on(
+        conn: Upgraded,
+        config: Self::Config,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
 }

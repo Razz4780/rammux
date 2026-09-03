@@ -11,7 +11,7 @@ use async_selector::{
     task::Task,
 };
 use futures::{FutureExt, StreamExt};
-use hyper::{HeaderMap, upgrade::Upgraded};
+use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use rammux::{
     config::{RammuxConfig, RammuxRole},
@@ -20,60 +20,42 @@ use rammux::{
 };
 
 use crate::{
+    config::RammuxMuxerConfig,
     rammux_rtt::RttSchedule,
-    server::{EchoImpl, http_util, pipe::PipeBytes},
+    server::{EchoImpl, pipe::PipeBytes},
     stream_util::RammuxIo,
 };
 
 /// Transport under the rammux connection.
 type Transport = TokioIo<Upgraded>;
 
-pub struct RammuxEcho {
-    config: RammuxConfig,
-    probe_interval: Duration,
-    ping_interval: Duration,
-}
+pub struct RammuxEcho;
 
 impl EchoImpl for RammuxEcho {
+    type Config = RammuxMuxerConfig;
+
     fn protocol_name() -> &'static str {
         "rammux"
     }
 
-    fn build_from(headers: &HeaderMap) -> anyhow::Result<Self> {
-        let mut config = RammuxConfig::new();
-        config.frame_limit = http_util::prop_from_header(headers, "frame-limit")?;
-        config.local_recv_window = http_util::prop_from_header(headers, "local-recv-window")?;
-        config.remote_recv_window = http_util::prop_from_header(headers, "remote-recv-window")?;
-        config.global_recv_window = http_util::prop_from_header(headers, "global-recv-window")?;
-        config.local_transit_window = http_util::prop_from_header(headers, "local-transit-window")?;
-        config.remote_transit_window =
-            http_util::prop_from_header(headers, "remote-transit-window")?;
-        config.transit_window_max = http_util::prop_from_header(headers, "transit-window-max")?;
-        config.max_inbound_streams = http_util::prop_from_header(headers, "max-streams")?;
-        config.max_outbound_streams = 0;
-        let probe_interval =
-            http_util::prop_from_header(headers, "probe-interval").map(Duration::from_secs)?;
-        let ping_interval =
-            http_util::prop_from_header(headers, "ping-interval").map(Duration::from_secs)?;
-        anyhow::ensure!(
-            probe_interval > Duration::ZERO,
-            "probe-interval must not be 0"
-        );
-        anyhow::ensure!(
-            ping_interval > Duration::ZERO,
-            "ping-interval must not be 0"
-        );
-        Ok(Self {
-            config,
-            probe_interval,
-            ping_interval,
-        })
-    }
+    async fn run_on(conn: Upgraded, config: Self::Config) -> anyhow::Result<()> {
+        let mut rammux_config = RammuxConfig::new();
+        rammux_config.frame_limit = config.frame_limit;
+        rammux_config.global_recv_window = config.global_recv_window;
+        rammux_config.local_recv_window = config.stream_recv_window;
+        rammux_config.remote_recv_window = config.stream_recv_window.get();
+        rammux_config.local_transit_window = config.transit_window;
+        rammux_config.remote_recv_window = config.transit_window;
+        rammux_config.transit_window_max = config.transit_window_max;
+        rammux_config.max_inbound_streams = config.max_streams;
+        rammux_config.max_outbound_streams = config.max_streams;
+        let probe_interval = Duration::from_secs(config.probe_interval.get());
+        let ping_interval = Duration::from_secs(config.ping_interval.get());
 
-    async fn run_on(self, conn: Upgraded) -> anyhow::Result<()> {
-        let connection = RammuxConnection::new(RammuxRole::Server, TokioIo::new(conn), self.config);
+        let connection =
+            RammuxConnection::new(RammuxRole::Server, TokioIo::new(conn), rammux_config);
         let mut selector: Selector<RammuxTask, RttSchedule> =
-            Selector::new(RttSchedule::new(self.probe_interval, self.ping_interval));
+            Selector::new(RttSchedule::new(probe_interval, ping_interval));
         selector.push(RammuxTask::Connection(connection));
         let downgraded = loop {
             match selector.next().await.unwrap() {
@@ -90,6 +72,7 @@ impl EchoImpl for RammuxEcho {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum RammuxTask {
     Connection(RammuxConnection<Transport>),
     Stream(PipeBytes<RammuxIo>),

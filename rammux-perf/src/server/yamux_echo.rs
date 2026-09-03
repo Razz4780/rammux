@@ -10,36 +10,33 @@ use async_selector::{
     task::Task,
 };
 use futures::{FutureExt, StreamExt};
-use hyper::{HeaderMap, upgrade::Upgraded};
+use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 use yamux::{Config, Connection, Mode, Stream};
 
-use crate::server::{EchoImpl, http_util, pipe::PipeFuturesIo};
+use crate::{
+    config::YamuxMuxerConfig,
+    server::{EchoImpl, pipe::PipeFuturesIo},
+};
 
-pub struct YamuxEcho {
-    config: Config,
-}
+pub struct YamuxEcho;
 
 impl EchoImpl for YamuxEcho {
+    type Config = YamuxMuxerConfig;
+
     fn protocol_name() -> &'static str {
         "yamux"
     }
 
-    fn build_from(headers: &HeaderMap) -> anyhow::Result<Self> {
-        let mut config = Config::default();
-        config.set_read_after_close(true);
-        config.set_split_send_size(http_util::prop_from_header(headers, "frame-limit")?);
-        config.set_max_num_streams(http_util::prop_from_header(headers, "max-streams")?);
-        config.set_max_connection_receive_window(Some(http_util::prop_from_header(
-            headers,
-            "max-conn-receive-window",
-        )?));
-        Ok(Self { config })
-    }
-
-    async fn run_on(self, conn: Upgraded) -> anyhow::Result<()> {
-        let connection = Connection::new(TokioIo::new(conn).compat(), self.config, Mode::Server);
+    async fn run_on(conn: Upgraded, config: Self::Config) -> anyhow::Result<()> {
+        let mut yamux_config = Config::default();
+        yamux_config
+            .set_max_connection_receive_window(Some(config.max_connection_receive_window))
+            .set_max_num_streams(config.max_num_streams)
+            .set_split_send_size(config.split_send_size)
+            .set_read_after_close(true);
+        let connection = Connection::new(TokioIo::new(conn).compat(), yamux_config, Mode::Server);
         let mut selector: Selector<YamuxTask, ()> = Selector::default();
         selector.push(YamuxTask::Connection(connection));
         loop {
@@ -55,6 +52,7 @@ impl EchoImpl for YamuxEcho {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum YamuxTask {
     Connection(Connection<Compat<TokioIo<Upgraded>>>),
     Stream(PipeFuturesIo<Stream>),

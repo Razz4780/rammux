@@ -13,10 +13,9 @@ use anyhow::Context as _;
 use bytes::{Bytes, BytesMut};
 use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, channel::mpsc};
 use hyper::{
-    HeaderMap, Method, Request, Response, StatusCode,
+    Method, Request, Response, StatusCode,
     body::{Body, Incoming},
     client::conn::http2::{Connection, SendRequest},
-    header::HeaderValue,
     upgrade::Upgraded,
 };
 use hyper_util::rt::TokioIo;
@@ -61,15 +60,6 @@ pub trait Muxer: Unpin {
     fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<anyhow::Result<()>>;
 }
 
-/// Sends `value` as the header `name`.
-fn header(headers: &mut HeaderMap, name: &'static str, value: impl ToString) {
-    headers.insert(
-        name,
-        HeaderValue::try_from(value.to_string())
-            .expect("numbers and booleans are valid header values"),
-    );
-}
-
 // ---------------------------------------------------------------------------
 // rammux
 // ---------------------------------------------------------------------------
@@ -91,50 +81,17 @@ enum RammuxState {
 }
 
 impl RammuxMuxer {
-    /// Headers the server builds its side from: negotiated windows mirrored,
-    /// the rest as they are.
-    pub fn headers(config: &RammuxMuxerConfig, streams: usize) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        header(&mut headers, "frame-limit", config.frame_limit);
-        header(&mut headers, "local-recv-window", config.remote_recv_window);
-        header(&mut headers, "remote-recv-window", config.local_recv_window);
-        header(
-            &mut headers,
-            "global-recv-window",
-            config.global_recv_window,
-        );
-        header(
-            &mut headers,
-            "local-transit-window",
-            config.remote_transit_window,
-        );
-        header(
-            &mut headers,
-            "remote-transit-window",
-            config.local_transit_window,
-        );
-        header(
-            &mut headers,
-            "transit-window-max",
-            config.transit_window_max,
-        );
-        header(&mut headers, "max-streams", streams);
-        header(&mut headers, "probe-interval", config.probe_interval);
-        header(&mut headers, "ping-interval", config.ping_interval);
-        headers
-    }
-
-    pub fn new(upgraded: Upgraded, config: &RammuxMuxerConfig, streams: usize) -> Self {
+    pub fn new(upgraded: Upgraded, config: &RammuxMuxerConfig) -> Self {
         let mut rammux = RammuxConfig::new();
         rammux.frame_limit = config.frame_limit;
-        rammux.local_recv_window = config.local_recv_window;
-        rammux.remote_recv_window = config.remote_recv_window.get();
+        rammux.local_recv_window = config.stream_recv_window;
+        rammux.remote_recv_window = config.stream_recv_window.get();
         rammux.global_recv_window = config.global_recv_window;
-        rammux.local_transit_window = config.local_transit_window;
-        rammux.remote_transit_window = config.remote_transit_window;
+        rammux.local_transit_window = config.transit_window;
+        rammux.remote_transit_window = config.transit_window;
         rammux.transit_window_max = config.transit_window_max;
-        rammux.max_inbound_streams = 0;
-        rammux.max_outbound_streams = u32::try_from(streams).expect("stream count fits u32");
+        rammux.max_inbound_streams = config.max_streams;
+        rammux.max_outbound_streams = config.max_streams;
         Self {
             state: RammuxState::Active(Box::new(RammuxConnection::new(
                 RammuxRole::Client,
@@ -231,24 +188,12 @@ pub struct YamuxMuxer {
 }
 
 impl YamuxMuxer {
-    pub fn headers(config: &YamuxMuxerConfig, streams: usize) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        header(&mut headers, "frame-limit", config.frame_limit);
-        header(&mut headers, "max-streams", streams);
-        header(
-            &mut headers,
-            "max-conn-receive-window",
-            config.max_conn_receive_window,
-        );
-        headers
-    }
-
-    pub fn new(upgraded: Upgraded, config: &YamuxMuxerConfig, streams: usize) -> Self {
+    pub fn new(upgraded: Upgraded, config: &YamuxMuxerConfig) -> Self {
         let mut yamux = yamux::Config::default();
         yamux.set_read_after_close(true);
-        yamux.set_split_send_size(config.frame_limit);
-        yamux.set_max_num_streams(streams);
-        yamux.set_max_connection_receive_window(Some(config.max_conn_receive_window));
+        yamux.set_split_send_size(config.split_send_size);
+        yamux.set_max_num_streams(config.max_num_streams);
+        yamux.set_max_connection_receive_window(Some(config.max_connection_receive_window));
         Self {
             connection: yamux::Connection::new(
                 TokioIo::new(upgraded).compat(),
@@ -392,34 +337,16 @@ where
 }
 
 impl H2Muxer {
-    pub fn headers(config: &H2MuxerConfig, streams: usize) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        header(&mut headers, "adaptive-window", config.adaptive_window);
-        header(&mut headers, "frame-limit", config.frame_limit);
-        header(&mut headers, "max-streams", streams);
-        header(&mut headers, "max-send-buf-size", config.max_send_buf_size);
-        header(
-            &mut headers,
-            "initial-stream-window",
-            config.initial_stream_window,
-        );
-        header(
-            &mut headers,
-            "initial-connection-window",
-            config.initial_connection_window,
-        );
-        headers
-    }
-
     pub async fn new(upgraded: Upgraded, config: &H2MuxerConfig) -> anyhow::Result<Self> {
         let executor = InlineExecutor::default();
         let (sender, dispatcher) = hyper::client::conn::http2::Builder::new(executor.clone())
             .keep_alive_interval(None)
-            .adaptive_window(config.adaptive_window)
-            .max_frame_size(config.frame_limit)
+            .max_frame_size(config.max_frame_size)
+            .max_concurrent_streams(config.max_concurrent_streams)
             .max_send_buf_size(config.max_send_buf_size)
-            .initial_stream_window_size(config.initial_stream_window)
-            .initial_connection_window_size(config.initial_connection_window)
+            .initial_connection_window_size(config.initial_connection_window_size)
+            .initial_stream_window_size(config.initial_stream_window_size)
+            .adaptive_window(config.adaptive_window)
             .handshake(upgraded)
             .await
             .context("HTTP/2 handshake failed")?;

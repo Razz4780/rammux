@@ -14,7 +14,7 @@ use async_selector::{
 use bytes::Bytes;
 use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, channel::mpsc};
 use hyper::{
-    HeaderMap, Request, Response,
+    Request, Response,
     body::{Body, Incoming},
     server::conn::http2::Connection,
     service::Service,
@@ -23,49 +23,31 @@ use hyper::{
 use hyper_util::rt::TokioExecutor;
 
 use crate::{
-    server::{EchoImpl, http_util, pipe::PipeBytes},
+    config::H2MuxerConfig,
+    server::{EchoImpl, pipe::PipeBytes},
     stream_util::ChannelBody,
 };
 
-pub struct H2Echo {
-    adaptive_window: bool,
-    max_frame_size: u32,
-    max_concurrent_streams: u32,
-    max_send_buf_size: usize,
-    initial_stream_window: u32,
-    initial_connection_window: u32,
-}
+pub struct H2Echo;
 
 impl EchoImpl for H2Echo {
+    type Config = H2MuxerConfig;
+
     fn protocol_name() -> &'static str {
         "h2"
     }
 
-    fn build_from(headers: &HeaderMap) -> anyhow::Result<Self> {
-        Ok(Self {
-            adaptive_window: http_util::prop_from_header(headers, "adaptive-window")?,
-            max_frame_size: http_util::prop_from_header(headers, "frame-limit")?,
-            max_concurrent_streams: http_util::prop_from_header(headers, "max-streams")?,
-            max_send_buf_size: http_util::prop_from_header(headers, "max-send-buf-size")?,
-            initial_stream_window: http_util::prop_from_header(headers, "initial-stream-window")?,
-            initial_connection_window: http_util::prop_from_header(
-                headers,
-                "initial-connection-window",
-            )?,
-        })
-    }
-
-    async fn run_on(self, conn: Upgraded) -> anyhow::Result<()> {
+    async fn run_on(conn: Upgraded, config: Self::Config) -> anyhow::Result<()> {
         let (req_tx, req_rx) = mpsc::unbounded();
         let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::default())
             .auto_date_header(false)
             .keep_alive_interval(None)
-            .adaptive_window(self.adaptive_window)
-            .max_concurrent_streams(self.max_concurrent_streams)
-            .max_frame_size(self.max_frame_size)
-            .max_send_buf_size(self.max_send_buf_size)
-            .initial_connection_window_size(self.initial_connection_window)
-            .initial_stream_window_size(self.initial_stream_window)
+            .max_frame_size(config.max_frame_size)
+            .max_concurrent_streams(config.max_concurrent_streams)
+            .max_send_buf_size(config.max_send_buf_size)
+            .initial_connection_window_size(config.initial_connection_window_size)
+            .initial_stream_window_size(config.initial_stream_window_size)
+            .adaptive_window(config.adaptive_window)
             .serve_connection(
                 conn,
                 MultiplexerService {
@@ -172,6 +154,7 @@ impl Stream for EmulatedStream {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum H2Task {
     Connection(Connection<Upgraded, MultiplexerService, TokioExecutor>),
     NewStreams(mpsc::UnboundedReceiver<EmulatedStream>),

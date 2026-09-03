@@ -15,6 +15,7 @@ rammux.workspace = true
 anyhow = "1"
 async-selector.workspace = true
 async_smux.workspace = true
+base64 = "0.23"
 bytes.workspace = true
 clap.workspace = true
 futures.workspace = true

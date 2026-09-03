@@ -5,7 +5,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
 use hyper::{
-    HeaderMap, Method, Request, StatusCode,
+    Method, Request, StatusCode,
     header::{CONNECTION, HOST, UPGRADE},
     upgrade::Upgraded,
 };
@@ -15,16 +15,18 @@ use tokio::{
     net::TcpStream,
 };
 
-use crate::{config::ClientConfig, tls};
+use crate::{
+    config::{ClientConfig, MuxerConfig},
+    tls,
+};
 
 /// Connects to the server and upgrades the connection to `protocol`.
 ///
-/// `headers` carry the multiplexer's configuration; the server builds its
-/// own side from them.
+/// `muxer_config` carries the multiplexer's configuration serialized to JSON and encoded with base64.
 pub async fn connect(
     config: &ClientConfig,
     protocol: &str,
-    headers: HeaderMap,
+    muxer_config: Vec<u8>,
 ) -> anyhow::Result<Upgraded> {
     let tcp = TcpStream::connect(config.server_addr)
         .await
@@ -39,14 +41,14 @@ pub async fn connect(
                 .connect(tls::server_name(), tcp)
                 .await
                 .context("TLS handshake failed")?;
-            upgrade(tls, protocol, headers).await
+            upgrade(tls, protocol, muxer_config).await
         },
-        None => upgrade(tcp, protocol, headers).await,
+        None => upgrade(tcp, protocol, muxer_config).await,
     }
 }
 
 /// Sends the upgrade request over `io` and returns the upgraded connection.
-async fn upgrade<IO>(io: IO, protocol: &str, headers: HeaderMap) -> anyhow::Result<Upgraded>
+async fn upgrade<IO>(io: IO, protocol: &str, muxer_config: Vec<u8>) -> anyhow::Result<Upgraded>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -60,15 +62,15 @@ where
     let connection = tokio::spawn(connection.with_upgrades());
 
     let host = tls::server_name().to_str().into_owned();
-    let mut request = Request::builder()
+    let request = Request::builder()
         .method(Method::GET)
         .uri("/echo")
         .header(HOST, host)
         .header(CONNECTION, "upgrade")
         .header(UPGRADE, protocol)
+        .header(MuxerConfig::HEADER_NAME, muxer_config)
         .body(Empty::new())
         .context("failed to build the upgrade request")?;
-    request.headers_mut().extend(headers);
 
     let response = sender
         .send_request(request)

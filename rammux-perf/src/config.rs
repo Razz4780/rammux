@@ -4,8 +4,9 @@ use std::{
     path::PathBuf,
 };
 
+use hyper::header::HeaderName;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Echo server configuration.
 #[derive(Deserialize, JsonSchema)]
@@ -64,10 +65,11 @@ pub struct ClientConfig {
     pub cert_path: Option<PathBuf>,
 
     /// Number of iterations to run.
-    #[serde(default = "default_iterations")]
+    #[serde(default = "non_zero_min")]
     pub iterations: NonZeroUsize,
 
     /// How many bulk streams to run in each iteration.
+    #[serde(default = "non_zero_min")]
     pub bulk_streams: NonZeroUsize,
 
     /// How much data each bulk stream sends, and reads back, in bytes.
@@ -87,19 +89,12 @@ pub struct ClientConfig {
     pub muxer: MuxerConfig,
 }
 
-fn default_iterations() -> NonZeroUsize {
+fn non_zero_min() -> NonZeroUsize {
     NonZeroUsize::MIN
 }
 
 fn default_bulk_stream_data() -> NonZeroUsize {
     NonZeroUsize::new(1024 * 1024).unwrap()
-}
-
-impl ClientConfig {
-    /// How many streams an iteration opens.
-    pub fn streams(&self) -> usize {
-        self.bulk_streams.get() + usize::from(self.ping_pong_size.is_some())
-    }
 }
 
 /// Which multiplexer to run, and how to configure it.
@@ -115,6 +110,9 @@ pub enum MuxerConfig {
 }
 
 impl MuxerConfig {
+    /// Name of the header that carries JSON-serialized inner config.
+    pub const HEADER_NAME: HeaderName = HeaderName::from_static("muxer-config");
+
     /// Name of the protocol, as used in the `Upgrade` header.
     pub fn protocol(&self) -> &'static str {
         match self {
@@ -125,53 +123,55 @@ impl MuxerConfig {
     }
 }
 
-/// rammux configuration, from the client's point of view.
-///
-/// Settings a peer has to agree on with the other side are sent to the server
-/// mirrored (its `remote` is our `local`); the rest are sent as they are, and
-/// the server uses the same values.
-#[derive(Deserialize, JsonSchema)]
+/// rammux configuration, from the client's point of view. Both sides use the same values.
+#[derive(Deserialize, Serialize, JsonSchema)]
 pub struct RammuxMuxerConfig {
-    /// Limit for the length of data in a single `DATA` frame, in bytes.
+    /// Size limit for a single data frame payload, in bytes.
     pub frame_limit: NonZeroU32,
-    /// Initial receive window of every stream on this side, in bytes.
-    pub local_recv_window: NonZeroU32,
-    /// Initial receive window of every stream on the server's side, in bytes.
-    pub remote_recv_window: NonZeroU32,
+    /// Initial receive window for a stream, in bytes.
+    pub stream_recv_window: NonZeroU32,
     /// Global receive window pool that streams borrow from, in bytes.
     pub global_recv_window: usize,
-    /// Initial transit window this side grants the server, in bytes. `0` disables it.
-    pub local_transit_window: u32,
-    /// Initial transit window the server grants this side, in bytes. `0` disables it.
-    pub remote_transit_window: u32,
+    /// Initial transit window, in bytes. `0` disables it.
+    pub transit_window: u32,
     /// Autotune limit of the transit window, in bytes.
     pub transit_window_max: u32,
     /// Interval of the link-clearing probe, in seconds. Also its timeout.
     pub probe_interval: NonZeroU64,
     /// Interval of the plain ping, in seconds. Also its timeout.
     pub ping_interval: NonZeroU64,
+    /// Limit for the number of concurrent streams. Applies separately to inbound and outbound streams.
+    pub max_streams: u32,
 }
 
 /// yamux configuration. Both sides use the same values.
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 pub struct YamuxMuxerConfig {
-    /// Largest data frame either side sends, in bytes.
-    pub frame_limit: usize,
-    /// Maximum connection-level receive window, in bytes.
-    pub max_conn_receive_window: usize,
+    /// Size limit for a single data frame payload, in bytes.
+    pub split_send_size: usize,
+    /// Limit for the total receive window across all streams, in bytes.
+    ///
+    /// Must be `>= 256 * 1024 * max_num_streams`.
+    pub max_connection_receive_window: usize,
+    /// Limit for the number of concurrent streams.
+    pub max_num_streams: usize,
 }
 
 /// HTTP/2 configuration. Both sides use the same values.
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 pub struct H2MuxerConfig {
-    /// Whether to size flow control windows from bandwidth-delay estimates.
+    /// Enable adaptive flow control.
+    ///
+    /// Adaptive flow control overrides `initial_connection_window_size` and `initial_stream_window_size`.
     pub adaptive_window: bool,
-    /// Largest frame either side sends, in bytes.
-    pub frame_limit: u32,
-    /// Send buffer size per stream, in bytes.
+    /// Frame size limit.
+    pub max_frame_size: u32,
+    /// Limit for the number of concurrent streams.
+    pub max_concurrent_streams: u32,
+    /// Limit for the write buffer size for each stream.
     pub max_send_buf_size: usize,
-    /// Initial stream-level flow control window, in bytes.
-    pub initial_stream_window: u32,
-    /// Initial connection-level flow control window, in bytes.
-    pub initial_connection_window: u32,
+    /// Initial connection receive window, in bytes.
+    pub initial_connection_window_size: u32,
+    /// Initial stream receive window, in bytes.
+    pub initial_stream_window_size: u32,
 }

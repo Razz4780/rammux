@@ -18,9 +18,9 @@ const HTTP_ADDR: &str = "127.0.0.1:28080";
 const HTTPS_ADDR: &str = "127.0.0.1:28443";
 
 const RAMMUX: &str = r#"{ "protocol": "rammux", "frame_limit": 16384,
-    "local_recv_window": 262144, "remote_recv_window": 262144, "global_recv_window": 4194304,
-    "local_transit_window": 262144, "remote_transit_window": 262144, "transit_window_max": 4194304,
-    "probe_interval": 20, "ping_interval": 5 }"#;
+    "stream_recv_window": 262144, "global_recv_window": 4194304,
+    "transit_window": 262144, "transit_window_max": 4194304,
+    "probe_interval": 20, "ping_interval": 5, "max_streams": 128 }"#;
 const YAMUX: &str =
     r#"{ "protocol": "yamux", "frame_limit": 16384, "max_conn_receive_window": 4194304 }"#;
 const H2: &str = r#"{ "protocol": "h2", "adaptive_window": true, "frame_limit": 16384,

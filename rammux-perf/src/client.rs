@@ -4,6 +4,7 @@
 use std::{path::Path, time::Duration};
 
 use anyhow::Context;
+use base64::Engine;
 use tokio::time::Instant;
 
 use crate::{
@@ -84,24 +85,40 @@ pub async fn run(config: &Path) -> anyhow::Result<()> {
 
 /// Connects, runs the workload once, and closes the connection.
 async fn run_iteration(config: &ClientConfig, workload: &Workload) -> anyhow::Result<Report> {
-    let streams = config.streams();
-    let started = Instant::now();
-    let cpu_before = cpu::cpu_time()?;
-
-    let measurements = match &config.muxer {
+    let upgraded = match &config.muxer {
         MuxerConfig::Rammux(muxer) => {
-            let headers = RammuxMuxer::headers(muxer, streams);
-            let upgraded = connect::connect(config, "rammux", headers).await?;
-            workload::run(RammuxMuxer::new(upgraded, muxer, streams), workload).await?
+            let muxer = serde_json::to_vec(muxer).expect("failed to serialize muxer config");
+            let muxer = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(muxer)
+                .into_bytes();
+            connect::connect(config, "rammux", muxer).await?
         },
         MuxerConfig::Yamux(muxer) => {
-            let headers = YamuxMuxer::headers(muxer, streams);
-            let upgraded = connect::connect(config, "yamux", headers).await?;
-            workload::run(YamuxMuxer::new(upgraded, muxer, streams), workload).await?
+            let muxer = serde_json::to_vec(muxer).expect("failed to serialize muxer config");
+            let muxer = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(muxer)
+                .into_bytes();
+            connect::connect(config, "yamux", muxer).await?
         },
         MuxerConfig::H2(muxer) => {
-            let headers = H2Muxer::headers(muxer, streams);
-            let upgraded = connect::connect(config, "h2", headers).await?;
+            let muxer = serde_json::to_vec(muxer).expect("failed to serialize muxer config");
+            let muxer = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(muxer)
+                .into_bytes();
+            connect::connect(config, "h2", muxer).await?
+        },
+    };
+
+    let started = Instant::now();
+    let cpu_before = cpu::cpu_time()?;
+    let measurements = match &config.muxer {
+        MuxerConfig::Rammux(muxer) => {
+            workload::run(RammuxMuxer::new(upgraded, muxer), workload).await?
+        },
+        MuxerConfig::Yamux(muxer) => {
+            workload::run(YamuxMuxer::new(upgraded, muxer), workload).await?
+        },
+        MuxerConfig::H2(muxer) => {
             workload::run(H2Muxer::new(upgraded, muxer).await?, workload).await?
         },
     };
