@@ -7,6 +7,7 @@ use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::Subscribe
 mod client;
 mod config;
 mod cpu;
+mod k8s;
 mod rammux_rtt;
 mod server;
 mod signal;
@@ -27,7 +28,7 @@ impl Args {
                 PeerCommand::Run { json_log, .. } => *json_log,
                 PeerCommand::Schema => false,
             },
-            Command::GenerateCert => false,
+            Command::K8s(..) | Command::GenerateCert => false,
         }
     }
 }
@@ -68,6 +69,16 @@ enum Command {
         #[clap(subcommand)]
         command: PeerCommand,
     },
+    /// Run one benchmark on a Kubernetes cluster, over a Chaos Mesh emulated link.
+    ///
+    /// Puts the echo server on the cluster, impairs the path between it and
+    /// the client with the chosen link archetype, runs the client as a job,
+    /// summarises what the job measured, and removes everything again - on a
+    /// clean finish, on a failure, and on Ctrl-C.
+    ///
+    /// Needs Chaos Mesh installed on the cluster, and an image with this
+    /// binary as its entrypoint that the cluster can pull.
+    K8s(k8s::K8sArgs),
     /// Generate a self-signed certificate to be used when benchmarking protocols with TLS
     /// and print it to stdout.
     GenerateCert,
@@ -125,6 +136,7 @@ async fn main() -> ExitCode {
         Command::Server {
             command: PeerCommand::Run { config_path, .. },
         } => server::run(&config_path).await,
+        Command::K8s(args) => k8s::run(&args).await,
     };
 
     match result {

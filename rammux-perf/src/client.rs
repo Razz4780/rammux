@@ -162,14 +162,14 @@ fn millis(duration: Duration) -> u64 {
 }
 
 /// Mean and percentiles of a sample. Empty samples summarise to `NaN`.
-struct Summary {
-    mean: f64,
-    p50: f64,
-    p99: f64,
+pub struct Summary {
+    pub mean: f64,
+    pub p50: f64,
+    pub p99: f64,
 }
 
 impl Summary {
-    fn of(values: impl IntoIterator<Item = f64>) -> Self {
+    pub fn of(values: impl IntoIterator<Item = f64>) -> Self {
         let mut values: Vec<f64> = values.into_iter().collect();
         values.sort_by(f64::total_cmp);
         let percentile = |p: f64| -> f64 {

@@ -23,6 +23,8 @@ http-body.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["http1", "http2", "client", "server"] }
 hyper-util.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
 rand.workspace = true
 rcgen.workspace = true
 schemars = "1"
