@@ -4,11 +4,13 @@ use std::{path::PathBuf, process::ExitCode};
 use tokio_rustls::rustls;
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
+mod client;
 mod config;
 mod cpu;
 mod rammux_rtt;
 mod server;
 mod signal;
+mod stream_util;
 mod tls;
 
 /// Multi-purpose CLI tool for benchmarking rammux against other multiplexing frameworks.
@@ -89,26 +91,16 @@ async fn main() -> ExitCode {
         Command::GenerateCert => generate_and_print_cert(),
         Command::Client {
             command: PeerCommand::Schema,
-        } => {
-            todo!()
-        },
+        } => print_schema(schemars::schema_for!(config::ClientConfig)),
         Command::Client {
             command: PeerCommand::Run { config_path, .. },
-        } => server::run(&config_path).await,
+        } => client::run(&config_path).await,
         Command::Server {
             command: PeerCommand::Schema,
-        } => {
-            let schema = schemars::schema_for!(config::ServerConfig);
-            serde_json::to_string_pretty(&schema)
-                .context("failed to serialize schema")
-                .map(|serialized| {
-                    println!("{serialized}");
-                    ()
-                })
-        },
+        } => print_schema(schemars::schema_for!(config::ServerConfig)),
         Command::Server {
             command: PeerCommand::Run { config_path, .. },
-        } => todo!(),
+        } => server::run(&config_path).await,
     };
 
     match result {
@@ -121,6 +113,12 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         },
     }
+}
+
+fn print_schema(schema: schemars::Schema) -> anyhow::Result<()> {
+    let serialized = serde_json::to_string_pretty(&schema).context("failed to serialize schema")?;
+    println!("{serialized}");
+    Ok(())
 }
 
 fn generate_and_print_cert() -> anyhow::Result<()> {

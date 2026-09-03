@@ -1,5 +1,4 @@
 use std::{
-    io,
     ops::ControlFlow,
     pin::Pin,
     task::{Context, Poll},
@@ -11,8 +10,7 @@ use async_selector::{
     selector::{BorrowedMut, Removed, Selector},
     task::Task,
 };
-use bytes::Bytes;
-use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt};
+use futures::{FutureExt, StreamExt};
 use hyper::{HeaderMap, upgrade::Upgraded};
 use hyper_util::rt::TokioIo;
 use rammux::{
@@ -24,6 +22,7 @@ use rammux::{
 use crate::{
     rammux_rtt::RttSchedule,
     server::{EchoImpl, http_util, pipe::PipeBytes},
+    stream_util::RammuxIo,
 };
 
 /// Transport under the rammux connection.
@@ -79,7 +78,7 @@ impl EchoImpl for RammuxEcho {
         let downgraded = loop {
             match selector.next().await.unwrap() {
                 ControlFlow::Continue(duplex) => {
-                    selector.push(RammuxTask::Stream(PipeBytes::new(EchoedStream(duplex))));
+                    selector.push(RammuxTask::Stream(PipeBytes::new(RammuxIo(duplex))));
                 },
                 ControlFlow::Break(result) => {
                     break result.context("rammux failed")?;
@@ -93,7 +92,7 @@ impl EchoImpl for RammuxEcho {
 
 enum RammuxTask {
     Connection(RammuxConnection<Transport>),
-    Stream(PipeBytes<EchoedStream>),
+    Stream(PipeBytes<RammuxIo>),
 }
 
 impl Task<RttSchedule> for RammuxTask {
@@ -170,41 +169,5 @@ impl Task<RttSchedule> for RammuxTask {
             Ok(None) => None,
             Err(error) => Some(ControlFlow::Break(Err(error))),
         }
-    }
-}
-
-/// [`RammuxDuplex`] with the item type [`PipeBytes`] expects.
-///
-/// A rammux stream never fails on the read side, so its [`Stream`] is infallible.
-struct EchoedStream(RammuxDuplex);
-
-impl Stream for EchoedStream {
-    type Item = io::Result<Bytes>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.get_mut()
-            .0
-            .poll_next_unpin(cx)
-            .map(|data| data.map(Ok))
-    }
-}
-
-impl Sink<Bytes> for EchoedStream {
-    type Error = io::Error;
-
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.get_mut().0.poll_ready_unpin(cx)
-    }
-
-    fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
-        self.get_mut().0.start_send_unpin(item)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.get_mut().0.poll_flush_unpin(cx)
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.get_mut().0.poll_close_unpin(cx)
     }
 }

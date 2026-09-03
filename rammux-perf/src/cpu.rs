@@ -7,7 +7,7 @@ const USER_HZ: u64 = 100;
 /// Returns process-wide CPU time so far (both user and sys).
 ///
 /// Can be used to measure how CPU-heavy a multiplexing protocol is.
-fn cpu_time() -> anyhow::Result<Duration> {
+pub fn cpu_time() -> anyhow::Result<Duration> {
     let stat =
         std::fs::read_to_string("/proc/self/stat").context("failed to read /proc/self/stat")?;
 

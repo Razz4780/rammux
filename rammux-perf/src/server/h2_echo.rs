@@ -15,14 +15,17 @@ use bytes::Bytes;
 use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, channel::mpsc};
 use hyper::{
     HeaderMap, Request, Response,
-    body::{Body, Frame, Incoming},
+    body::{Body, Incoming},
     server::conn::http2::Connection,
     service::Service,
     upgrade::Upgraded,
 };
 use hyper_util::rt::TokioExecutor;
 
-use crate::server::{EchoImpl, http_util, pipe::PipeBytes};
+use crate::{
+    server::{EchoImpl, http_util, pipe::PipeBytes},
+    stream_util::ChannelBody,
+};
 
 pub struct H2Echo {
     adaptive_window: bool,
@@ -92,7 +95,7 @@ struct MultiplexerService {
 }
 
 impl Service<Request<Incoming>> for MultiplexerService {
-    type Response = Response<ResponseBody>;
+    type Response = Response<ChannelBody>;
     type Error = hyper::Error;
     type Future = Ready<Result<Self::Response, Self::Error>>;
 
@@ -104,7 +107,7 @@ impl Service<Request<Incoming>> for MultiplexerService {
             outgoing: outgoing_tx,
         };
         let _ = self.requests_tx.unbounded_send(stream);
-        let response = Response::new(ResponseBody(outgoing_rx));
+        let response = Response::new(ChannelBody(outgoing_rx));
         std::future::ready(Ok(response))
     }
 }
@@ -166,23 +169,6 @@ impl Stream for EmulatedStream {
                 Some(Err(error)) => break Poll::Ready(Some(Err(io::Error::other(error)))),
             }
         }
-    }
-}
-
-struct ResponseBody(mpsc::Receiver<Bytes>);
-
-impl Body for ResponseBody {
-    type Data = Bytes;
-    type Error = hyper::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        self.get_mut()
-            .0
-            .poll_next_unpin(cx)
-            .map(|opt| opt.map(Frame::data).map(Ok))
     }
 }
 
