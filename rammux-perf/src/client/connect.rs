@@ -33,8 +33,6 @@ pub async fn connect(
         .with_context(|| format!("failed to connect to {}", config.server_addr))?;
     tcp.set_nodelay(true)
         .context("failed to set TCP_NODELAY on the connection socket")?;
-    tcp.set_zero_linger()
-        .context("failed to set 0 duration SO_LINGER on the connection socket")?;
 
     match &config.cert_path {
         Some(cert_path) => {
