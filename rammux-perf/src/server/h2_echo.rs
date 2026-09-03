@@ -55,7 +55,7 @@ impl EchoImpl for H2Echo {
                 },
             );
         let mut selector: Selector<H2Task, ()> = Default::default();
-        selector.push(H2Task::Connection(conn));
+        selector.push(H2Task::Connection(Box::new(conn)));
         selector.push(H2Task::NewStreams(req_rx));
         loop {
             match selector.next().await.unwrap() {
@@ -154,9 +154,8 @@ impl Stream for EmulatedStream {
     }
 }
 
-#[allow(clippy::large_enum_variant)]
 enum H2Task {
-    Connection(Connection<Upgraded, MultiplexerService, TokioExecutor>),
+    Connection(Box<Connection<Upgraded, MultiplexerService, TokioExecutor>>),
     NewStreams(mpsc::UnboundedReceiver<EmulatedStream>),
     Stream(PipeBytes<EmulatedStream>),
 }

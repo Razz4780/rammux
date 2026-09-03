@@ -36,7 +36,7 @@ impl EchoImpl for YamuxEcho {
             Mode::Server,
         );
         let mut selector: Selector<YamuxTask, ()> = Selector::default();
-        selector.push(YamuxTask::Connection(connection));
+        selector.push(YamuxTask::Connection(Box::new(connection)));
         loop {
             match selector.next().await.unwrap() {
                 ControlFlow::Continue(stream) => {
@@ -50,9 +50,8 @@ impl EchoImpl for YamuxEcho {
     }
 }
 
-#[allow(clippy::large_enum_variant)]
 enum YamuxTask {
-    Connection(Connection<Compat<TokioIo<Upgraded>>>),
+    Connection(Box<Connection<Compat<TokioIo<Upgraded>>>>),
     Stream(PipeFuturesIo<Stream>),
 }
 

@@ -47,7 +47,7 @@ impl EchoImpl for RammuxEcho {
             config.probe_interval(),
             config.ping_interval(),
         ));
-        selector.push(RammuxTask::Connection(connection));
+        selector.push(RammuxTask::Connection(Box::new(connection)));
         let downgraded = loop {
             match selector.next().await.unwrap() {
                 ControlFlow::Continue(duplex) => {
@@ -63,9 +63,8 @@ impl EchoImpl for RammuxEcho {
     }
 }
 
-#[allow(clippy::large_enum_variant)]
 enum RammuxTask {
-    Connection(RammuxConnection<Transport>),
+    Connection(Box<RammuxConnection<Transport>>),
     Stream(PipeBytes<RammuxIo>),
 }
 
