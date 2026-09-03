@@ -18,7 +18,7 @@ bitflags = "2"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
-http-body = "1"
+h2 = "0.4"
 http-body-util = "0.1"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }

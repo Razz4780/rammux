@@ -1,23 +1,16 @@
 //! The benchmarked multiplexers behind one interface, from the client's side.
 
 use std::{
-    cell::RefCell,
     io,
     pin::Pin,
-    rc::Rc,
     task::{Context, Poll},
 };
 
 use anyhow::Context as _;
-use async_selector::FutureSelector;
 use bytes::{Buf, Bytes};
-use futures::{AsyncWrite, FutureExt, Sink, SinkExt, Stream, StreamExt, channel::mpsc};
-use hyper::{
-    Method, Request, Response, StatusCode,
-    body::{Body, Incoming},
-    client::conn::http2::{Connection, SendRequest},
-    upgrade::Upgraded,
-};
+use futures::{AsyncWrite, FutureExt, Sink, SinkExt, Stream, StreamExt};
+use h2::client::SendRequest;
+use hyper::{Method, Request, upgrade::Upgraded};
 use hyper_util::rt::TokioIo;
 use rammux::{
     config::RammuxRole,
@@ -28,7 +21,7 @@ use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 use crate::{
     config::{H2MuxerConfig, RammuxMuxerConfig, YamuxMuxerConfig},
     rammux_rtt::RttSchedule,
-    stream_util::{ChannelBody, RammuxIo},
+    stream_util::{H2Duplex, RammuxIo},
 };
 
 /// A multiplexed connection to the echo server.
@@ -278,195 +271,66 @@ impl Sink<Bytes> for YamuxStream {
 // HTTP/2
 // ---------------------------------------------------------------------------
 
+type H2Connection = h2::client::Connection<TokioIo<Upgraded>, Bytes>;
+
 /// An HTTP/2 connection, one request per stream.
 ///
-/// hyper's client splits the work between a dispatcher, which is the
-/// [`Connection`] future it hands back, and futures it spawns on an executor:
-/// the connection driver that actually moves frames, and a body pipe per
-/// request. [`InlineExecutor`] captures those, and [`Muxer::poll_drive`] runs
-/// them here - so the whole client runs in one task, like the other two
-/// protocols, and closing can wait for the wire to actually close.
+/// `h2` puts the whole connection in one future: frames move for every open
+/// stream while [`Muxer::poll_drive`] polls it, and nothing is spawned, so
+/// this runs in one task like the other two protocols.
 pub struct H2Muxer {
-    /// Dropped to close: hyper shuts the connection down once the last
-    /// request handle is gone.
-    sender: Option<SendRequest<ChannelBody>>,
-    /// The dispatcher, until it finishes.
-    dispatcher: Option<Connection<Upgraded, ChannelBody, InlineExecutor>>,
-    /// Everything hyper spawned.
-    executor: InlineExecutor,
-}
-
-/// A future hyper asked the executor to run.
-type SpawnedTask = Pin<Box<dyn Future<Output = ()>>>;
-
-/// A [`hyper::rt::Executor`] that does not spawn: it stores futures in a [`FutureSelector`],
-/// for [`H2Muxer::poll_drive`] to poll.
-#[derive(Clone, Default)]
-pub struct InlineExecutor(Rc<RefCell<FutureSelector<SpawnedTask>>>);
-
-impl InlineExecutor {
-    /// Polls captured futures.
-    ///
-    /// Returns whether any are still running.
-    fn poll_tasks(&self, cx: &mut Context<'_>) -> bool {
-        let mut tasks = self.0.borrow_mut();
-        loop {
-            match tasks.poll_next_unpin(cx) {
-                Poll::Pending => break true,
-                Poll::Ready(Some(())) => {},
-                Poll::Ready(None) => break false,
-            }
-        }
-    }
-}
-
-impl<F> hyper::rt::Executor<F> for InlineExecutor
-where
-    F: Future<Output = ()> + 'static,
-{
-    fn execute(&self, future: F) {
-        self.0.borrow_mut().push(Box::pin(future));
-    }
+    /// Dropped to close. With no handle left to open a stream and no stream
+    /// still open, the connection sends its GOAWAY and finishes.
+    sender: Option<SendRequest<Bytes>>,
+    /// The connection, until it finishes.
+    connection: Option<H2Connection>,
 }
 
 impl H2Muxer {
     pub async fn new(upgraded: Upgraded, config: &H2MuxerConfig) -> anyhow::Result<Self> {
-        let executor = InlineExecutor::default();
-        let (sender, dispatcher) = hyper::client::conn::http2::Builder::new(executor.clone())
-            .keep_alive_interval(None)
-            .max_frame_size(16 * 1024)
-            .max_concurrent_streams(100)
-            .initial_connection_window_size(config.global_recv_window)
-            .initial_stream_window_size(config.stream_recv_window)
-            .adaptive_window(config.adaptive_window)
-            .handshake(upgraded)
+        let (sender, connection) = config
+            .to_client_builder()
+            .handshake::<_, Bytes>(TokioIo::new(upgraded))
             .await
             .context("HTTP/2 handshake failed")?;
         Ok(Self {
             sender: Some(sender),
-            dispatcher: Some(dispatcher),
-            executor,
+            connection: Some(connection),
         })
     }
 }
 
 impl Muxer for H2Muxer {
-    type Stream = H2Stream;
+    type Stream = H2Duplex;
 
     fn poll_open(&mut self, cx: &mut Context<'_>) -> Poll<anyhow::Result<Self::Stream>> {
         let Some(sender) = self.sender.as_mut() else {
             return Poll::Ready(Err(anyhow::anyhow!("the connection is closed")));
         };
         std::task::ready!(sender.poll_ready(cx)).context("HTTP/2 connection failed")?;
-        let (outgoing, body) = mpsc::channel(1);
         let request = Request::builder()
             .method(Method::POST)
             .uri("http://echo-server/echo")
-            .body(ChannelBody(body))
+            .body(())
             .context("failed to build an HTTP/2 request")?;
-        Poll::Ready(Ok(H2Stream {
-            response: Some(Box::pin(sender.send_request(request))),
-            incoming: None,
-            outgoing,
-        }))
+        // Not the end of the stream: the body is what the workload sends.
+        let (response, send) = sender
+            .send_request(request, false)
+            .context("failed to open an HTTP/2 stream")?;
+        Poll::Ready(Ok(H2Duplex::requested(response, send)))
     }
 
     fn poll_drive(&mut self, cx: &mut Context<'_>) -> Poll<anyhow::Result<()>> {
-        // The dispatcher queues requests for the driver; the driver and the
-        // body pipes are in the executor. The connection is over when all
-        // of them are.
-        if let Some(dispatcher) = self.dispatcher.as_mut()
-            && let Poll::Ready(result) = dispatcher.poll_unpin(cx)
-        {
-            result.context("HTTP/2 connection failed")?;
-            self.dispatcher = None;
-        }
-        let tasks_running = self.executor.poll_tasks(cx);
-        if self.dispatcher.is_none() && !tasks_running {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Pending
-        }
+        let Some(connection) = self.connection.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        std::task::ready!(connection.poll_unpin(cx)).context("HTTP/2 connection failed")?;
+        self.connection = None;
+        Poll::Ready(Ok(()))
     }
 
     fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<anyhow::Result<()>> {
         self.sender = None;
         self.poll_drive(cx)
-    }
-}
-
-/// The response to a request, on its way.
-type ResponseFuture = Pin<Box<dyn Future<Output = hyper::Result<Response<Incoming>>>>>;
-
-/// An HTTP/2 stream: the request body goes out, the response body comes back.
-pub struct H2Stream {
-    /// The response, until it arrives.
-    response: Option<ResponseFuture>,
-    /// The response body, once it arrives.
-    incoming: Option<Incoming>,
-    /// Feeds the request body.
-    outgoing: mpsc::Sender<Bytes>,
-}
-
-impl Stream for H2Stream {
-    type Item = io::Result<Bytes>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        if let Some(response) = this.response.as_mut() {
-            let response = std::task::ready!(response.poll_unpin(cx)).map_err(io::Error::other)?;
-            this.response = None;
-            if response.status() != StatusCode::OK {
-                return Poll::Ready(Some(Err(io::Error::other(format!(
-                    "server responded with {}",
-                    response.status()
-                )))));
-            }
-            this.incoming = Some(response.into_body());
-        }
-        let incoming = this.incoming.as_mut().expect("set above");
-        loop {
-            match std::task::ready!(Pin::new(&mut *incoming).poll_frame(cx)) {
-                None => return Poll::Ready(None),
-                Some(Ok(frame)) => {
-                    if let Ok(data) = frame.into_data() {
-                        return Poll::Ready(Some(Ok(data)));
-                    }
-                },
-                Some(Err(error)) => return Poll::Ready(Some(Err(io::Error::other(error)))),
-            }
-        }
-    }
-}
-
-impl Sink<Bytes> for H2Stream {
-    type Error = io::Error;
-
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.get_mut()
-            .outgoing
-            .poll_ready_unpin(cx)
-            .map_err(io::Error::other)
-    }
-
-    fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
-        self.get_mut()
-            .outgoing
-            .start_send_unpin(item)
-            .map_err(io::Error::other)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.get_mut()
-            .outgoing
-            .poll_flush_unpin(cx)
-            .map_err(io::Error::other)
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.get_mut()
-            .outgoing
-            .poll_close_unpin(cx)
-            .map_err(io::Error::other)
     }
 }
