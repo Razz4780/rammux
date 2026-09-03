@@ -35,11 +35,35 @@ impl Args {
 #[derive(Subcommand)]
 enum Command {
     /// Echo server talking all benchmarked multiplexing protocols.
+    ///
+    /// The server accepts all inbound streams and simply echoes back the data.
     Server {
         #[clap(subcommand)]
         command: PeerCommand,
     },
     /// Client talking one of the benchmarked multiplexing protocols.
+    ///
+    /// The client runs a number of iterations against the echo server. Each
+    /// iteration opens a fresh connection and runs some number of bulk streams and
+    /// at most one ping pong stream on it:
+    ///
+    /// * A bulk stream sends data as fast as possible and reads the echo back. These
+    ///   streams measure throughput.
+    /// * The ping pong stream sends one message and waits for its echo before sending
+    ///   the next. It measures latency under whatever load the bulk streams put on
+    ///   the connection.
+    ///
+    /// After each iteration the client logs:
+    /// * CPU time spent on the iteration, user and sys, in ms
+    /// * mean/p50/p99 throughput across the bulk streams, in Mbit/s - bytes a stream
+    ///   sent per second, with the time it took the echo to come back included
+    /// * mean/p50/p99 latency across the ping pong exchanges, in ms, and how many
+    ///   exchanges completed
+    /// * total elapsed time, connection setup excluded
+    ///
+    /// The iteration ends when every bulk stream has read its echo back. An
+    /// outstanding ping pong message is abandoned. A failed iteration is logged and
+    /// retried, up to 3 times.
     Client {
         #[clap(subcommand)]
         command: PeerCommand,

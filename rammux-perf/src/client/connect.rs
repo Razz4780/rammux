@@ -33,6 +33,8 @@ pub async fn connect(
         .with_context(|| format!("failed to connect to {}", config.server_addr))?;
     tcp.set_nodelay(true)
         .context("failed to set TCP_NODELAY on the connection socket")?;
+    tcp.set_zero_linger()
+        .context("failed to set 0 duration SO_LINGER on the connection socket")?;
 
     match &config.cert_path {
         Some(cert_path) => {
@@ -56,9 +58,8 @@ where
         hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(TokioIo::new(io))
             .await
             .context("HTTP/1.1 handshake failed")?;
-    // The connection has to be driven for the request to go out, and it is
-    // what performs the upgrade. It resolves once the connection is handed
-    // over, so it does not outlive this function by much.
+    // The connection has to be polled for the request to progress.
+    // It resolves once the connection is handed over to use after the upgrade.
     let connection = tokio::spawn(connection.with_upgrades());
 
     let host = tls::server_name().to_str().into_owned();

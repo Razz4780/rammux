@@ -16,13 +16,12 @@ use async_selector::{
     task::Task,
 };
 use bytes::Bytes;
-use futures::{SinkExt, StreamExt};
+use futures::{Sink, SinkExt, Stream, StreamExt};
 use tokio::time::Instant;
 
 use crate::client::muxer::Muxer;
 
-/// Bulk streams write in chunks of this size.
-const CHUNK_SIZE: usize = 64 * 1024;
+const CHUNK: Bytes = Bytes::from_static(&[b'X'; 256 * 1024]);
 
 /// What one iteration runs.
 pub struct Workload {
@@ -237,7 +236,7 @@ struct Bulk<S> {
     started: Instant,
 }
 
-impl<S: Muxer_Stream> Bulk<S> {
+impl<S: MuxerStream> Bulk<S> {
     fn new(stream: S, total: usize) -> Self {
         Self {
             stream,
@@ -258,8 +257,8 @@ impl<S: Muxer_Stream> Bulk<S> {
             if self.to_send > 0 {
                 if let Poll::Ready(result) = self.stream.poll_ready_unpin(cx) {
                     result?;
-                    let len = self.to_send.min(CHUNK_SIZE);
-                    self.stream.start_send_unpin(chunk(len))?;
+                    let len = self.to_send.min(CHUNK.len());
+                    self.stream.start_send_unpin(CHUNK.slice(..len))?;
                     self.to_send -= len;
                     progressed = true;
                 }
@@ -319,11 +318,11 @@ enum PingPongState {
     Drain { sink_closed: bool },
 }
 
-impl<S: Muxer_Stream> PingPong<S> {
+impl<S: MuxerStream> PingPong<S> {
     fn new(stream: S, size: usize) -> Self {
         Self {
             stream,
-            message: chunk(size),
+            message: CHUNK.slice(..size),
             state: PingPongState::Send,
         }
     }
@@ -402,31 +401,13 @@ impl<S: Muxer_Stream> PingPong<S> {
     }
 }
 
-/// `len` bytes of payload.
-///
-/// One static buffer, sliced: the streams never look at the content, and
-/// handing out slices keeps the send side allocation free.
-fn chunk(len: usize) -> Bytes {
-    static PAYLOAD: Bytes = Bytes::from_static(&[b'r'; CHUNK_SIZE]);
-    if len <= CHUNK_SIZE {
-        PAYLOAD.slice(..len)
-    } else {
-        Bytes::from(vec![b'r'; len])
-    }
-}
-
-/// Shorthand for the stream bounds [`Muxer::Stream`] carries.
-#[allow(non_camel_case_types)]
-trait Muxer_Stream:
-    futures::Sink<Bytes, Error = std::io::Error>
-    + futures::Stream<Item = std::io::Result<Bytes>>
-    + Unpin
+/// Shorthand for the stream bounds that [`Muxer::Stream`] carries.
+trait MuxerStream:
+    Sink<Bytes, Error = std::io::Error> + Stream<Item = std::io::Result<Bytes>> + Unpin
 {
 }
 
-impl<S> Muxer_Stream for S where
-    S: futures::Sink<Bytes, Error = std::io::Error>
-        + futures::Stream<Item = std::io::Result<Bytes>>
-        + Unpin
+impl<S> MuxerStream for S where
+    S: Sink<Bytes, Error = std::io::Error> + Stream<Item = std::io::Result<Bytes>> + Unpin
 {
 }

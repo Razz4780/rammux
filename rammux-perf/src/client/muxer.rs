@@ -9,8 +9,9 @@ use std::{
 };
 
 use anyhow::Context as _;
-use bytes::{Bytes, BytesMut};
-use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, channel::mpsc};
+use async_selector::FutureSelector;
+use bytes::{Buf, Bytes};
+use futures::{AsyncWrite, FutureExt, Sink, SinkExt, Stream, StreamExt, channel::mpsc};
 use hyper::{
     Method, Request, Response, StatusCode,
     body::{Body, Incoming},
@@ -22,10 +23,7 @@ use rammux::{
     config::RammuxRole,
     connection::{Downgraded, RammuxConnection, RammuxProgress},
 };
-use tokio_util::{
-    codec::{BytesCodec, Framed},
-    compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt},
-};
+use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
 use crate::{
     config::{H2MuxerConfig, RammuxMuxerConfig, YamuxMuxerConfig},
@@ -191,7 +189,10 @@ impl Muxer for YamuxMuxer {
     fn poll_open(&mut self, cx: &mut Context<'_>) -> Poll<anyhow::Result<Self::Stream>> {
         self.connection.poll_new_outbound(cx).map(|result| {
             result
-                .map(|stream| YamuxStream(Framed::new(stream.compat(), BytesCodec::new())))
+                .map(|stream| YamuxStream {
+                    stream,
+                    unwritten: Bytes::new(),
+                })
                 .context("failed to open a yamux stream")
         })
     }
@@ -215,38 +216,61 @@ impl Muxer for YamuxMuxer {
 ///
 /// yamux streams are byte streams; the codec cuts whatever is readable into
 /// one item and writes items back as bytes, which is all the workload needs.
-pub struct YamuxStream(Framed<Compat<yamux::Stream>, BytesCodec>);
+pub struct YamuxStream {
+    unwritten: Bytes,
+    stream: yamux::Stream,
+}
 
 impl Stream for YamuxStream {
     type Item = io::Result<Bytes>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.get_mut()
-            .0
+            .stream
             .poll_next_unpin(cx)
-            .map(|item| item.map(|result| result.map(BytesMut::freeze)))
+            .map(|item| item.map(|result| result.map(Bytes::from_owner)))
     }
 }
 
 impl Sink<Bytes> for YamuxStream {
     type Error = io::Error;
 
-    // The codec encodes both `Bytes` and `BytesMut`, so the item type has to
-    // be spelled out.
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        SinkExt::<Bytes>::poll_ready_unpin(&mut self.get_mut().0, cx)
+        let this = self.get_mut();
+        loop {
+            if this.unwritten.is_empty() {
+                break Poll::Ready(Ok(()));
+            }
+            let result =
+                std::task::ready!(Pin::new(&mut this.stream).poll_write(cx, &this.unwritten))?;
+            if result == 0 {
+                break Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            } else {
+                this.unwritten.advance(result);
+            }
+        }
     }
 
     fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
-        SinkExt::<Bytes>::start_send_unpin(&mut self.get_mut().0, item)
+        let this = self.get_mut();
+        if this.unwritten.is_empty() {
+            this.unwritten = item;
+            Ok(())
+        } else {
+            Err(io::Error::other("not ready"))
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        SinkExt::<Bytes>::poll_flush_unpin(&mut self.get_mut().0, cx)
+        let this = self.get_mut();
+        std::task::ready!(this.poll_ready_unpin(cx))?;
+        Pin::new(&mut this.stream).poll_flush(cx)
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        SinkExt::<Bytes>::poll_close_unpin(&mut self.get_mut().0, cx)
+        let this = self.get_mut();
+        std::task::ready!(this.poll_ready_unpin(cx))?;
+        Pin::new(&mut this.stream).poll_close(cx)
     }
 }
 
@@ -275,36 +299,24 @@ pub struct H2Muxer {
 /// A future hyper asked the executor to run.
 type SpawnedTask = Pin<Box<dyn Future<Output = ()>>>;
 
-/// An executor that does not spawn: it keeps what it is given, for
-/// [`H2Muxer::poll_drive`] to poll.
+/// A [`hyper::rt::Executor`] that does not spawn: it stores futures in a [`FutureSelector`],
+/// for [`H2Muxer::poll_drive`] to poll.
 #[derive(Clone, Default)]
-pub struct InlineExecutor {
-    tasks: Rc<RefCell<Vec<SpawnedTask>>>,
-}
+pub struct InlineExecutor(Rc<RefCell<FutureSelector<SpawnedTask>>>);
 
 impl InlineExecutor {
-    /// Polls every captured future once, dropping the finished ones.
+    /// Polls captured futures.
+    ///
     /// Returns whether any are still running.
     fn poll_tasks(&self, cx: &mut Context<'_>) -> bool {
-        let mut pending = Vec::new();
+        let mut tasks = self.0.borrow_mut();
         loop {
-            // Polling a task may hand the executor more tasks - a request
-            // body pipe, say. Those have registered no waker yet, so they
-            // get polled in the same pass rather than left for a wakeup that
-            // would never come.
-            let fresh = std::mem::take(&mut *self.tasks.borrow_mut());
-            if fresh.is_empty() {
-                break;
-            }
-            for mut task in fresh {
-                if task.as_mut().poll(cx).is_pending() {
-                    pending.push(task);
-                }
+            match tasks.poll_next_unpin(cx) {
+                Poll::Pending => break true,
+                Poll::Ready(Some(())) => {},
+                Poll::Ready(None) => break false,
             }
         }
-        let any_pending = !pending.is_empty();
-        *self.tasks.borrow_mut() = pending;
-        any_pending
     }
 }
 
@@ -313,7 +325,7 @@ where
     F: Future<Output = ()> + 'static,
 {
     fn execute(&self, future: F) {
-        self.tasks.borrow_mut().push(Box::pin(future));
+        self.0.borrow_mut().push(Box::pin(future));
     }
 }
 
@@ -391,7 +403,7 @@ type ResponseFuture = Pin<Box<dyn Future<Output = hyper::Result<Response<Incomin
 pub struct H2Stream {
     /// The response, until it arrives.
     response: Option<ResponseFuture>,
-    /// The response body, once it has.
+    /// The response body, once it arrives.
     incoming: Option<Incoming>,
     /// Feeds the request body.
     outgoing: mpsc::Sender<Bytes>,
