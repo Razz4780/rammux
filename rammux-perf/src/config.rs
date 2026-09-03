@@ -106,8 +106,6 @@ impl MuxerConfig {
 /// rammux configuration, from the client's point of view. Both sides use the same values.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct RammuxMuxerConfig {
-    /// Size limit for a single data frame payload, in bytes.
-    pub frame_limit: NonZeroU32,
     /// Initial receive window for a stream, in bytes.
     pub stream_recv_window: NonZeroU32,
     /// Global receive window pool that streams borrow from, in bytes.
@@ -120,8 +118,6 @@ pub struct RammuxMuxerConfig {
     pub probe_interval: NonZeroU64,
     /// Interval of the plain ping, in seconds. Also its timeout.
     pub ping_interval: NonZeroU64,
-    /// Limit for the number of concurrent streams. Applies separately to inbound and outbound streams.
-    pub max_streams: u32,
 }
 
 impl RammuxMuxerConfig {
@@ -132,15 +128,15 @@ impl RammuxMuxerConfig {
     /// peer rejects a frame.
     pub fn to_rammux_config(&self) -> RammuxConfig {
         let mut config = RammuxConfig::new();
-        config.frame_limit = self.frame_limit;
+        config.frame_limit = NonZeroU32::new(16 * 1024).unwrap();
         config.local_recv_window = self.stream_recv_window;
         config.remote_recv_window = self.stream_recv_window.get();
         config.global_recv_window = self.global_recv_window;
         config.local_transit_window = self.transit_window;
         config.remote_transit_window = self.transit_window;
         config.transit_window_max = self.transit_window_max;
-        config.max_inbound_streams = self.max_streams;
-        config.max_outbound_streams = self.max_streams;
+        config.max_inbound_streams = 100;
+        config.max_outbound_streams = 100;
         config
     }
 
@@ -158,14 +154,13 @@ impl RammuxMuxerConfig {
 /// yamux configuration. Both sides use the same values.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct YamuxMuxerConfig {
-    /// Size limit for a single data frame payload, in bytes.
-    pub split_send_size: usize,
     /// Limit for the total receive window across all streams, in bytes.
     ///
     /// Must be `>= 256 * 1024 * max_num_streams`.
-    pub max_connection_receive_window: usize,
-    /// Limit for the number of concurrent streams.
-    pub max_num_streams: usize,
+    ///
+    /// Every stream initially has a 256kb window, and the window is autotuned.
+    /// This value sets an upper limit for the total size of all windows.
+    pub global_recv_window: usize,
 }
 
 impl YamuxMuxerConfig {
@@ -178,16 +173,15 @@ impl YamuxMuxerConfig {
     pub fn to_yamux_config(&self) -> anyhow::Result<yamux::Config> {
         const DEFAULT_STREAM_WINDOW: usize = 256 * 1024;
         anyhow::ensure!(
-            self.max_connection_receive_window >= self.max_num_streams * DEFAULT_STREAM_WINDOW,
-            "max_connection_receive_window ({}) must be at least 256 KiB * max_num_streams ({})",
-            self.max_connection_receive_window,
-            self.max_num_streams,
+            self.global_recv_window >= 100 * DEFAULT_STREAM_WINDOW,
+            "global_recv_window ({}) must be at least 256 KiB * 100",
+            self.global_recv_window,
         );
         let mut config = yamux::Config::default();
         config
-            .set_max_num_streams(self.max_num_streams)
-            .set_max_connection_receive_window(Some(self.max_connection_receive_window))
-            .set_split_send_size(self.split_send_size)
+            .set_max_num_streams(100)
+            .set_max_connection_receive_window(Some(self.global_recv_window))
+            .set_split_send_size(16 * 1024)
             .set_read_after_close(true);
         Ok(config)
     }
@@ -198,16 +192,14 @@ impl YamuxMuxerConfig {
 pub struct H2MuxerConfig {
     /// Enable adaptive flow control.
     ///
-    /// Adaptive flow control overrides `initial_connection_window_size` and `initial_stream_window_size`.
+    /// Adaptive flow control overrides `stream_recv_window` and `gloval_recv_window`.
     pub adaptive_window: bool,
-    /// Frame size limit.
-    pub max_frame_size: u32,
-    /// Limit for the number of concurrent streams.
-    pub max_concurrent_streams: u32,
-    /// Limit for the write buffer size for each stream.
-    pub max_send_buf_size: usize,
-    /// Initial connection receive window, in bytes.
-    pub initial_connection_window_size: u32,
-    /// Initial stream receive window, in bytes.
-    pub initial_stream_window_size: u32,
+    /// Fixed size of each stream's receive window.
+    ///
+    /// Ignored if `adaptive_window` is set.
+    pub stream_recv_window: u32,
+    /// Upper limit for the total size of all streams' receive windows.
+    ///
+    /// Ignored if `adaptive_window` is set.
+    pub global_recv_window: u32,
 }

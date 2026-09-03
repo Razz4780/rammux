@@ -120,7 +120,7 @@ impl RammuxConfig {
     /// 2. [`Self::max_inbound_streams`] and [`Self::max_outbound_streams`] - 128
     /// 3. [`Self::local_recv_window`] and [`Self::remote_recv_window`] - 64kb
     /// 4. [`Self::global_recv_window`] - 4mb
-    /// 5. [`Self::local_transit_window`] and [`Self::remote_transit_window`] - 0 (disabled)
+    /// 5. [`Self::local_transit_window`] and [`Self::remote_transit_window`] - 128kb
     /// 6. [`Self::transit_window_max`] - 4mb
     pub const fn new() -> Self {
         Self {
@@ -130,8 +130,8 @@ impl RammuxConfig {
             local_recv_window: NonZeroU32::new(64 * 1024).unwrap(),
             remote_recv_window: 64 * 1024,
             global_recv_window: 4 * 1024 * 1024,
-            local_transit_window: 0,
-            remote_transit_window: 0,
+            local_transit_window: 128 * 1024,
+            remote_transit_window: 128 * 1024,
             transit_window_max: 4 * 1024 * 1024,
         }
     }

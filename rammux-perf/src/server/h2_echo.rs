@@ -42,11 +42,10 @@ impl EchoImpl for H2Echo {
         let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::default())
             .auto_date_header(false)
             .keep_alive_interval(None)
-            .max_frame_size(config.max_frame_size)
-            .max_concurrent_streams(config.max_concurrent_streams)
-            .max_send_buf_size(config.max_send_buf_size)
-            .initial_connection_window_size(config.initial_connection_window_size)
-            .initial_stream_window_size(config.initial_stream_window_size)
+            .max_frame_size(16 * 1024)
+            .max_concurrent_streams(100)
+            .initial_connection_window_size(config.global_recv_window)
+            .initial_stream_window_size(config.stream_recv_window)
             .adaptive_window(config.adaptive_window)
             .serve_connection(
                 conn,

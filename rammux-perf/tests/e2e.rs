@@ -17,15 +17,12 @@ const BIN: &str = env!("CARGO_BIN_EXE_rammux-perf");
 const HTTP_ADDR: &str = "127.0.0.1:28080";
 const HTTPS_ADDR: &str = "127.0.0.1:28443";
 
-const RAMMUX: &str = r#"{ "protocol": "rammux", "frame_limit": 16384,
+const RAMMUX: &str = r#"{ "protocol": "rammux",
     "stream_recv_window": 262144, "global_recv_window": 4194304,
     "transit_window": 262144, "transit_window_max": 4194304,
-    "probe_interval": 20, "ping_interval": 5, "max_streams": 128 }"#;
-const YAMUX: &str = r#"{ "protocol": "yamux", "split_send_size": 16384,
-    "max_connection_receive_window": 4194304, "max_num_streams": 8 }"#;
-const H2: &str = r#"{ "protocol": "h2", "adaptive_window": true, "max_frame_size": 16384,
-    "max_concurrent_streams": 8, "max_send_buf_size": 262144,
-    "initial_connection_window_size": 1048576, "initial_stream_window_size": 262144 }"#;
+    "probe_interval": 20, "ping_interval": 5 }"#;
+const YAMUX: &str = r#"{ "protocol": "yamux", "global_recv_window": 1073741824 }"#;
+const H2: &str = r#"{ "protocol": "h2", "adaptive_window": true, "global_recv_window": 1048576, "stream_recv_window": 262144 }"#;
 
 /// The echo server, killed on drop.
 struct Server(Child);
