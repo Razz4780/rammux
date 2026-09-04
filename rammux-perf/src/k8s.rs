@@ -1,8 +1,17 @@
 //! Runs one benchmark on a Kubernetes cluster, over a Chaos Mesh emulated link.
 //!
-//! The shape of a run is: put the echo server on the cluster, impair the path
-//! between it and where the client will be, run the client as a job, read what
-//! it measured out of the job's logs, and remove everything again.
+//! The shape of a run is: put the echo server on the cluster, start the client
+//! as a job and hold it at a start gate, impair the path between the two, open
+//! the gate, read what the client measured out of the job's logs, and remove
+//! everything again.
+//!
+//! The order is what it is because of one Chaos Mesh property: it resolves its
+//! selectors once, at injection, and cannot inject into a pod that does not
+//! exist yet. So both pods have to be running before the impairment goes in -
+//! which is why the client starts first - and the client must not connect
+//! until it has, which is what the gate is for. The result is that both ends
+//! are impaired, and the client's very first packet already crosses the
+//! emulated link.
 //!
 //! Every object a run creates carries the run's id as a label, and teardown
 //! deletes by that label alone. Nothing is remembered in memory that teardown
@@ -18,8 +27,8 @@
 //!   module; a stripped one will make the injection fail rather than quietly
 //!   run the benchmark unimpaired.
 //! * An image with this binary as its entrypoint that the nodes can pull.
-//! * Credentials that may create and delete pods, jobs, config maps and
-//!   secrets in the namespace, `networkchaos` in `chaos-mesh.org`, and - only
+//! * Credentials that may create and delete pods, jobs, services, config maps
+//!   and secrets in the namespace, `networkchaos` in `chaos-mesh.org`, and - only
 //!   if the namespace does not exist yet - namespaces.
 //!
 //! `--dry-run` prints the objects and needs none of this.
@@ -30,7 +39,7 @@ use anyhow::Context as _;
 use clap::Args;
 use k8s_openapi::api::{
     batch::v1::Job,
-    core::v1::{ConfigMap, Namespace, Pod, Secret},
+    core::v1::{ConfigMap, Namespace, Pod, Secret, Service},
 };
 use kube::{
     Api, Client,
@@ -274,15 +283,36 @@ async fn execute(
             &resources::config_map(
                 naming.client_config_map(),
                 naming,
-                &resources::client_config(args, &server_ip, muxer),
+                &resources::client_config(naming, args, &server_ip, muxer),
             )?,
         )
         .await
         .context("failed to create the client config map")?;
 
-    // The impairment goes in before the client exists, so that the very first
-    // packet of the connection already sees the emulated link. Nothing about
-    // the handshake should run on an unimpaired path.
+    // The client starts before the impairment and waits at the start gate for
+    // it. Chaos Mesh needs a running container to inject into, and the client
+    // must not connect until it has - the gate is what makes those two
+    // compatible, and it is why the client is created here rather than last.
+    let jobs = Api::<Job>::namespaced(client.clone(), ns);
+    jobs.create(
+        &PostParams::default(),
+        &resources::client_job(naming, args)?,
+    )
+    .await
+    .context("failed to create the client job")?;
+    wait_for("the client pod to be running", SETUP_TIMEOUT, || async {
+        let Some(pod) = client_pod(client, args, naming).await? else {
+            return Ok(None);
+        };
+        let status = pod.status.unwrap_or_default();
+        if let Some(reason) = stuck_reason(&status) {
+            anyhow::bail!("the client pod cannot start: {reason}");
+        }
+        Ok((status.phase.as_deref() == Some("Running")).then_some(()))
+    })
+    .await?;
+    tracing::info!("Client is running, held at the start gate");
+
     if let Some(profile) = args.archetype.profile() {
         let (api_resource, _) = discovery::pinned_kind(
             client,
@@ -323,18 +353,22 @@ async fn execute(
         tracing::info!(
             archetype = args.archetype.name(),
             experiments = objects.len(),
-            "Link impairment is in place",
+            one_way_delay = ?profile.one_way_delay(),
+            one_way_jitter = ?profile.one_way_jitter(),
+            "Link impairment is in place, on both pods",
         );
     }
 
-    let jobs = Api::<Job>::namespaced(client.clone(), ns);
-    jobs.create(
-        &PostParams::default(),
-        &resources::client_job(naming, args)?,
-    )
-    .await
-    .context("failed to create the client job")?;
-    tracing::info!("Client job running");
+    // Opening the gate is the last thing to happen, so everything the client
+    // does - its very first SYN included - crosses the emulated link.
+    Api::<Service>::namespaced(client.clone(), ns)
+        .create(&PostParams::default(), &resources::gate_service(naming)?)
+        .await
+        .context("failed to open the start gate")?;
+    tracing::info!(
+        endpoint = resources::gate_endpoint(naming),
+        "Start gate open, benchmark running",
+    );
 
     let succeeded = wait_for("the client job to finish", args.timeout(), || async {
         let status = jobs
@@ -392,8 +426,9 @@ fn dry_run(args: &K8sArgs, naming: &Naming, muxer: &Value) -> anyhow::Result<()>
         serde_yaml_value(&resources::config_map(
             naming.client_config_map(),
             naming,
-            &resources::client_config(args, PLACEHOLDER_IP, muxer),
+            &resources::client_config(naming, args, PLACEHOLDER_IP, muxer),
         )?)?,
+        serde_yaml_value(&resources::client_job(naming, args)?)?,
     ];
     if let Some(profile) = args.archetype.profile() {
         let duration = args.timeout() + Duration::from_secs(120);
@@ -406,7 +441,7 @@ fn dry_run(args: &K8sArgs, naming: &Naming, muxer: &Value) -> anyhow::Result<()>
             )?)?);
         }
     }
-    documents.push(serde_yaml_value(&resources::client_job(naming, args)?)?);
+    documents.push(serde_yaml_value(&resources::gate_service(naming)?)?);
 
     println!(
         "# rammux-perf run {}, archetype {}",
@@ -776,6 +811,7 @@ async fn teardown(
     }
     delete!(Job, "jobs");
     delete!(Pod, "pods");
+    delete!(Service, "services");
     delete!(ConfigMap, "config maps");
     delete!(Secret, "secrets");
 

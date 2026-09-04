@@ -162,10 +162,9 @@ impl Archetype {
 pub struct LinkProfile {
     /// Round trip over the whole path.
     ///
-    /// Applied in one direction only - see [`crate::k8s`] - so this is the
-    /// delay Chaos Mesh is given, not half of it.
+    /// Split across the two directions - see [`LinkProfile::one_way_delay`].
     pub rtt: Duration,
-    /// Delay variation.
+    /// Delay variation over the whole round trip.
     pub jitter: Duration,
     /// How strongly each packet's delay follows the previous one, in percent.
     ///
@@ -182,6 +181,24 @@ pub struct LinkProfile {
 }
 
 impl LinkProfile {
+    /// The delay to give Chaos Mesh, which applies it to each pod's egress.
+    ///
+    /// Both ends are impaired, so each leg carries half the round trip.
+    pub fn one_way_delay(&self) -> Duration {
+        self.rtt / 2
+    }
+
+    /// The jitter to give Chaos Mesh, per direction.
+    ///
+    /// netem draws uniformly from +/- the jitter it is given, and a round trip
+    /// crosses two of those draws. Their sum spans +/- twice one draw, so half
+    /// the round trip's jitter per leg is what reproduces it end to end - and
+    /// the sum is triangular rather than uniform, which is closer to a real
+    /// path than either leg is on its own.
+    pub fn one_way_jitter(&self) -> Duration {
+        self.jitter / 2
+    }
+
     /// Bandwidth-delay product in bytes, or [`None`] on an unshaped link.
     ///
     /// Not used to configure anything - it is logged, because it is the

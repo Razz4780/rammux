@@ -67,6 +67,15 @@ pub struct ClientConfig {
     /// The configuration is also sent to the server in the upgrade request, so
     /// both sides run the protocol with matching settings.
     pub muxer: MuxerConfig,
+
+    /// `host:port` to wait for before the first iteration.
+    ///
+    /// The client blocks until this accepts a TCP connection. A cluster run
+    /// uses it as a start gate: the client has to be running for its link to
+    /// be impaired, but must not connect until it is, and this holds it in
+    /// between. Unset starts immediately.
+    #[serde(default)]
+    pub await_endpoint: Option<String>,
 }
 
 fn non_zero_min() -> NonZeroUsize {

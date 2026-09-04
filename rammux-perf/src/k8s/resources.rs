@@ -6,7 +6,10 @@
 //! looking at than the builder form does.
 
 use anyhow::Context as _;
-use k8s_openapi::api::{batch::v1::Job, core::v1::ConfigMap, core::v1::Pod, core::v1::Secret};
+use k8s_openapi::api::{
+    batch::v1::Job,
+    core::v1::{ConfigMap, Pod, Secret, Service},
+};
 use kube::api::{DynamicObject, ObjectMeta};
 use serde_json::{Value, json};
 
@@ -60,6 +63,10 @@ impl Naming {
 
     pub fn secret(&self) -> String {
         format!("rammux-perf-tls-{}", self.run_id)
+    }
+
+    pub fn gate_service(&self) -> String {
+        format!("rammux-perf-gate-{}", self.run_id)
     }
 
     pub fn netem_chaos(&self) -> String {
@@ -132,7 +139,7 @@ pub fn server_config() -> Value {
 ///
 /// Deliberately the pod IP and not a Service: a Service would put kube-proxy's
 /// DNAT and its conntrack entry in the path, and this is a latency benchmark.
-pub fn client_config(args: &K8sArgs, server_ip: &str, muxer: &Value) -> Value {
+pub fn client_config(naming: &Naming, args: &K8sArgs, server_ip: &str, muxer: &Value) -> Value {
     let port = if args.tls { HTTPS_PORT } else { HTTP_PORT };
     let mut config = json!({
         "server_addr": format!("{server_ip}:{port}"),
@@ -140,6 +147,7 @@ pub fn client_config(args: &K8sArgs, server_ip: &str, muxer: &Value) -> Value {
         "bulk_streams": args.bulk_streams,
         "bulk_stream_data": args.bulk_stream_data,
         "muxer": muxer,
+        "await_endpoint": gate_endpoint(naming),
     });
     if let Some(size) = args.ping_pong_size {
         config["ping_pong_size"] = json!(size);
@@ -148,6 +156,40 @@ pub fn client_config(args: &K8sArgs, server_ip: &str, muxer: &Value) -> Value {
         config["cert_path"] = json!(format!("{CERT_DIR}/cert.pem"));
     }
     config
+}
+
+/// The start gate: a Service that exists only once the link is impaired.
+///
+/// The client blocks until this accepts a connection, so it holds the
+/// benchmark between "the client pod is running, and can therefore be
+/// impaired" and "the impairment is in place". It points at the echo server,
+/// which is already listening, so creating the Service is all it takes to
+/// open the gate - there is no second workload to run and wait for.
+///
+/// Its name does not resolve at all until it is created, which is what makes
+/// the wait a wait rather than a race. Expect the gate to open a few seconds
+/// after the Service appears rather than instantly: CoreDNS caches the denial
+/// it has been handing out, for 5 seconds by default.
+pub fn gate_service(naming: &Naming) -> anyhow::Result<Service> {
+    serde_json::from_value(json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": naming.meta(naming.gate_service(), "gate"),
+        "spec": {
+            "selector": { COMPONENT_LABEL: "server" },
+            "ports": [{ "port": HTTP_PORT, "targetPort": HTTP_PORT }],
+        },
+    }))
+    .context("failed to build the gate service")
+}
+
+/// Where the client waits for the gate.
+pub fn gate_endpoint(naming: &Naming) -> String {
+    format!(
+        "{}.{}.svc:{HTTP_PORT}",
+        naming.gate_service(),
+        naming.namespace
+    )
 }
 
 /// The echo server, as a bare pod.
@@ -231,26 +273,29 @@ fn volumes(naming: &Naming, config_map: String) -> Value {
 
 /// The delay, jitter and loss half of an archetype.
 ///
-/// # Which pod, and which direction
+/// # Which pods, and which direction
 ///
-/// This impairs the **server pod's outbound traffic**, and nothing else. The
-/// tempting alternative - selecting the server, targeting the client and
-/// asking for `direction: both` - does not work here, because Chaos Mesh
-/// resolves its selectors once at injection and cannot inject into a pod that
-/// does not exist yet. The client is a Job created after the chaos, so it
-/// would never be impaired, and the run would silently measure a clean link.
-/// Injecting after the Job instead would race the client's first connection.
+/// The selector is the run label, which matches *both* the server pod and the
+/// client pod, and `direction: to` puts netem on each one's egress. That is
+/// what makes the emulated link symmetric: the client's requests are delayed,
+/// jittered and dropped on the way out, and so are the server's echoes.
 ///
-/// So the emulated path is one-sided: everything the server sends carries the
-/// archetype's full delay, jitter, loss and rate, and the client's requests
-/// reach it over the cluster's own network. That still measures what this
-/// benchmark is for. The workload is an echo, so every byte it moves crosses
-/// the impaired leg; the round trip the client reports is the archetype's,
-/// because the whole delay is on the return; and a receive window's credit
-/// travels server to client, which is the feedback loop under study.
+/// Note what this deliberately is not. Selecting one side and naming the other
+/// as `target` would be the obvious spelling, but Chaos Mesh resolves its
+/// selectors once at injection and cannot inject into a pod that does not
+/// exist yet, so it only works if both pods are already up - and then two
+/// egress rules are simpler than one rule with a target, and avoid the
+/// `direction: both` behaviour of also impairing traffic *between* the
+/// selected pods.
 ///
-/// The latency is therefore the archetype's whole round trip rather than half
-/// of it - it is applied once, not once per direction.
+/// Both pods being up before injection is what the start gate is for; see
+/// [`gate_service`]. `podPhaseSelectors` pins that down: a pod that is not
+/// Running has no container for the chaos daemon to enter.
+///
+/// The delay and jitter are per leg, so each is half the archetype's round
+/// trip figure - see [`LinkProfile::one_way_delay`]. Loss and rate are not
+/// halved: a path that drops 1% drops 1% in each direction, and a 50 Mbit/s
+/// link carries 50 Mbit/s each way.
 pub fn netem_chaos(
     naming: &Naming,
     profile: &LinkProfile,
@@ -259,16 +304,13 @@ pub fn netem_chaos(
     let mut spec = json!({
         "action": "netem",
         "mode": "all",
-        "selector": {
-            "namespaces": [naming.namespace],
-            "labelSelectors": { COMPONENT_LABEL: "server" },
-        },
+        "selector": both_pods(naming),
         "direction": "to",
         // A dead orchestrator must not leave the cluster impaired forever.
         "duration": format!("{}s", duration.as_secs()),
         "delay": {
-            "latency": format_millis(profile.rtt),
-            "jitter": format_millis(profile.jitter),
+            "latency": format_millis(profile.one_way_delay()),
+            "jitter": format_millis(profile.one_way_jitter()),
             "correlation": profile.delay_correlation.to_string(),
         },
     });
@@ -303,10 +345,7 @@ pub fn bandwidth_chaos(
     let spec = json!({
         "action": "bandwidth",
         "mode": "all",
-        "selector": {
-            "namespaces": [naming.namespace],
-            "labelSelectors": { COMPONENT_LABEL: "server" },
-        },
+        "selector": both_pods(naming),
         "direction": "to",
         "duration": format!("{}s", duration.as_secs()),
         "bandwidth": {
@@ -316,6 +355,17 @@ pub fn bandwidth_chaos(
         },
     });
     chaos(naming, naming.bandwidth_chaos(), spec)
+}
+
+/// Both of the run's pods, and only while they are actually running.
+fn both_pods(naming: &Naming) -> Value {
+    json!({
+        "namespaces": [naming.namespace],
+        "labelSelectors": { RUN_LABEL: naming.run_id },
+        // A pod that is not Running has no container for the chaos daemon to
+        // enter, so injection would fail rather than wait.
+        "podPhaseSelectors": ["Running"],
+    })
 }
 
 fn chaos(naming: &Naming, name: String, spec: Value) -> anyhow::Result<DynamicObject> {
@@ -454,19 +504,68 @@ mod test {
         );
     }
 
+    /// The two experiments have to hit the same pods, or the delay and the
+    /// rate limit end up on different legs of the link.
+    #[test]
+    fn both_experiments_select_the_same_pods() {
+        let naming = Naming::new("bench".to_owned());
+        let profile = Archetype::WanVpn.profile().unwrap();
+        let duration = Duration::from_secs(60);
+        let netem = netem_chaos(&naming, &profile, duration).unwrap();
+        let bandwidth =
+            bandwidth_chaos(&naming, &profile, profile.rate_mbit.unwrap(), duration).unwrap();
+        assert_eq!(
+            netem.data["spec"]["selector"],
+            bandwidth.data["spec"]["selector"],
+        );
+        assert_eq!(netem.data["spec"]["direction"], "to");
+        assert_eq!(bandwidth.data["spec"]["direction"], "to");
+    }
+
+    /// The gate only works if the client waits for the name the Service
+    /// actually has, and if that Service points at something already
+    /// listening.
+    #[test]
+    fn the_gate_matches_what_the_client_waits_for() {
+        let naming = Naming::new("bench".to_owned());
+        let service = gate_service(&naming).unwrap();
+        assert_survives(
+            &service,
+            &[
+                (
+                    "/spec/selector/rammux-perf.metalbear.com~1component",
+                    json!("server"),
+                ),
+                ("/spec/ports/0/port", json!(HTTP_PORT)),
+            ],
+        );
+        let endpoint = gate_endpoint(&naming);
+        assert!(
+            endpoint.starts_with(&format!("{}.bench.svc:", naming.gate_service())),
+            "the client would wait on {endpoint}, which is not this service",
+        );
+        let config = client_config(
+            &naming,
+            &args(),
+            "10.1.2.3",
+            &json!({ "protocol": "rammux" }),
+        );
+        assert_eq!(config["await_endpoint"], endpoint);
+    }
+
     #[test]
     fn the_client_config_points_at_the_server() {
         let naming = Naming::new("bench".to_owned());
         let mut args = args();
         let muxer = json!({ "protocol": "rammux" });
-        let plain = client_config(&args, "10.1.2.3", &muxer);
+        let plain = client_config(&naming, &args, "10.1.2.3", &muxer);
         assert_eq!(plain["server_addr"], format!("10.1.2.3:{HTTP_PORT}"));
         assert!(plain.get("cert_path").is_none());
         assert!(plain.get("ping_pong_size").is_none());
 
         args.tls = true;
         args.ping_pong_size = Some(1024);
-        let encrypted = client_config(&args, "10.1.2.3", &muxer);
+        let encrypted = client_config(&naming, &args, "10.1.2.3", &muxer);
         assert_eq!(encrypted["server_addr"], format!("10.1.2.3:{HTTPS_PORT}"));
         assert_eq!(encrypted["cert_path"], format!("{CERT_DIR}/cert.pem"));
         assert_eq!(encrypted["ping_pong_size"], 1024);
@@ -485,16 +584,18 @@ mod test {
         let chaos = netem_chaos(&naming, &profile, Duration::from_secs(60)).unwrap();
         let spec = &chaos.data["spec"];
         assert_eq!(spec["action"], "netem");
-        // One direction only, on the leg the echo comes back over.
+        // Each pod's egress, so the impairment covers both legs.
         assert_eq!(spec["direction"], "to");
-        // The whole 200 ms round trip, applied once on the return leg.
-        assert_eq!(spec["delay"]["latency"], "200ms");
-        // Impairing the client would need it to exist at injection time.
+        // Half the archetype's 200 ms round trip and of its jitter, per leg.
+        assert_eq!(spec["delay"]["latency"], "100ms");
+        assert_eq!(spec["delay"]["jitter"], "15ms");
+        // Loss is per direction and is not halved.
+        assert_eq!(spec["loss"]["loss"], "1.5");
+        // Both pods by the run label, rather than one side with the other as
+        // a target, which Chaos Mesh resolves differently.
         assert!(spec.get("target").is_none());
-        assert_eq!(
-            spec["selector"]["labelSelectors"][COMPONENT_LABEL],
-            "server"
-        );
+        assert_eq!(spec["selector"]["labelSelectors"][RUN_LABEL], naming.run_id);
+        assert_eq!(spec["selector"]["podPhaseSelectors"][0], "Running");
         assert_eq!(spec["loss"]["loss"], "1.5");
         assert_eq!(spec["selector"]["namespaces"][0], "bench");
     }

@@ -23,6 +23,10 @@ mod workload;
 
 /// How many times a failed iteration is retried.
 const MAX_RETRIES: usize = 3;
+/// How long [`ClientConfig::await_endpoint`] is waited for.
+const GATE_TIMEOUT: Duration = Duration::from_secs(300);
+/// How often it is retried meanwhile.
+const GATE_INTERVAL: Duration = Duration::from_millis(200);
 
 pub async fn run(config: &Path) -> anyhow::Result<()> {
     let config = {
@@ -46,8 +50,19 @@ pub async fn run(config: &Path) -> anyhow::Result<()> {
         bulk_streams = config.bulk_streams,
         bulk_stream_data = config.bulk_stream_data,
         ping_pong_size = config.ping_pong_size.map(|size| size.get()),
+        await_endpoint = config.await_endpoint.as_deref(),
         "Starting the client",
     );
+
+    if let Some(endpoint) = &config.await_endpoint {
+        tokio::select! {
+            () = &mut signal => {
+                tracing::info!("Received an exit signal");
+                return Ok(());
+            },
+            result = await_endpoint(endpoint) => result?,
+        }
+    }
 
     for iteration in 1..=config.iterations.get() {
         let mut attempt = 1;
@@ -81,6 +96,36 @@ pub async fn run(config: &Path) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Blocks until `endpoint` accepts a TCP connection.
+///
+/// Retries rather than failing on the first refusal, because the whole point
+/// is that the endpoint is not there yet - in a cluster run its name does not
+/// even resolve until the orchestrator creates it.
+async fn await_endpoint(endpoint: &str) -> anyhow::Result<()> {
+    let started = Instant::now();
+    let mut attempts = 0_u64;
+    loop {
+        attempts += 1;
+        match tokio::net::TcpStream::connect(endpoint).await {
+            Ok(..) => {
+                tracing::info!(
+                    endpoint,
+                    attempts,
+                    waited_ms = millis(started.elapsed()),
+                    "Start gate opened",
+                );
+                return Ok(());
+            },
+            Err(error) if started.elapsed() >= GATE_TIMEOUT => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "{endpoint} did not accept a connection within {GATE_TIMEOUT:?}"
+                )));
+            },
+            Err(..) => tokio::time::sleep(GATE_INTERVAL).await,
+        }
+    }
 }
 
 /// Connects, runs the workload once, and closes the connection.
