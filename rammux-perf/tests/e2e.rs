@@ -174,6 +174,8 @@ fn every_protocol_against_one_server() {
                 "p50_ping_pong_latency_micros",
                 "p99_ping_pong_latency_micros",
                 "completed_ping_pongs",
+                "total_time_micros",
+                "total_cpu_time_micros",
             ] {
                 assert!(
                     report[field].is_u64(),
@@ -185,6 +187,13 @@ fn every_protocol_against_one_server() {
             assert!(
                 report["mean_bulk_elapsed_micros"].as_u64().unwrap() > 0,
                 "{name}: the bulk streams measured no time: {report}",
+            );
+            // CPU time is not checked against zero: it comes from
+            // `/proc/self/stat` in 10 ms ticks, and an iteration this small
+            // can genuinely land on none of them.
+            assert!(
+                report["total_time_micros"].as_u64().unwrap() > 0,
+                "{name}: the run measured no time at all: {report}",
             );
 
             let completed = report["completed_ping_pongs"].as_u64().unwrap();

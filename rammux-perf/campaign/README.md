@@ -29,12 +29,19 @@ land apart is the resolution of every other difference in it.
 
 | protocol | points per link |
 |---|---|
-| rammux | `transit-1x/2x/4x/8x`, `transit-auto`, `transit-auto-probe-30s` |
-| h2 | `adaptive`, `fixed-1x/2x/4x/8x` |
-| quic | `fixed-1x/2x/8x` |
-| yamux | `global-25mib`, `global-64mib` |
+| rammux | `transit-1x/2x/4x/8x`, each at `probe-10s` and `probe-30s` |
+| h2 | `adaptive`, `fixed-256kb` |
+| quic | `fixed-1x/2x/4x/8x` |
+| yamux | `global-25mib` |
 
-18 runs a link, 90 over the five impaired links.
+17 runs a link, 85 over the five impaired links.
+
+Every protocol gets the same memory ceiling: 25 MiB of receive buffer across
+the connection, which is yamux's floor (256 KiB x 100 streams) and so the
+lowest budget all four can be held to. rammux's share is accounted against
+the workload's 9 streams - 9 x 256 KiB of stream window plus a pool of
+25 MiB minus that - because its global window is a pool on top of the
+per-stream windows rather than a cap over them.
 
 rammux's transit window is always on: the ladder asks how big it should be,
 not whether it should exist. Flow control that works the other way round -
@@ -60,10 +67,10 @@ IMAGE=europe-west1-docker.pkg.dev/$PROJECT/rammux/rammux-perf:dev
 # shaped link. ~5 min, and where a wrong image or a missing RBAC verb shows up.
 ./bench.py --image "$IMAGE" --kubeconfig bench.kubeconfig --smoke
 
-# One link first. ~40 min.
+# One link first.
 ./bench.py --image "$IMAGE" --kubeconfig bench.kubeconfig --links wan
 
-# The rest. ~2.4 h. Skips whatever already succeeded.
+# The rest. Skips whatever already succeeded.
 ./bench.py --image "$IMAGE" --kubeconfig bench.kubeconfig
 
 # Print a results file without running anything.
@@ -79,9 +86,13 @@ accident.
 
 ## What comes out
 
-`results/results.jsonl`, one line per run: the config it ran, and the six
-numbers `k8s run` reports - `failures`, `mean_bulk_elapsed_us`, mean/p50/p99
-ping pong latency, `completed_ping_pongs` - plus `mbps` derived from the bulk
-elapsed time. Small enough to commit. Each run's stderr is kept beside it in
+`results/results.jsonl`, one line per run: the config it ran, and the numbers
+`k8s run` reports - `failures`, `mean_bulk_elapsed_us`, mean/p50/p99 ping pong
+latency, `completed_ping_pongs`, `total_time_us` and `total_cpu_time_us` -
+plus `mbps` derived from the bulk elapsed time and `cpu_ratio`, which is CPU
+over wall time. The client runs on one thread, so a `cpu_ratio` near 1.0 means
+that run was CPU-bound rather than link-bound, which changes what its
+throughput number means. CPU time comes from `/proc/self/stat` in USER_HZ
+ticks, so it moves in 10 ms steps whatever the microseconds suggest. Small enough to commit. Each run's stderr is kept beside it in
 `results/stderr/`, and the exact config in `results/configs/`, so a surprising
 row can be re-run by hand.

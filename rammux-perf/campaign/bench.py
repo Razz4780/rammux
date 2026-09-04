@@ -159,6 +159,14 @@ SMOKE = [
 ]
 
 
+# Run first and last in every link's block, on top of its place in the
+# ladder. Three readings of one configuration spread across the block: they
+# should be identical, and how far apart they land is the resolution of every
+# other difference in it. Must name a real ladder point - `matrix` refuses to
+# build if it does not.
+ANCHOR = ("rammux", "transit-2x-probe-10s")
+
+
 def matrix(links, protocols):
     """The runs to do, in the order to do them.
 
@@ -183,17 +191,27 @@ def matrix(links, protocols):
                 points = ladders[protocol]
                 if index < len(points):
                     block.append((link, protocol, *points[index]))
-        anchor = next((run for run in block
-                       if run[1] == "rammux" and run[2] == "transit-2x"), None)
-        if anchor:
+        if ANCHOR[0] in protocols:
+            anchor = next((run for run in block
+                           if (run[1], run[2]) == ANCHOR), None)
+            if anchor is None:
+                # Loudly. This was matched by name once, the ladder's names
+                # changed, and the anchors silently stopped being generated -
+                # which is invisible in the results, because what goes missing
+                # is the thing that tells you how much of a difference is
+                # real.
+                raise SystemExit(
+                    f"ANCHOR {ANCHOR} is not a point in the ladder; "
+                    f"{ANCHOR[0]} has "
+                    f"{', '.join(name for name, _ in LADDERS[ANCHOR[0]])}")
             # Distinct names, or the two would collide with the ladder's own
-            # `transit-2x` and with each other - and a run is skipped on a
-            # restart by name, so a collision would quietly drop the anchor.
-            # The ladder's own copy sits somewhere in the middle, which makes
-            # three readings of one configuration across the block.
-            block = ([(link, "rammux", "transit-2x-first", anchor[3])]
+            # copy and with each other - a run is skipped on a restart by
+            # name, so a collision would quietly drop an anchor. The ladder's
+            # own copy sits somewhere in the middle, which makes three
+            # readings of one configuration across the block.
+            block = ([(link, ANCHOR[0], f"{ANCHOR[1]}-first", anchor[3])]
                      + block
-                     + [(link, "rammux", "transit-2x-last", anchor[3])])
+                     + [(link, ANCHOR[0], f"{ANCHOR[1]}-last", anchor[3])])
         runs.extend(block)
     return runs
 
@@ -225,13 +243,15 @@ REPORT_FIELDS = {
     "P50 PING PONG LATENCY": "p50_ping_pong_latency_us",
     "P99 PING PONG LATENCY": "p99_ping_pong_latency_us",
     "COMPLETED PING PONG": "completed_ping_pongs",
+    "TOTAL TIME": "total_time_us",
+    "TOTAL CPU TIME": "total_cpu_time_us",
 }
 # The unit suffix is a mu, and not worth depending on.
 REPORT_LINE = re.compile(r"^([A-Z0-9 ]+?):\s*(\d+)")
 
 
 def parse_report(stdout):
-    """Reads the six numbers back, or says which are missing."""
+    """Reads the numbers back, or says which are missing."""
     found = {}
     for line in stdout.splitlines():
         match = REPORT_LINE.match(line.strip())
@@ -253,6 +273,23 @@ def mbps(bytes_per_stream, elapsed_us):
     if not elapsed_us:
         return None
     return round(bytes_per_stream * 8 / elapsed_us, 2)
+
+
+def cpu_ratio(cpu_us, total_us):
+    """CPU time as a fraction of wall time, which is what compares protocols.
+
+    The client runs on one thread, so this tops out near 1.0 and a protocol
+    that reaches it was CPU-bound rather than link-bound - which changes what
+    its throughput number means. Both inputs come from the client process
+    alone; the echo server is a different pod.
+
+    Coarse on purpose: CPU time is read from `/proc/self/stat` in USER_HZ
+    ticks, so it moves in 10 ms steps however many microseconds it is
+    reported in.
+    """
+    if not total_us:
+        return None
+    return round(cpu_us / total_us, 3)
 
 
 def run_one(binary, config_path, env, timeout):
@@ -319,7 +356,8 @@ def report(path):
     if not rows:
         print(f"no successful runs in {path}")
         return
-    header = f"{'point':<22} {'mbit/s':>9} {'p50 ms':>9} {'p99 ms':>9} {'mean ms':>9} {'pp n':>7} {'fail':>5}"
+    header = (f"{'point':<26} {'mbit/s':>9} {'p50 ms':>8} {'p99 ms':>9} {'mean ms':>8} "
+              f"{'total s':>8} {'cpu s':>7} {'cpu/wall':>9} {'pp n':>7} {'fail':>5}")
     for link in dict.fromkeys(row["link"] for row in rows):
         print(f"\n=== {link}")
         for protocol in dict.fromkeys(row["protocol"] for row in rows if row["link"] == link):
@@ -327,15 +365,19 @@ def report(path):
             block = [row for row in rows
                      if row["link"] == link and row["protocol"] == protocol]
             for row in block:
-                print("  {:<22} {:>9} {:>9.3f} {:>9.3f} {:>9.3f} {:>7} {:>5}".format(
-                    row["point"],
-                    row["mbps"] if row["mbps"] is not None else "-",
-                    row["p50_ping_pong_latency_us"] / 1e3,
-                    row["p99_ping_pong_latency_us"] / 1e3,
-                    row["mean_ping_pong_latency_us"] / 1e3,
-                    row["completed_ping_pongs"],
-                    row["failures"],
-                ))
+                print("  {:<26} {:>9} {:>8.3f} {:>9.3f} {:>8.3f} "
+                      "{:>8.2f} {:>7.2f} {:>9} {:>7} {:>5}".format(
+                          row["point"],
+                          row["mbps"] if row["mbps"] is not None else "-",
+                          row["p50_ping_pong_latency_us"] / 1e3,
+                          row["p99_ping_pong_latency_us"] / 1e3,
+                          row["mean_ping_pong_latency_us"] / 1e3,
+                          row["total_time_us"] / 1e6,
+                          row["total_cpu_time_us"] / 1e6,
+                          row.get("cpu_ratio") if row.get("cpu_ratio") is not None else "-",
+                          row["completed_ping_pongs"],
+                          row["failures"],
+                      ))
 
 
 def main():
@@ -436,10 +478,13 @@ def main():
                     row.update(report_fields)
                     row["mbps"] = mbps(config["bulk_stream_data"] * MIB,
                                        report_fields["mean_bulk_elapsed_us"])
+                    row["cpu_ratio"] = cpu_ratio(report_fields["total_cpu_time_us"],
+                                                 report_fields["total_time_us"])
                     print(f"ok ({elapsed:.0f}s) "
                           f"{row['mbps']} mbit/s, "
                           f"p50 {row['p50_ping_pong_latency_us'] / 1e3:.2f} ms, "
-                          f"p99 {row['p99_ping_pong_latency_us'] / 1e3:.2f} ms")
+                          f"p99 {row['p99_ping_pong_latency_us'] / 1e3:.2f} ms, "
+                          f"cpu {row['cpu_ratio']}")
                 with results.open("a") as handle:
                     handle.write(json.dumps(row) + "\n")
                 if row["status"] == "ok":
