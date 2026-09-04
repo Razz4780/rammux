@@ -34,7 +34,10 @@
 //!   and secrets in the namespace, `networkchaos` in `chaos-mesh.org`, and - only
 //!   if the namespace does not exist yet - namespaces.
 
-use std::{path::Path, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::Context as _;
 use k8s_openapi::api::{
@@ -105,6 +108,17 @@ pub struct K8sConfig {
     /// How long the client job gets before the run is given up on.
     #[serde(default = "K8sConfig::default_timeout_s")]
     pub timeout_secs: u64,
+
+    /// Where to write the client job's log, verbatim.
+    ///
+    /// The summary printed at the end of a run is a lossy view of what the
+    /// job measured: it is taken over the samples and the samples are then
+    /// gone with the namespace. A campaign wants the samples themselves, so
+    /// that a question nobody thought to ask beforehand can still be answered
+    /// afterwards, and so that runs can be pooled. Unset keeps the old
+    /// behaviour of printing and discarding.
+    #[serde(default)]
+    pub log_path: Option<PathBuf>,
 }
 
 impl K8sConfig {
@@ -375,6 +389,20 @@ async fn execute(
     // Logs are read whether the job passed or failed: a failed run's warnings
     // are the whole reason to look.
     let logs = client_logs(client, naming).await?;
+    // Before the failure check: a failed run's log is the one most worth
+    // keeping, and the namespace it came from is about to be deleted.
+    if let Some(path) = &config.log_path {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        std::fs::write(path, &logs)
+            .with_context(|| format!("failed to write the job log to {}", path.display()))?;
+        tracing::info!(path = %path.display(), bytes = logs.len(), "Wrote the client job's log");
+    }
     let (iterations, samples) = parse_log(&logs);
     if !succeeded {
         anyhow::bail!(
