@@ -75,12 +75,27 @@ ITERATIONS = 3
 TLS = True
 TIMEOUT_SECS = 900
 
-# rammux's RTT schedule. Not under test, and deliberately slack: the probe
-# interval doubles as the probe's deadline, and an expired probe kills the
-# connection - which on a wide, slow link would be a property of the schedule
-# rather than of the window being measured.
-PROBE_INTERVAL = 5
-PING_INTERVAL = 15
+# rammux's RTT schedule. The two are not interchangeable and the ordering is
+# structural, not a convention: a link-clearing probe pauses data output on
+# both sides, so it is a whole-connection stall and has to be rare, while a
+# plain ping holds nothing back but the next probe and can be frequent. The
+# code assumes that ordering too - a probe that is refused because one is
+# already running comes back after `ping_every`, so a ping interval above the
+# probe interval would back off for longer than the probe period.
+#
+# The probe interval also doubles as the probe's deadline, and an expired
+# probe kills the connection. At 10 s that is 50 round trips even on
+# `lossy-wan`, so the deadline is not what is being traded here - the stall
+# rate is, which is why the probe interval is an axis of its own below.
+PROBE_INTERVAL = 10
+PING_INTERVAL = 5
+# Probe intervals to sweep, on top of the default. A run's iteration lasts
+# 15-20 s and every iteration opens a fresh connection whose first probe fires
+# immediately, so 10 s buys about two probes an iteration and 30 s buys just
+# the opening one. Anything above 30 s measures the same single probe, so it
+# would cost cluster time and tell us nothing - to separate 60 s from 30 s the
+# iterations have to get longer, not the ladder wider.
+PROBE_SWEEP = [30]
 
 # What "receive windows are not the constraint" means for rammux, in the runs
 # where the transit window is the thing being laddered.
@@ -129,15 +144,28 @@ def rammux_ladder(bdp):
         }))
     # Starts where the smallest fixed point sits and may grow to where the
     # largest does, so it is directly comparable to both.
-    points.append(("transit-auto", {
+    autotune = {
         "transit_window": window(1 * bdp),
         "transit_window_max": window(8 * bdp),
         "stream_recv_window": window(RAMMUX_OPEN_STREAM),
         "global_recv_window": RAMMUX_OPEN_GLOBAL,
-    }))
-    return [(name, dict(protocol="rammux", probe_interval=PROBE_INTERVAL,
-                        ping_interval=PING_INTERVAL, **fields))
-            for name, fields in points]
+    }
+    points.append(("transit-auto", autotune))
+    ladder = [(name, dict(protocol="rammux", probe_interval=PROBE_INTERVAL,
+                          ping_interval=PING_INTERVAL, **fields))
+              for name, fields in points]
+
+    # The probe interval, swept where it does the most: on the autotuning
+    # point. The probe is both the cost and the value here - it stalls the
+    # connection, which lands in the latency tail, and it is what produces the
+    # clean round trip the transit window sizes itself from, so probing less
+    # often trades convergence against those stalls. On a fixed window there
+    # is nothing to converge and the sweep would only measure the cost.
+    for probe in PROBE_SWEEP:
+        ladder.append((f"transit-auto-probe-{probe}s",
+                       dict(protocol="rammux", probe_interval=probe,
+                            ping_interval=PING_INTERVAL, **autotune)))
+    return ladder
 
 
 def yamux_ladder(bdp):

@@ -29,14 +29,22 @@ land apart is the resolution of every other difference in it.
 
 | protocol | points per link |
 |---|---|
-| rammux | `off-open`, `off-tuned`, `transit-1x/2x/4x/8x`, `transit-auto` |
+| rammux | `off-open`, `off-tuned`, `transit-1x/2x/4x/8x`, `transit-auto`, `transit-auto-probe-30s` |
 | h2 | `adaptive`, `fixed-1x/2x/4x/8x` |
 | quic | `fixed-1x/2x/8x` |
 | yamux | `global-25mib`, `global-64mib` |
 
-19 runs a link, 95 over the five impaired links. Held constant, and so not
-answered here: 8 bulk streams, a 1 KiB ping pong message, TLS everywhere, and
-rammux's 5 s / 15 s probe schedule.
+20 runs a link, 100 over the five impaired links.
+
+rammux's probe interval is the second axis, swept on the autotuning point
+because that is where the probe is both the cost and the value: it stalls the
+connection on both sides, which lands in the latency tail, and it is what
+produces the clean round trip the transit window sizes itself from. The ping
+interval is not swept - it stays at 5 s, below the probe interval, which the
+schedule assumes (a refused probe backs off by one ping interval).
+
+Held constant, and so not answered here: 8 bulk streams, a 1 KiB ping pong
+message, TLS everywhere, and a 5 s ping interval.
 
 ## Running it
 
@@ -48,10 +56,10 @@ IMAGE=europe-west1-docker.pkg.dev/$PROJECT/rammux/rammux-perf:dev
 # shaped link. ~5 min, and where a wrong image or a missing RBAC verb shows up.
 ./bench.py --image "$IMAGE" --kubeconfig bench.kubeconfig --smoke
 
-# One link first. ~40 min.
+# One link first. ~45 min.
 ./bench.py --image "$IMAGE" --kubeconfig bench.kubeconfig --links wan
 
-# The rest. ~2.5 h. Skips whatever already succeeded.
+# The rest. ~2.7 h. Skips whatever already succeeded.
 ./bench.py --image "$IMAGE" --kubeconfig bench.kubeconfig
 
 # Print a results file without running anything.
