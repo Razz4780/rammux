@@ -20,9 +20,16 @@
 //! * Wi-Fi: measured 802.11 round trips of 3-5 ms, with jitter below 1 ms for
 //!   802.11n at short range rising to 18 ms at range - the variance, not the
 //!   mean, is what makes Wi-Fi hard on a congestion controller.
-//! * VPN overhead: WireGuard measured at 0.3 ms added latency and a 95 Mbit/s
-//!   ceiling in one comparison, against OpenVPN's 2.1 ms and 81 Mbit/s; a
-//!   multi-site deployment saw the average rise from 18.4 ms to 19.8 ms.
+//! * VPN cost, which is two separate things and easy to conflate. The
+//!   *crypto* is cheap: WireGuard measured at 0.3 ms added latency and a
+//!   95 Mbit/s ceiling in one comparison, against OpenVPN's 2.1 ms and
+//!   81 Mbit/s, and a multi-site deployment saw the average rise from 18.4 ms
+//!   to 19.8 ms. The *detour* is what costs, because traffic goes via a
+//!   concentrator instead of straight to the service: 5-30 ms for a nearby,
+//!   well connected server, more when it is not, and a full tunnel that has
+//!   become the bottleneck shows up as 40 ms or more against a split one.
+//!   The rate ceiling comes from the crypto, the delay almost entirely from
+//!   the detour.
 //! * Mobile broadband loss: at least half of connections stay under 1% loss,
 //!   but 15-43% of connections on the better operators exceed 0.5%, and above
 //!   2% is the accepted threshold for a path being in trouble.
@@ -100,28 +107,36 @@ impl Archetype {
                 rate_mbit: Some(50),
             },
 
-            // Wi-Fi plus a VPN hop. The round trip is small - a few ms of
-            // Wi-Fi, a couple of ms of VPN, some backhaul - but the jitter is
-            // most of it, which is the point: the delay variation is as large
-            // as the delay. 100 Mbit/s is about where WireGuard tops out in
-            // the measurements above.
+            // Office Wi-Fi, out through a VPN concentrator, on to the
+            // service. 4 ms of Wi-Fi access + 15 ms of detour, in the middle
+            // of the 5-30 ms band for a nearby concentrator, + ~1 ms of
+            // crypto. The delay is unremarkable and the variation is the
+            // point: Wi-Fi jitter reaches 18 ms at range, so 12 ms here
+            // swings the round trip between 8 and 32 ms, and a congestion
+            // controller that mistakes that for congestion will behave badly.
+            // 100 Mbit/s is where WireGuard tops out in the measurements.
             Self::WifiVpn => LinkProfile {
                 rtt: Duration::from_millis(20),
-                jitter: Duration::from_millis(15),
+                jitter: Duration::from_millis(12),
                 delay_correlation: 25,
                 loss_percent: 0.5,
                 loss_correlation: 25,
                 rate_mbit: Some(100),
             },
 
-            // A remote site: an intra-continental path with a VPN on top, so
-            // the round trip is the 60 ms path plus tunnel overhead, and the
-            // rate is the tunnel's rather than the link's.
+            // A remote site on a full tunnel: the 60 ms intra-continental
+            // path + 25 ms of detour, since a full tunnel hauls everything
+            // via the concentrator and shows up as 40 ms or more against a
+            // split one, + ~1 ms of crypto. Longer than `wifi-vpn` because
+            // the distance dominates - the tunnel adds much the same either
+            // way, and a continent is worth more delay than a wireless hop.
+            // Loss is the path's 0.5%; the tunnel has no measured loss of
+            // its own to add.
             Self::WanVpn => LinkProfile {
-                rtt: Duration::from_millis(80),
+                rtt: Duration::from_millis(85),
                 jitter: Duration::from_millis(10),
                 delay_correlation: 25,
-                loss_percent: 0.7,
+                loss_percent: 0.5,
                 loss_correlation: 25,
                 rate_mbit: Some(100),
             },
@@ -175,5 +190,88 @@ impl LinkProfile {
     pub fn bdp_bytes(&self) -> Option<u64> {
         let rate_mbit = u64::from(self.rate_mbit?);
         Some(rate_mbit * 1_000_000 / 8 * self.rtt.as_micros() as u64 / 1_000_000)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// The archetypes are meant to be a ladder, and the whole point of one is
+    /// that it is ordered. An RTT that is out of place - a VPN'd wireless hop
+    /// costing more than a continent, say - means a number was invented
+    /// rather than derived, which is how the VPN profiles went wrong once.
+    #[test]
+    fn the_archetypes_are_a_ladder() {
+        let ladder = [
+            Archetype::Datacenter,
+            Archetype::WifiVpn,
+            Archetype::Wan,
+            Archetype::WanVpn,
+            Archetype::LossyWan,
+        ];
+        let rtts: Vec<Duration> = ladder
+            .iter()
+            .map(|archetype| archetype.profile().expect("only `none` has no profile").rtt)
+            .collect();
+        assert!(
+            rtts.is_sorted(),
+            "round trips are out of order: {:?}",
+            ladder
+                .iter()
+                .map(|a| a.name())
+                .zip(&rtts)
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Adding a VPN to a path costs delay and caps the rate; it never makes
+    /// either better. Cheap to state, and it is exactly the comparison that
+    /// was wrong.
+    #[test]
+    fn a_vpn_only_ever_costs() {
+        for (bare, tunnelled) in [
+            (Archetype::Wan, Archetype::WanVpn),
+            // Wi-Fi alone is not an archetype, so this stands in for it: even
+            // a local wireless client behind a VPN beats the datacenter.
+            (Archetype::Datacenter, Archetype::WifiVpn),
+        ] {
+            let bare_profile = bare.profile().unwrap();
+            let tunnelled_profile = tunnelled.profile().unwrap();
+            assert!(
+                tunnelled_profile.rtt > bare_profile.rtt,
+                "{} should be slower than {}",
+                tunnelled.name(),
+                bare.name(),
+            );
+            let capped = tunnelled_profile.rate_mbit.expect("a tunnel has a ceiling");
+            assert!(
+                bare_profile.rate_mbit.is_none_or(|bare| capped <= bare),
+                "{} should not be faster than {}",
+                tunnelled.name(),
+                bare.name(),
+            );
+        }
+    }
+
+    /// Jitter that exceeds the delay would let netem produce a negative one.
+    #[test]
+    fn jitter_never_swallows_the_delay() {
+        for archetype in [
+            Archetype::Datacenter,
+            Archetype::Wan,
+            Archetype::LossyWan,
+            Archetype::WifiVpn,
+            Archetype::WanVpn,
+        ] {
+            let profile = archetype.profile().unwrap();
+            assert!(
+                profile.jitter < profile.rtt,
+                "{} jitter {:?} is not below its {:?} round trip",
+                archetype.name(),
+                profile.jitter,
+                profile.rtt,
+            );
+        }
     }
 }
