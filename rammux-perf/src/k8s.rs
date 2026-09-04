@@ -33,22 +33,23 @@
 //! * Credentials that may create and delete pods, jobs, services, config maps
 //!   and secrets in the namespace, `networkchaos` in `chaos-mesh.org`, and - only
 //!   if the namespace does not exist yet - namespaces.
-//!
-//! `--dry-run` prints the objects and needs none of this.
 
-use std::{path::PathBuf, time::Duration};
+use std::{path::Path, time::Duration};
 
 use anyhow::Context as _;
-use clap::Args;
 use k8s_openapi::api::{
     batch::v1::Job,
     core::v1::{ConfigMap, Namespace, Pod, Secret, Service},
 };
 use kube::{
     Api, Client,
-    api::{DeleteParams, DynamicObject, ListParams, LogParams, PostParams, PropagationPolicy},
+    api::{
+        DeleteParams, DynamicObject, ListParams, LogParams, ObjectMeta, PostParams,
+        PropagationPolicy,
+    },
     discovery,
 };
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::time::Instant;
@@ -72,71 +73,68 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// How long the server pod and the chaos injection each get to become ready.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(180);
 
-#[derive(Args, Debug)]
-pub struct K8sArgs {
+#[derive(Deserialize, JsonSchema)]
+pub struct K8sConfig {
     /// Container image with the `rammux-perf` binary as its entrypoint.
-    #[arg(long)]
     pub image: String,
 
     /// Which emulated link to run over.
-    #[arg(long)]
     pub archetype: Archetype,
 
-    /// Path to a JSON file with the muxer configuration - the `muxer` object
-    /// of a client config, tagged with its `protocol`.
-    #[arg(long)]
-    pub muxer_config: PathBuf,
+    /// Muxer configuration.
+    pub muxer_config: MuxerConfig,
 
     /// Number of iterations to run.
-    #[arg(long, default_value_t = 10)]
     pub iterations: usize,
 
     /// How many bulk streams each iteration runs.
-    #[arg(long, default_value_t = 8)]
     pub bulk_streams: usize,
 
     /// How much data each bulk stream sends, and reads back, in MiB.
-    #[arg(long, default_value_t = 16)]
     pub bulk_stream_data: usize,
 
     /// Size of the ping pong message in bytes. Omitted runs no ping pong
     /// stream, and so measures no latency.
-    #[arg(long)]
+    #[serde(default)]
     pub ping_pong_size: Option<usize>,
 
     /// Encrypt the benchmarked connection with TLS 1.3.
-    #[arg(long)]
+    #[serde(default)]
     pub tls: bool,
 
     /// How long the client job gets before the run is given up on.
-    #[arg(long, default_value_t = 900)]
+    #[serde(default = "K8sConfig::default_timeout_s")]
     pub timeout_secs: u64,
 }
 
-impl K8sArgs {
+impl K8sConfig {
+    fn default_timeout_s() -> u64 {
+        900
+    }
+
     fn timeout(&self) -> Duration {
         Duration::from_secs(self.timeout_secs)
     }
 }
 
-pub async fn run(args: &K8sArgs) -> anyhow::Result<()> {
-    // Everything that can be wrong locally is checked before the cluster is
-    // touched, so a typo in the muxer config does not leave objects behind.
-    let muxer = read_muxer_config(&args.muxer_config)?;
-    let protocol = serde_json::from_value::<MuxerConfig>(muxer.clone())
-        .expect("validated above")
-        .protocol();
+pub async fn run(config: &Path) -> anyhow::Result<()> {
+    let config = {
+        let raw = std::fs::read(config)
+            .with_context(|| format!("failed to read config at {}", config.display()))?;
+        serde_json::from_slice::<K8sConfig>(&raw)
+            .with_context(|| format!("failed to parse config at {}", config.display()))?
+    };
 
     let naming = Naming::new(format!("rammux-perf-{:08x}", rand::random::<u32>()));
-    let profile = args.archetype.profile();
+    let profile = config.archetype.profile();
 
     let client = connect().await?;
 
     tracing::info!(
         run_id = naming.run_id,
         namespace = naming.namespace,
-        archetype = args.archetype.name(),
-        protocol,
+        archetype = config.archetype.name(),
+        protocol = config.muxer_config.protocol(),
         rtt_ms = profile.map(|p| p.rtt.as_millis() as u64),
         jitter_ms = profile.map(|p| p.jitter.as_millis() as u64),
         loss_percent = profile.map(|p| p.loss_percent),
@@ -151,7 +149,7 @@ pub async fn run(args: &K8sArgs) -> anyhow::Result<()> {
             tracing::warn!("Received an exit signal, tearing down");
             Err(anyhow::anyhow!("interrupted"))
         },
-        result = execute(&client, args, &naming, &muxer) => result,
+        result = execute(&client, &config, &naming) => result,
     };
 
     // Deliberately not racing the signal: a second interrupt during
@@ -166,18 +164,36 @@ pub async fn run(args: &K8sArgs) -> anyhow::Result<()> {
     }
 
     let report = outcome?;
-    report.print(args, protocol);
+    report.print(&config);
     Ok(())
 }
 
 /// Creates everything, waits for it, and reads the result out of the job.
 async fn execute(
     client: &Client,
-    args: &K8sArgs,
+    config: &K8sConfig,
     naming: &Naming,
-    muxer: &Value,
 ) -> anyhow::Result<RunReport> {
     let ns = &naming.namespace;
+    tracing::info!(
+        namespace = ns,
+        "Creating resources in an ephemeral namespace",
+    );
+
+    Api::<Namespace>::all(client.clone())
+        .create(
+            &PostParams::default(),
+            &Namespace {
+                metadata: ObjectMeta {
+                    name: Some(naming.namespace.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .inspect(|_| tracing::info!("Created bench namespace"))
+        .context("failed to create the namespace")?;
 
     let bundle = tls::generate_cert()?;
     let cert_pem = format!(
@@ -191,6 +207,7 @@ async fn execute(
             &resources::secret(naming, &cert_pem)?,
         )
         .await
+        .inspect(|_| tracing::info!("Created shared TLS secret"))
         .context("failed to create the TLS secret")?;
 
     let config_maps = Api::<ConfigMap>::namespaced(client.clone(), ns);
@@ -200,18 +217,20 @@ async fn execute(
             &resources::config_map(
                 naming.server_config_map(),
                 naming,
-                &resources::server_config(muxer),
+                &resources::server_config(&config.muxer_config),
             )?,
         )
         .await
+        .inspect(|_| tracing::info!("Created server config map"))
         .context("failed to create the server config map")?;
 
     let pods = Api::<Pod>::namespaced(client.clone(), ns);
     pods.create(
         &PostParams::default(),
-        &resources::server_pod(naming, args)?,
+        &resources::server_pod(naming, config)?,
     )
     .await
+    .inspect(|_| tracing::info!("Created server pod"))
     .context("failed to create the server pod")?;
     let server_ip = wait_for("the server pod to be ready", SETUP_TIMEOUT, || async {
         let status = pods
@@ -240,10 +259,11 @@ async fn execute(
             &resources::config_map(
                 naming.client_config_map(),
                 naming,
-                &resources::client_config(naming, args, &server_ip, muxer),
+                &resources::client_config(naming, config, &server_ip),
             )?,
         )
         .await
+        .inspect(|_| tracing::info!("Created client config map"))
         .context("failed to create the client config map")?;
 
     // The client starts before the impairment and waits at the start gate for
@@ -253,9 +273,10 @@ async fn execute(
     let jobs = Api::<Job>::namespaced(client.clone(), ns);
     jobs.create(
         &PostParams::default(),
-        &resources::client_job(naming, args)?,
+        &resources::client_job(naming, config)?,
     )
     .await
+    .inspect(|_| tracing::info!("Created client job"))
     .context("failed to create the client job")?;
     wait_for("the client pod to be running", SETUP_TIMEOUT, || async {
         let Some(pod) = client_pod(client, naming).await? else {
@@ -270,7 +291,7 @@ async fn execute(
     .await?;
     tracing::info!("Client is running, held at the start gate");
 
-    if let Some(profile) = args.archetype.profile() {
+    if let Some(profile) = config.archetype.profile() {
         let (api_resource, _) = discovery::pinned_kind(
             client,
             &kube::core::GroupVersionKind::gvk("chaos-mesh.org", "v1alpha1", "NetworkChaos"),
@@ -283,7 +304,7 @@ async fn execute(
 
         // The chaos outlives the job by a margin, so a slow teardown cannot
         // unimpair the link while the client is still measuring it.
-        let chaos_duration = args.timeout() + Duration::from_secs(120);
+        let chaos_duration = config.timeout() + Duration::from_secs(120);
         let mut objects = vec![resources::netem_chaos(naming, &profile, chaos_duration)?];
         if let Some(rate_mbit) = profile.rate_mbit {
             objects.push(resources::bandwidth_chaos(
@@ -297,6 +318,7 @@ async fn execute(
             chaos
                 .create(&PostParams::default(), object)
                 .await
+                .inspect(|_| tracing::info!("Created NetworkChaos experiment"))
                 .context("failed to create a NetworkChaos experiment")?;
         }
         for object in &objects {
@@ -308,7 +330,7 @@ async fn execute(
             .await?;
         }
         tracing::info!(
-            archetype = args.archetype.name(),
+            archetype = config.archetype.name(),
             experiments = objects.len(),
             one_way_delay = ?profile.one_way_delay(),
             one_way_jitter = ?profile.one_way_jitter(),
@@ -327,7 +349,7 @@ async fn execute(
         "Start gate open, benchmark running",
     );
 
-    let succeeded = wait_for("the client job to finish", args.timeout(), || async {
+    let succeeded = wait_for("the client job to finish", config.timeout(), || async {
         let status = jobs
             .get(&naming.client_job())
             .await?
@@ -361,7 +383,7 @@ async fn execute(
         );
     }
     Ok(RunReport {
-        archetype: args.archetype,
+        archetype: config.archetype,
         iterations,
     })
 }
@@ -496,7 +518,7 @@ struct RunReport {
 }
 
 impl RunReport {
-    fn print(&self, args: &K8sArgs, protocol: &str) {
+    fn print(&self, config: &K8sConfig) {
         let retried = self.iterations.iter().filter(|it| it.attempt > 1).count();
         let throughput = Summary::of(self.iterations.iter().filter_map(|it| it.bulk_mbps_mean));
         let latency = Summary::of(self.iterations.iter().filter_map(|it| it.latency_ms_mean));
@@ -507,7 +529,11 @@ impl RunReport {
 
         let profile = self.archetype.profile();
         println!();
-        println!("{protocol} over {}", self.archetype.name());
+        println!(
+            "{} over {}",
+            config.muxer_config.protocol(),
+            self.archetype.name()
+        );
         match profile {
             Some(profile) => println!(
                 "  link          {:?} rtt, {:?} jitter, {}% loss, {}",
@@ -525,10 +551,10 @@ impl RunReport {
             println!("  link bdp      {bdp} bytes");
         }
         println!(
-            "  workload      {} bulk streams x {} bytes, ping pong {}",
-            args.bulk_streams,
-            args.bulk_stream_data * 1024 * 1024,
-            match args.ping_pong_size {
+            "  workload      {} bulk streams x {} MiB, ping pong {}",
+            config.bulk_streams,
+            config.bulk_stream_data,
+            match config.ping_pong_size {
                 Some(size) => format!("{size} bytes"),
                 None => "off".to_owned(),
             },
@@ -536,7 +562,7 @@ impl RunReport {
         println!(
             "  iterations    {} of {} requested ({retried} needed a retry)",
             self.iterations.len(),
-            args.iterations,
+            config.iterations,
         );
 
         // Per iteration first, because a summary hides the one iteration that
@@ -610,21 +636,6 @@ fn optional(value: Option<f64>, precision: usize) -> String {
         Some(value) => format!("{value:.precision$}"),
         None => "-".to_owned(),
     }
-}
-
-/// Reads the muxer config, failing here rather than in the cluster.
-fn read_muxer_config(path: &PathBuf) -> anyhow::Result<Value> {
-    let raw = std::fs::read(path)
-        .with_context(|| format!("failed to read the muxer config at {}", path.display()))?;
-    let value: Value = serde_json::from_slice(&raw)
-        .with_context(|| format!("failed to parse the muxer config at {}", path.display()))?;
-    serde_json::from_value::<MuxerConfig>(value.clone()).with_context(|| {
-        format!(
-            "the muxer config at {} is not a valid muxer configuration",
-            path.display()
-        )
-    })?;
-    Ok(value)
 }
 
 async fn connect() -> anyhow::Result<Client> {

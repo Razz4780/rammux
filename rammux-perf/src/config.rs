@@ -109,7 +109,7 @@ fn default_bulk_stream_data() -> NonZeroUsize {
 }
 
 /// Which multiplexer to run, and how to configure it.
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "protocol", rename_all = "lowercase")]
 pub enum MuxerConfig {
     /// rammux.

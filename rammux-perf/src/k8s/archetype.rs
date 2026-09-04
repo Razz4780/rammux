@@ -36,11 +36,12 @@
 
 use std::time::Duration;
 
-use clap::ValueEnum;
+use schemars::JsonSchema;
+use serde::Deserialize;
 
 /// Which emulated link to run the benchmark over.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-#[clap(rename_all = "kebab-case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
 pub enum Archetype {
     /// No impairment: the cluster's own network, as a control.
     None,

@@ -24,11 +24,13 @@ struct Args {
 impl Args {
     fn json_log(&self) -> bool {
         match &self.command {
-            Command::Client { command } | Command::Server { command } => match command {
-                PeerCommand::Run { json_log, .. } => *json_log,
-                PeerCommand::Schema => false,
+            Command::Client { command }
+            | Command::Server { command }
+            | Command::K8s { command } => match command {
+                CommandWithConfig::Run { json_log, .. } => *json_log,
+                CommandWithConfig::Schema => false,
             },
-            Command::K8s(..) | Command::GenerateCert => false,
+            Command::GenerateCert => false,
         }
     }
 }
@@ -40,7 +42,7 @@ enum Command {
     /// The server accepts all inbound streams and simply echoes back the data.
     Server {
         #[clap(subcommand)]
-        command: PeerCommand,
+        command: CommandWithConfig,
     },
     /// Client talking one of the benchmarked multiplexing protocols.
     ///
@@ -67,7 +69,7 @@ enum Command {
     /// retried, up to 3 times.
     Client {
         #[clap(subcommand)]
-        command: PeerCommand,
+        command: CommandWithConfig,
     },
     /// Run one benchmark on a Kubernetes cluster, over a Chaos Mesh emulated link.
     ///
@@ -78,14 +80,17 @@ enum Command {
     ///
     /// Needs Chaos Mesh installed on the cluster, and an image with this
     /// binary as its entrypoint that the cluster can pull.
-    K8s(k8s::K8sArgs),
+    K8s {
+        #[clap(subcommand)]
+        command: CommandWithConfig,
+    },
     /// Generate a self-signed certificate to be used when benchmarking protocols with TLS
     /// and print it to stdout.
     GenerateCert,
 }
 
 #[derive(Subcommand)]
-enum PeerCommand {
+enum CommandWithConfig {
     /// Print JSON schema of the configuration file.
     Schema,
     /// Run the benchmark side.
@@ -125,18 +130,23 @@ async fn main() -> ExitCode {
     let result = match args.command {
         Command::GenerateCert => generate_and_print_cert(),
         Command::Client {
-            command: PeerCommand::Schema,
+            command: CommandWithConfig::Schema,
         } => print_schema(schemars::schema_for!(config::ClientConfig)),
         Command::Client {
-            command: PeerCommand::Run { config_path, .. },
+            command: CommandWithConfig::Run { config_path, .. },
         } => client::run(&config_path).await,
         Command::Server {
-            command: PeerCommand::Schema,
+            command: CommandWithConfig::Schema,
         } => print_schema(schemars::schema_for!(config::ServerConfig)),
         Command::Server {
-            command: PeerCommand::Run { config_path, .. },
+            command: CommandWithConfig::Run { config_path, .. },
         } => server::run(&config_path).await,
-        Command::K8s(args) => k8s::run(&args).await,
+        Command::K8s {
+            command: CommandWithConfig::Schema,
+        } => print_schema(schemars::schema_for!(k8s::K8sConfig)),
+        Command::K8s {
+            command: CommandWithConfig::Run { config_path, .. },
+        } => k8s::run(&config_path).await,
     };
 
     match result {
