@@ -212,6 +212,28 @@ pub fn gate_endpoint(naming: &Naming) -> String {
     )
 }
 
+/// Keeps this run's two pods off the same node.
+///
+/// The scheduler usually spreads two pods anyway, but "usually" is not a
+/// property a measurement campaign can rest on: co-located, the client and
+/// server share a node's CPU, and CPU per byte is one of the things being
+/// compared. Required rather than preferred for the same reason - a preference
+/// silently not honoured produces numbers that look fine and are not.
+///
+/// Scoped to this run's label, so concurrent runs do not compete: each run's
+/// own pair must be split, but one run's server may share a node with
+/// another's client.
+fn anti_affinity(naming: &Naming) -> Value {
+    json!({
+        "podAntiAffinity": {
+            "requiredDuringSchedulingIgnoredDuringExecution": [{
+                "labelSelector": { "matchLabels": { RUN_LABEL: naming.run_id } },
+                "topologyKey": "kubernetes.io/hostname",
+            }],
+        },
+    })
+}
+
 /// The echo server, as a bare pod.
 ///
 /// No Deployment, because a rescheduled server mid-run would silently change
@@ -224,6 +246,7 @@ pub fn server_pod(naming: &Naming, args: &K8sArgs) -> anyhow::Result<Pod> {
         "metadata": naming.meta(naming.server_pod(), "server"),
         "spec": {
             "restartPolicy": "Never",
+            "affinity": anti_affinity(naming),
             "containers": [container(
                 "server",
                 args,
@@ -253,6 +276,7 @@ pub fn client_job(naming: &Naming, args: &K8sArgs) -> anyhow::Result<Job> {
                 "metadata": { "labels": naming.labels("client") },
                 "spec": {
                     "restartPolicy": "Never",
+                    "affinity": anti_affinity(naming),
                     "containers": [container(
                         "client",
                         args,
@@ -571,6 +595,72 @@ mod test {
             &json!({ "protocol": "rammux" }),
         );
         assert_eq!(config["await_endpoint"], endpoint);
+    }
+
+    /// Both pods have to carry the rule, and it has to be required: a
+    /// preference the scheduler quietly declines puts the client and the
+    /// server on one node's CPU, which is one of the things being measured.
+    #[test]
+    fn both_pods_are_kept_off_one_node() {
+        let naming = Naming::new("bench".to_owned());
+        let args = args();
+        let required = "/affinity/podAntiAffinity/requiredDuringSchedulingIgnoredDuringExecution/0";
+
+        let pod = server_pod(&naming, &args).unwrap();
+        assert_survives(
+            &pod,
+            &[
+                (
+                    &format!("/spec{required}/topologyKey"),
+                    json!("kubernetes.io/hostname"),
+                ),
+                (
+                    &format!(
+                        "/spec{required}/labelSelector/matchLabels/{}",
+                        RUN_LABEL.replace('/', "~1")
+                    ),
+                    json!(naming.run_id),
+                ),
+            ],
+        );
+
+        let job = client_job(&naming, &args).unwrap();
+        assert_survives(
+            &job,
+            &[
+                (
+                    &format!("/spec/template/spec{required}/topologyKey"),
+                    json!("kubernetes.io/hostname"),
+                ),
+                (
+                    &format!(
+                        "/spec/template/spec{required}/labelSelector/matchLabels/{}",
+                        RUN_LABEL.replace('/', "~1"),
+                    ),
+                    json!(naming.run_id),
+                ),
+            ],
+        );
+    }
+
+    /// Scoped to one run's id, not to the app as a whole. Two campaigns in one
+    /// namespace should split their own pairs and otherwise ignore each other;
+    /// a selector on the shared name would make every run in flight compete
+    /// for distinct nodes.
+    #[test]
+    fn the_rule_does_not_reach_beyond_its_own_run() {
+        let naming = Naming::new("bench".to_owned());
+        let selector = &anti_affinity(&naming)["podAntiAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+            [0]["labelSelector"]["matchLabels"];
+        assert_eq!(selector[RUN_LABEL], naming.run_id);
+        assert!(
+            selector.get("app.kubernetes.io/name").is_none(),
+            "the rule matches every run's pods, not just this one's: {selector}",
+        );
+        assert!(
+            selector.get(COMPONENT_LABEL).is_none(),
+            "a component-scoped rule would only split like from like: {selector}",
+        );
     }
 
     #[test]

@@ -26,6 +26,9 @@
 //!   the delay, jitter and loss in. Most distribution kernels have it as a
 //!   module; a stripped one will make the injection fail rather than quietly
 //!   run the benchmark unimpaired.
+//! * Two schedulable nodes. The run's two pods are required to land on
+//!   different ones, so that neither is measuring the other's CPU; on a
+//!   single-node cluster the client pod stays Pending and the run says so.
 //! * An image with this binary as its entrypoint that the nodes can pull.
 //! * Credentials that may create and delete pods, jobs, services, config maps
 //!   and secrets in the namespace, `networkchaos` in `chaos-mesh.org`, and - only
@@ -527,6 +530,20 @@ fn stuck_reason(status: &k8s_openapi::api::core::v1::PodStatus) -> Option<String
     ];
     if status.phase.as_deref() == Some("Failed") {
         return Some(status.reason.clone().unwrap_or_else(|| "failed".to_owned()));
+    }
+    // A pod no node will take has no containers, and so no container status to
+    // read a reason out of - it sits in Pending until the wait gives up. The
+    // scheduler's own message says why, and with anti-affinity required, "no
+    // second node" is a likely why.
+    if let Some(unschedulable) = status.conditions.iter().flatten().find(|condition| {
+        condition.type_ == "PodScheduled"
+            && condition.status == "False"
+            && condition.reason.as_deref() == Some("Unschedulable")
+    }) {
+        return Some(match &unschedulable.message {
+            Some(message) => format!("unschedulable: {message}"),
+            None => "unschedulable".to_owned(),
+        });
     }
     status
         .container_statuses
