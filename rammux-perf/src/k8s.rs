@@ -55,7 +55,7 @@ use serde_json::Value;
 use tokio::time::Instant;
 
 use crate::{
-    client::Summary,
+    client::Samples,
     config::MuxerConfig,
     k8s::{
         archetype::Archetype,
@@ -375,7 +375,7 @@ async fn execute(
     // Logs are read whether the job passed or failed: a failed run's warnings
     // are the whole reason to look.
     let logs = client_logs(client, naming).await?;
-    let iterations = parse_iterations(&logs);
+    let (iterations, samples) = parse_log(&logs);
     if !succeeded {
         anyhow::bail!(
             "the client job failed; its last log line was: {}",
@@ -385,6 +385,7 @@ async fn execute(
     Ok(RunReport {
         archetype: config.archetype,
         iterations,
+        samples,
     })
 }
 
@@ -472,60 +473,80 @@ fn stuck_reason(status: &k8s_openapi::api::core::v1::PodStatus) -> Option<String
         })
 }
 
-/// One `Iteration finished` event, as the client logs it.
-///
-/// The percentile fields are optional because an iteration that completed no
-/// ping pong exchange summarises to `NaN`, which JSON has no spelling for.
+/// One `Iteration finished` event: the iteration's own cost, not its samples.
 #[derive(Debug, Deserialize)]
-struct Iteration {
-    iteration: usize,
-    attempt: usize,
-    elapsed_ms: u64,
-    cpu_ms: u64,
-    bulk_streams: usize,
-    #[serde(default)]
-    bulk_mbps_mean: Option<f64>,
-    #[serde(default)]
-    bulk_mbps_p50: Option<f64>,
-    #[serde(default)]
-    bulk_mbps_p99: Option<f64>,
-    ping_pong_count: usize,
-    #[serde(default)]
-    latency_ms_mean: Option<f64>,
-    #[serde(default)]
-    latency_ms_p50: Option<f64>,
-    #[serde(default)]
-    latency_ms_p99: Option<f64>,
+pub(crate) struct Iteration {
+    pub iteration: usize,
+    pub attempt: usize,
+    pub elapsed_ms: u64,
+    pub cpu_ms: u64,
+    pub bulk_streams: usize,
+    pub ping_pong_count: usize,
 }
 
-/// Picks the iteration reports out of the job's JSON log.
+/// One `Bulk stream finished` event.
+#[derive(Debug, Deserialize)]
+struct BulkSample {
+    elapsed_us: u64,
+    mbps: f64,
+}
+
+/// One `Ping pong exchange finished` event.
+#[derive(Debug, Deserialize)]
+struct LatencySample {
+    elapsed_us: u64,
+}
+
+/// Reads the job's JSON log back into the samples that produced it.
+///
+/// The client logs one event per measurement rather than a per-iteration
+/// summary, so that the percentiles here are taken over every sample the run
+/// produced. Summarising per iteration and combining those would give a
+/// percentile of percentiles, which describes nothing.
 ///
 /// Anything unparseable is skipped rather than fatal: the log also carries the
-/// startup line, retry warnings and whatever the runtime had to say, and a
-/// summary is still worth printing when one line is malformed.
-fn parse_iterations(logs: &str) -> Vec<Iteration> {
-    logs.lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|line| line["fields"]["message"] == "Iteration finished")
-        .filter_map(|line| serde_json::from_value(line["fields"].clone()).ok())
-        .collect()
+/// startup line, retry warnings and whatever the runtime had to say.
+pub(crate) fn parse_log(logs: &str) -> (Vec<Iteration>, Samples) {
+    let mut iterations = Vec::new();
+    let mut samples = Samples::default();
+    for line in logs.lines() {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let fields = &entry["fields"];
+        match fields["message"].as_str() {
+            Some("Iteration finished") => {
+                if let Ok(iteration) = serde_json::from_value(fields.clone()) {
+                    iterations.push(iteration);
+                }
+            },
+            Some("Bulk stream finished") => {
+                if let Ok(sample) = serde_json::from_value::<BulkSample>(fields.clone()) {
+                    samples.bulk_mbps.push(sample.mbps);
+                    samples.bulk_elapsed_ms.push(sample.elapsed_us as f64 / 1e3);
+                }
+            },
+            Some("Ping pong exchange finished") => {
+                if let Ok(sample) = serde_json::from_value::<LatencySample>(fields.clone()) {
+                    samples.latency_ms.push(sample.elapsed_us as f64 / 1e3);
+                }
+            },
+            _ => {},
+        }
+    }
+    (iterations, samples)
 }
 
 /// What a finished run has to say.
 struct RunReport {
     archetype: Archetype,
     iterations: Vec<Iteration>,
+    samples: Samples,
 }
 
 impl RunReport {
     fn print(&self, config: &K8sConfig) {
         let retried = self.iterations.iter().filter(|it| it.attempt > 1).count();
-        let throughput = Summary::of(self.iterations.iter().filter_map(|it| it.bulk_mbps_mean));
-        let latency = Summary::of(self.iterations.iter().filter_map(|it| it.latency_ms_mean));
-        let latency_p99 = Summary::of(self.iterations.iter().filter_map(|it| it.latency_ms_p99));
-        let elapsed = Summary::of(self.iterations.iter().map(|it| it.elapsed_ms as f64));
-        let cpu = Summary::of(self.iterations.iter().map(|it| it.cpu_ms as f64));
-        let exchanges: usize = self.iterations.iter().map(|it| it.ping_pong_count).sum();
 
         let profile = self.archetype.profile();
         println!();
@@ -565,76 +586,30 @@ impl RunReport {
             config.iterations,
         );
 
-        // Per iteration first, because a summary hides the one iteration that
-        // went wrong, and on an impaired link that is usually the interesting
-        // one. Within an iteration, `p50`/`p99` are across the bulk streams
-        // and across the ping pong exchanges respectively.
+        // Per iteration first: a summary hides the one iteration that went
+        // wrong, and on an impaired link that is usually the interesting one.
+        // Only the iteration's own cost lives here - the measurements are
+        // summarised below, over every sample at once.
         println!();
         println!(
-            "  {:>4} {:>4} {:>7} {:>7} {:>9} {:>9} {:>9} {:>6} {:>8} {:>8} {:>8}",
-            "iter",
-            "try",
-            "elapsed",
-            "cpu",
-            "thr mean",
-            "thr p50",
-            "thr p99",
-            "pp n",
-            "lat mean",
-            "lat p50",
-            "lat p99",
+            "  {:>4} {:>4} {:>9} {:>7} {:>8} {:>8}",
+            "iter", "try", "elapsed", "cpu", "streams", "pp n",
         );
         for it in &self.iterations {
             println!(
-                "  {:>4} {:>4} {:>7} {:>7} {:>9} {:>9} {:>9} {:>6} {:>8} {:>8} {:>8}",
+                "  {:>4} {:>4} {:>9} {:>7} {:>8} {:>8}",
                 it.iteration,
                 it.attempt,
                 it.elapsed_ms,
                 it.cpu_ms,
-                optional(it.bulk_mbps_mean, 0),
-                optional(it.bulk_mbps_p50, 0),
-                optional(it.bulk_mbps_p99, 0),
+                it.bulk_streams,
                 it.ping_pong_count,
-                optional(it.latency_ms_mean, 3),
-                optional(it.latency_ms_p50, 3),
-                optional(it.latency_ms_p99, 3),
             );
         }
 
         println!();
-        println!("  across the {} iterations:", self.iterations.len());
-        println!("                        mean         p50         p99");
-        print_row("  throughput mbit/s ", &throughput);
-        print_row("  latency ms        ", &latency);
-        print_row("  latency ms p99    ", &latency_p99);
-        print_row("  elapsed ms        ", &elapsed);
-        print_row("  cpu ms            ", &cpu);
-        println!();
-        println!(
-            "  {} bulk streams per iteration, {exchanges} ping pong exchanges in total",
-            self.iterations
-                .first()
-                .map(|it| it.bulk_streams)
-                .unwrap_or_default(),
-        );
-        println!(
-            "  (throughput is per bulk stream; every column summarises the per-iteration means)",
-        );
-    }
-}
-
-fn print_row(label: &str, summary: &Summary) {
-    println!(
-        "{label}{:>11.1} {:>11.1} {:>11.1}",
-        summary.mean, summary.p50, summary.p99
-    );
-}
-
-/// A measurement the client had no sample for prints as `-`, not as `NaN`.
-fn optional(value: Option<f64>, precision: usize) -> String {
-    match value {
-        Some(value) => format!("{value:.precision$}"),
-        None => "-".to_owned(),
+        println!("  over every sample in the run:");
+        self.samples.print_rows();
     }
 }
 

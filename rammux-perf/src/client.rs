@@ -65,6 +65,7 @@ pub async fn run(config: &Path) -> anyhow::Result<()> {
         }
     }
 
+    let mut samples = Samples::default();
     for iteration in 1..=config.iterations.get() {
         let mut attempt = 1;
         let report = loop {
@@ -93,8 +94,18 @@ pub async fn run(config: &Path) -> anyhow::Result<()> {
                 },
             }
         };
-        report.log(iteration, attempt);
+        samples.extend(report.log(iteration, attempt));
     }
+
+    // The client is run on its own as well as under the cluster runner, so it
+    // summarises what it measured rather than leaving a wall of samples.
+    println!();
+    println!(
+        "{} over {} iterations",
+        config.muxer.protocol(),
+        config.iterations,
+    );
+    samples.print_rows();
 
     Ok(())
 }
@@ -183,6 +194,7 @@ async fn measure<M: Muxer>(muxer: M, workload: &Workload) -> anyhow::Result<Repo
         elapsed: started.elapsed(),
         cpu: cpu::cpu_time()?.saturating_sub(cpu_before),
         measurements,
+        bulk_stream_data: workload.bulk_stream_data,
     })
 }
 
@@ -191,38 +203,120 @@ struct Report {
     elapsed: Duration,
     cpu: Duration,
     measurements: Measurements,
+    /// Bytes each bulk stream sent, and read back, so a bulk sample can be
+    /// read as a rate without knowing the config.
+    bulk_stream_data: usize,
 }
 
 impl Report {
-    fn log(&self, iteration: usize, attempt: usize) {
-        let throughput = Summary::of(
-            self.measurements
-                .bulk_bytes_per_sec
-                .iter()
-                .map(|bytes_per_sec| bytes_per_sec * 8.0 / 1e6),
-        );
-        let latency = Summary::of(
-            self.measurements
-                .latencies
-                .iter()
-                .map(|latency| latency.as_secs_f64() * 1e3),
-        );
+    /// Logs one event per measurement, and one for the iteration itself.
+    ///
+    /// Per sample rather than per iteration, because percentiles over a run
+    /// have to come from every sample at once. Summarising here and averaging
+    /// the summaries later would give a p99 of p99s, which is not the p99 of
+    /// anything: with four bulk streams an iteration's p99 is just its slowest
+    /// stream, and the middle of those is not the run's tail.
+    fn log(&self, iteration: usize, attempt: usize) -> Samples {
+        let mut samples = Samples::default();
+
+        for (stream, elapsed) in self.measurements.bulk_elapsed.iter().enumerate() {
+            // Everything downstream is derived from the microseconds that get
+            // logged, so that a summary taken here and one taken from the log
+            // are the same number rather than nearly the same number.
+            let elapsed_us = micros(*elapsed);
+            let elapsed_ms = elapsed_us as f64 / 1e3;
+            // bits over microseconds is megabits over seconds, the 1e6 on each
+            // side cancelling.
+            let mbps = self.bulk_stream_data as f64 * 8.0 / elapsed_us as f64;
+            tracing::info!(
+                iteration,
+                attempt,
+                stream,
+                elapsed_us,
+                bytes = self.bulk_stream_data,
+                mbps,
+                "Bulk stream finished",
+            );
+            samples.bulk_mbps.push(mbps);
+            samples.bulk_elapsed_ms.push(elapsed_ms);
+        }
+
+        for (exchange, latency) in self.measurements.latencies.iter().enumerate() {
+            let elapsed_us = micros(*latency);
+            tracing::info!(
+                iteration,
+                attempt,
+                exchange,
+                elapsed_us,
+                "Ping pong exchange finished",
+            );
+            samples.latency_ms.push(elapsed_us as f64 / 1e3);
+        }
+
+        // The iteration's own cost, which is per iteration and not per sample.
         tracing::info!(
             iteration,
             attempt,
             elapsed_ms = millis(self.elapsed),
             cpu_ms = millis(self.cpu),
-            bulk_streams = self.measurements.bulk_bytes_per_sec.len(),
-            bulk_mbps_mean = throughput.mean,
-            bulk_mbps_p50 = throughput.p50,
-            bulk_mbps_p99 = throughput.p99,
+            bulk_streams = self.measurements.bulk_elapsed.len(),
             ping_pong_count = self.measurements.latencies.len(),
-            latency_ms_mean = latency.mean,
-            latency_ms_p50 = latency.p50,
-            latency_ms_p99 = latency.p99,
             "Iteration finished",
         );
+        samples
     }
+}
+
+/// Every sample a run produced, across all of its iterations.
+///
+/// Shared with the cluster runner, which rebuilds one of these from the job's
+/// log and summarises it the same way, so a run reports the same numbers
+/// whichever side of the cluster it was started from.
+#[derive(Default)]
+pub struct Samples {
+    /// Throughput of each bulk stream, in Mbit/s.
+    pub bulk_mbps: Vec<f64>,
+    /// How long each bulk stream took, in ms.
+    pub bulk_elapsed_ms: Vec<f64>,
+    /// Round trip of each ping pong exchange, in ms.
+    pub latency_ms: Vec<f64>,
+}
+
+impl Samples {
+    /// Folds another iteration's samples in.
+    pub fn extend(&mut self, other: Samples) {
+        self.bulk_mbps.extend(other.bulk_mbps);
+        self.bulk_elapsed_ms.extend(other.bulk_elapsed_ms);
+        self.latency_ms.extend(other.latency_ms);
+    }
+
+    /// Prints one row per metric, over every sample the run produced.
+    pub fn print_rows(&self) {
+        println!("                        mean         p50         p99       count");
+        print_row("  throughput mbit/s ", &self.bulk_mbps);
+        print_row("  bulk elapsed ms   ", &self.bulk_elapsed_ms);
+        print_row("  latency ms        ", &self.latency_ms);
+    }
+}
+
+fn print_row(label: &str, values: &[f64]) {
+    let summary = Summary::of(values.iter().copied());
+    println!(
+        "{label}{:>11.3} {:>11.3} {:>11.3} {:>11}",
+        summary.mean,
+        summary.p50,
+        summary.p99,
+        values.len(),
+    );
+}
+
+/// Whole microseconds, as a type the log fields render as a number.
+///
+/// Microseconds rather than milliseconds because a ping pong exchange on a
+/// fast link is a fraction of one, and rounding those to zero would throw the
+/// distribution away.
+fn micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 /// Whole milliseconds, as a type the log fields render as a number.
@@ -258,5 +352,110 @@ impl Summary {
             p50: percentile(50.0),
             p99: percentile(99.0),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::fmt::MakeWriter;
+
+    use super::*;
+    use crate::client::workload::Measurements;
+
+    /// Collects a subscriber's output so a test can read it back.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Capture {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The client logs the samples and the cluster runner reads them back out
+    /// of the job's log. Nothing but the field names connects the two, so a
+    /// rename on one side would leave the other quietly summarising an empty
+    /// set - a run that looks like it worked and reports nothing. This runs
+    /// the real logging through a real JSON subscriber and parses the result
+    /// with the real parser.
+    #[test]
+    fn the_cluster_runner_reads_back_what_the_client_logged() {
+        let report = Report {
+            elapsed: Duration::from_millis(1234),
+            cpu: Duration::from_millis(567),
+            measurements: Measurements {
+                bulk_elapsed: vec![
+                    Duration::from_micros(23_178),
+                    Duration::from_micros(25_003),
+                    Duration::from_micros(19_004),
+                ],
+                latencies: vec![
+                    Duration::from_micros(714),
+                    Duration::from_micros(422),
+                    Duration::from_micros(1_900),
+                ],
+            },
+            bulk_stream_data: 4 * 1024 * 1024,
+        };
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture.clone())
+            .finish();
+        let logged = tracing::subscriber::with_default(subscriber, || report.log(3, 2));
+        let raw = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+
+        let (iterations, parsed) = crate::k8s::parse_log(&raw);
+
+        assert_eq!(parsed.bulk_mbps, logged.bulk_mbps);
+        assert_eq!(parsed.bulk_elapsed_ms, logged.bulk_elapsed_ms);
+        assert_eq!(parsed.latency_ms, logged.latency_ms);
+        assert_eq!(parsed.bulk_mbps.len(), 3);
+        assert_eq!(parsed.latency_ms.len(), 3);
+        // Microseconds are the unit on the wire precisely so that a
+        // sub-millisecond exchange survives the trip.
+        assert_eq!(parsed.latency_ms[1], 0.422);
+
+        assert_eq!(
+            iterations.len(),
+            1,
+            "the iteration's own cost is logged too"
+        );
+        assert_eq!(iterations[0].iteration, 3);
+        assert_eq!(iterations[0].attempt, 2);
+        assert_eq!(iterations[0].elapsed_ms, 1234);
+        assert_eq!(iterations[0].cpu_ms, 567);
+        assert_eq!(iterations[0].bulk_streams, 3);
+        assert_eq!(iterations[0].ping_pong_count, 3);
+    }
+
+    /// A percentile has to come from the samples, not from other percentiles.
+    #[test]
+    fn percentiles_come_from_every_sample_at_once() {
+        // Two iterations of four streams. Each iteration's own p99 is its
+        // slowest stream - 10 and 100 - and the middle of those is 55. The
+        // run's real p99 is 100, which is what taking it over all eight
+        // samples gives.
+        let mut samples = Samples::default();
+        samples.bulk_mbps.extend([1.0, 2.0, 3.0, 10.0]);
+        samples.bulk_mbps.extend([4.0, 5.0, 6.0, 100.0]);
+        let p99 = Summary::of(samples.bulk_mbps.iter().copied()).p99;
+        assert_eq!(p99, 100.0, "a percentile of percentiles would give 55");
     }
 }

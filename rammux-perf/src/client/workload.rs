@@ -34,10 +34,15 @@ pub struct Workload {
 }
 
 /// What one iteration measured.
+///
+/// Raw samples, one entry per stream and per exchange, rather than anything
+/// summarised: a run is many iterations, and percentiles have to be taken
+/// over all of their samples at once. A percentile of per-iteration
+/// percentiles is not a percentile of anything.
 #[derive(Default)]
 pub struct Measurements {
-    /// Bytes each bulk stream sent per second, with its echo included in the time.
-    pub bulk_bytes_per_sec: Vec<f64>,
+    /// How long each bulk stream took to send its data and read the echo back.
+    pub bulk_elapsed: Vec<Duration>,
     /// Round trip of each completed ping pong exchange.
     pub latencies: Vec<Duration>,
 }
@@ -80,8 +85,8 @@ pub async fn run<M: Muxer>(muxer: M, workload: &Workload) -> anyhow::Result<Meas
                 },
             },
             Event::Latency(latency) => measurements.latencies.push(latency),
-            Event::BulkDone { bytes_per_sec } => {
-                measurements.bulk_bytes_per_sec.push(bytes_per_sec);
+            Event::BulkDone { elapsed } => {
+                measurements.bulk_elapsed.push(elapsed);
                 remaining_bulk -= 1;
                 if remaining_bulk == 0 {
                     // Tasks are parked on the connection's wakers, none of
@@ -128,7 +133,7 @@ enum Event<S> {
     /// The ping pong stream completed an exchange.
     Latency(Duration),
     /// A bulk stream read its echo back.
-    BulkDone { bytes_per_sec: f64 },
+    BulkDone { elapsed: Duration },
     /// The ping pong stream is closed and drained.
     PingPongDone,
     /// The connection is closed.
@@ -284,9 +289,8 @@ impl<S: MuxerStream> Bulk<S> {
                             self.total,
                         )));
                     }
-                    let elapsed = self.started.elapsed().as_secs_f64();
                     return Poll::Ready(Ok(Event::BulkDone {
-                        bytes_per_sec: self.total as f64 / elapsed,
+                        elapsed: self.started.elapsed(),
                     }));
                 },
                 Poll::Pending => {},

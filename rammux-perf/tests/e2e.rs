@@ -81,12 +81,14 @@ fn start_server(dir: &Path, (http_addr, https_addr, quic_addr): Addrs) -> (Serve
 }
 
 /// Runs the client with `muxer` and returns the per-iteration reports.
-fn run_client(
-    dir: &Path,
-    name: &str,
-    muxer: &str,
-    cert_path: Option<&str>,
-) -> Vec<serde_json::Value> {
+/// Every event the client logged, by message.
+struct ClientLog {
+    iterations: Vec<serde_json::Value>,
+    bulk: Vec<serde_json::Value>,
+    exchanges: Vec<serde_json::Value>,
+}
+
+fn run_client(dir: &Path, name: &str, muxer: &str, cert_path: Option<&str>) -> ClientLog {
     // QUIC is always encrypted and has its own address; the other three
     // choose between the plain and the TLS one.
     let (addr, tls) = match (muxer == QUIC, cert_path) {
@@ -115,11 +117,18 @@ fn run_client(
         "{name}: an iteration had to be retried:\n{logs}"
     );
 
-    logs.lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|entry| entry["fields"]["message"] == "Iteration finished")
-        .map(|entry| entry["fields"].clone())
-        .collect()
+    let of = |message: &str| -> Vec<serde_json::Value> {
+        logs.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|entry| entry["fields"]["message"] == message)
+            .map(|entry| entry["fields"].clone())
+            .collect()
+    };
+    ClientLog {
+        iterations: of("Iteration finished"),
+        bulk: of("Bulk stream finished"),
+        exchanges: of("Ping pong exchange finished"),
+    }
 }
 
 #[test]
@@ -140,26 +149,55 @@ fn every_protocol_against_one_server() {
             [false, true].as_slice()
         } {
             let name = format!("{protocol}{}", if *tls { "_tls" } else { "" });
-            let reports = run_client(dir.path(), &name, muxer, tls.then_some(cert_path.as_str()));
+            let log = run_client(dir.path(), &name, muxer, tls.then_some(cert_path.as_str()));
+
             assert_eq!(
-                reports.len(),
+                log.iterations.len(),
                 2,
                 "{name}: expected one report per iteration"
             );
-            for (i, report) in reports.iter().enumerate() {
+            for (i, report) in log.iterations.iter().enumerate() {
                 assert_eq!(report["iteration"], i + 1, "{name}");
                 assert_eq!(report["attempt"], 1, "{name}");
                 assert_eq!(report["bulk_streams"], 3, "{name}");
-                let mbps = report["bulk_mbps_p50"].as_f64().unwrap();
-                assert!(mbps > 0.0, "{name}: no throughput measured");
-                let exchanges = report["ping_pong_count"].as_u64().unwrap();
-                assert!(exchanges > 0, "{name}: no ping pong exchange completed");
-                let latency = report["latency_ms_p50"].as_f64().unwrap();
-                assert!(latency > 0.0, "{name}: no latency measured");
                 assert!(report["cpu_ms"].is_u64(), "{name}: cpu_ms is not a number");
                 assert!(
                     report["elapsed_ms"].is_u64(),
                     "{name}: elapsed_ms is not a number"
+                );
+            }
+
+            // One event per sample, not one summary per iteration: three bulk
+            // streams over two iterations is six, and every exchange gets its
+            // own. Percentiles over a run are taken from these.
+            assert_eq!(log.bulk.len(), 6, "{name}: expected a report per stream");
+            for sample in &log.bulk {
+                assert!(
+                    sample["elapsed_us"].as_u64().is_some_and(|us| us > 0),
+                    "{name}: bulk stream measured no time: {sample}",
+                );
+                assert!(
+                    sample["mbps"].as_f64().is_some_and(|mbps| mbps > 0.0),
+                    "{name}: bulk stream measured no throughput: {sample}",
+                );
+                assert_eq!(sample["bytes"], 2097152, "{name}");
+            }
+
+            let counted: u64 = log
+                .iterations
+                .iter()
+                .map(|it| it["ping_pong_count"].as_u64().unwrap())
+                .sum();
+            assert!(counted > 0, "{name}: no ping pong exchange completed");
+            assert_eq!(
+                log.exchanges.len() as u64,
+                counted,
+                "{name}: an exchange the iteration counted was never logged",
+            );
+            for sample in &log.exchanges {
+                assert!(
+                    sample["elapsed_us"].as_u64().is_some_and(|us| us > 0),
+                    "{name}: exchange measured no time: {sample}",
                 );
             }
         }
