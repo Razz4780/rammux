@@ -111,28 +111,14 @@ def window(value):
 def rammux_ladder(bdp):
     """rammux: the transit window is the axis, receive windows are held open.
 
-    Two zero-transit points, not one. `off-open` is rammux with the feature
-    disabled and its windows left where someone who had not thought about it
-    would leave them - the failure mode the transit window exists to prevent,
-    and worth having in the results. `off-tuned` is rammux with the feature
-    disabled and its receive windows sized to the link, which is the same flow
-    control yamux and h2 have; that is the baseline the transit window has to
-    beat to have earned its place.
+    The window is always on. There are no zero-transit points - rammux is not
+    being asked whether the transit window should exist, only how big it
+    should be, and rammux-without-its-flow-control is neither a configuration
+    anyone would ship nor a protocol anyone would compare against. Flow
+    control that works the other way round is what yamux, h2 and QUIC are in
+    the matrix for.
     """
-    points = [
-        ("off-open", {
-            "transit_window": 0,
-            "transit_window_max": 0,
-            "stream_recv_window": window(RAMMUX_OPEN_STREAM),
-            "global_recv_window": RAMMUX_OPEN_GLOBAL,
-        }),
-        ("off-tuned", {
-            "transit_window": 0,
-            "transit_window_max": 0,
-            "stream_recv_window": window(2 * bdp / 4),
-            "global_recv_window": int(2 * bdp),
-        }),
-    ]
+    points = []
     for mult in (1, 2, 4, 8):
         points.append((f"transit-{mult}x", {
             # Initial and cap equal: a fixed window, so the point measures the

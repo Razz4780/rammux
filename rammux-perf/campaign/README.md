@@ -29,12 +29,16 @@ land apart is the resolution of every other difference in it.
 
 | protocol | points per link |
 |---|---|
-| rammux | `off-open`, `off-tuned`, `transit-1x/2x/4x/8x`, `transit-auto`, `transit-auto-probe-30s` |
+| rammux | `transit-1x/2x/4x/8x`, `transit-auto`, `transit-auto-probe-30s` |
 | h2 | `adaptive`, `fixed-1x/2x/4x/8x` |
 | quic | `fixed-1x/2x/8x` |
 | yamux | `global-25mib`, `global-64mib` |
 
-20 runs a link, 100 over the five impaired links.
+18 runs a link, 90 over the five impaired links.
+
+rammux's transit window is always on: the ladder asks how big it should be,
+not whether it should exist. Flow control that works the other way round -
+receive windows alone - is what yamux, h2 and QUIC are in the matrix for.
 
 rammux's probe interval is the second axis, swept on the autotuning point
 because that is where the probe is both the cost and the value: it stalls the
@@ -56,10 +60,10 @@ IMAGE=europe-west1-docker.pkg.dev/$PROJECT/rammux/rammux-perf:dev
 # shaped link. ~5 min, and where a wrong image or a missing RBAC verb shows up.
 ./bench.py --image "$IMAGE" --kubeconfig bench.kubeconfig --smoke
 
-# One link first. ~45 min.
+# One link first. ~40 min.
 ./bench.py --image "$IMAGE" --kubeconfig bench.kubeconfig --links wan
 
-# The rest. ~2.7 h. Skips whatever already succeeded.
+# The rest. ~2.4 h. Skips whatever already succeeded.
 ./bench.py --image "$IMAGE" --kubeconfig bench.kubeconfig
 
 # Print a results file without running anything.
