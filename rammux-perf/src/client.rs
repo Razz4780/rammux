@@ -98,8 +98,12 @@ pub async fn run(config: &Path) -> anyhow::Result<()> {
     // This log is expected, in this format.
     let mean_bulk_elapsed = mean(&samples.bulk_elapsed);
     let mean_ping_pong_latency = mean(&samples.ping_pong_latency);
-    let p50_ping_pong_latency = percentile(&mut samples.ping_pong_latency, 0.50);
-    let p99_ping_pong_latency = percentile(&mut samples.ping_pong_latency, 0.99);
+    // `percentile` takes a percentage, so these are 50 and 99 rather than
+    // 0.50 and 0.99 - the fractions asked for the 0.5th and 0.99th
+    // percentiles, which on any sample smaller than 200 is the fastest
+    // exchange in the run, twice.
+    let p50_ping_pong_latency = percentile(&mut samples.ping_pong_latency, 50.0);
+    let p99_ping_pong_latency = percentile(&mut samples.ping_pong_latency, 99.0);
     tracing::info!(
         iterations = config.iterations.get(),
         failures,
@@ -198,6 +202,12 @@ impl Samples {
 }
 
 fn mean(values: &[Duration]) -> Duration {
+    if values.is_empty() {
+        // `div_f64(0.0)` is a NaN, and `Duration` panics on those. A run with
+        // no ping pong stream has no latencies, which is a configuration
+        // rather than a fault.
+        return Duration::ZERO;
+    }
     let sum = values.iter().copied().sum::<Duration>();
     sum.div_f64(values.len() as f64)
 }
@@ -209,4 +219,34 @@ fn percentile(values: &mut [Duration], p: f64) -> Duration {
     values.sort_unstable();
     let rank = ((p / 100.0) * values.len() as f64).ceil() as usize;
     values[rank.clamp(1, values.len()) - 1]
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// `percentile` takes a percentage, and the difference matters: asking it
+    /// for 0.50 rather than 50.0 gets the 0.5th percentile, which on any
+    /// sample smaller than 200 is the fastest exchange in the run. It is a
+    /// silent wrong answer - the number still looks like a latency - and it
+    /// makes p50 and p99 the same minimum, so every latency comparison a
+    /// campaign draws from them is noise.
+    #[test]
+    fn percentiles_are_percentages() {
+        let mut values: Vec<Duration> = (1..=100).map(Duration::from_millis).collect();
+        assert_eq!(percentile(&mut values, 50.0), Duration::from_millis(50));
+        assert_eq!(percentile(&mut values, 99.0), Duration::from_millis(99));
+        assert_eq!(percentile(&mut values, 100.0), Duration::from_millis(100));
+        // Nearest rank never falls off either end.
+        assert_eq!(percentile(&mut values, 0.0), Duration::from_millis(1));
+    }
+
+    /// An empty sample is a configuration, not a fault: a run with no ping
+    /// pong stream has no latencies. `Duration` panics on the NaN that
+    /// dividing by a zero length would produce.
+    #[test]
+    fn an_empty_sample_summarises_to_zero() {
+        assert_eq!(mean(&[]), Duration::ZERO);
+        assert_eq!(percentile(&mut [], 99.0), Duration::ZERO);
+    }
 }

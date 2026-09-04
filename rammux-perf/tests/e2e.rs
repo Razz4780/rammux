@@ -84,8 +84,8 @@ fn start_server(dir: &Path, (http_addr, https_addr, quic_addr): Addrs) -> (Serve
 /// Every event the client logged, by message.
 struct ClientLog {
     iterations: Vec<serde_json::Value>,
-    bulk: Vec<serde_json::Value>,
-    exchanges: Vec<serde_json::Value>,
+    /// The `Finished all iterations` line: the run's whole result.
+    report: serde_json::Value,
 }
 
 fn run_client(dir: &Path, name: &str, muxer: &str, cert_path: Option<&str>) -> ClientLog {
@@ -106,7 +106,7 @@ fn run_client(dir: &Path, name: &str, muxer: &str, cert_path: Option<&str>) -> C
         ),
     );
     let output = Command::new(BIN)
-        .args(["client", "run", "--json-log", "--config-path", &config])
+        .args(["--json-log", "client", "run", "--config-path", &config])
         .env("RUST_LOG", "info")
         .output()
         .unwrap();
@@ -126,8 +126,9 @@ fn run_client(dir: &Path, name: &str, muxer: &str, cert_path: Option<&str>) -> C
     };
     ClientLog {
         iterations: of("Iteration finished"),
-        bulk: of("Bulk stream finished"),
-        exchanges: of("Ping pong exchange finished"),
+        report: of("Finished all iterations")
+            .pop()
+            .unwrap_or_else(|| panic!("{name}: the client logged no final report:\n{logs}")),
     }
 }
 
@@ -154,52 +155,43 @@ fn every_protocol_against_one_server() {
             assert_eq!(
                 log.iterations.len(),
                 2,
-                "{name}: expected one report per iteration"
+                "{name}: expected one line per iteration"
             );
-            for (i, report) in log.iterations.iter().enumerate() {
-                assert_eq!(report["iteration"], i + 1, "{name}");
-                assert_eq!(report["attempt"], 1, "{name}");
-                assert_eq!(report["bulk_streams"], 3, "{name}");
-                assert!(report["cpu_ms"].is_u64(), "{name}: cpu_ms is not a number");
-                assert!(
-                    report["elapsed_ms"].is_u64(),
-                    "{name}: elapsed_ms is not a number"
-                );
+            for (i, iteration) in log.iterations.iter().enumerate() {
+                assert_eq!(iteration["iteration"], i + 1, "{name}");
             }
 
-            // One event per sample, not one summary per iteration: three bulk
-            // streams over two iterations is six, and every exchange gets its
-            // own. Percentiles over a run are taken from these.
-            assert_eq!(log.bulk.len(), 6, "{name}: expected a report per stream");
-            for sample in &log.bulk {
+            // The final line is the whole result of a cluster run: it is what
+            // `k8s::RunReport` deserializes out of the job's logs, and every
+            // number the campaign compares comes from it. So every field it
+            // names has to be there, and be a number.
+            let report = &log.report;
+            for field in [
+                "iterations",
+                "failures",
+                "mean_bulk_elapsed_micros",
+                "mean_ping_pong_latency_micros",
+                "p50_ping_pong_latency_micros",
+                "p99_ping_pong_latency_micros",
+                "completed_ping_pongs",
+            ] {
                 assert!(
-                    sample["elapsed_us"].as_u64().is_some_and(|us| us > 0),
-                    "{name}: bulk stream measured no time: {sample}",
+                    report[field].is_u64(),
+                    "{name}: {field} is missing or not a number: {report}",
                 );
-                assert!(
-                    sample["mbps"].as_f64().is_some_and(|mbps| mbps > 0.0),
-                    "{name}: bulk stream measured no throughput: {sample}",
-                );
-                assert_eq!(sample["bytes"], 2097152, "{name}");
             }
-
-            let counted: u64 = log
-                .iterations
-                .iter()
-                .map(|it| it["ping_pong_count"].as_u64().unwrap())
-                .sum();
-            assert!(counted > 0, "{name}: no ping pong exchange completed");
-            assert_eq!(
-                log.exchanges.len() as u64,
-                counted,
-                "{name}: an exchange the iteration counted was never logged",
+            assert_eq!(report["iterations"], 2, "{name}");
+            assert_eq!(report["failures"], 0, "{name}");
+            assert!(
+                report["mean_bulk_elapsed_micros"].as_u64().unwrap() > 0,
+                "{name}: the bulk streams measured no time: {report}",
             );
-            for sample in &log.exchanges {
-                assert!(
-                    sample["elapsed_us"].as_u64().is_some_and(|us| us > 0),
-                    "{name}: exchange measured no time: {sample}",
-                );
-            }
+
+            let completed = report["completed_ping_pongs"].as_u64().unwrap();
+            let p50 = report["p50_ping_pong_latency_micros"].as_u64().unwrap();
+            let p99 = report["p99_ping_pong_latency_micros"].as_u64().unwrap();
+            assert!(completed > 0, "{name}: no ping pong exchange completed");
+            assert!(p50 > 0 && p50 <= p99, "{name}: p50 {p50} vs p99 {p99}");
         }
     }
 }
@@ -233,7 +225,7 @@ fn the_start_gate_holds_the_client() {
         ),
     );
     let mut child = Command::new(BIN)
-        .args(["client", "run", "--json-log", "--config-path", &config])
+        .args(["--json-log", "client", "run", "--config-path", &config])
         .env("RUST_LOG", "info")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
