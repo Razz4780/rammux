@@ -19,7 +19,10 @@ use bytes::Bytes;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use tokio::time::Instant;
 
-use crate::client::muxer::Muxer;
+use crate::{
+    client::{Samples, muxer::Muxer},
+    cpu,
+};
 
 const CHUNK: Bytes = Bytes::from_static(&[b'X'; 256 * 1024]);
 
@@ -33,27 +36,13 @@ pub struct Workload {
     pub ping_pong_size: Option<usize>,
 }
 
-/// What one iteration measured.
-///
-/// Raw samples, one entry per stream and per exchange, rather than anything
-/// summarised: a run is many iterations, and percentiles have to be taken
-/// over all of their samples at once. A percentile of per-iteration
-/// percentiles is not a percentile of anything.
-#[derive(Default)]
-pub struct Measurements {
-    /// How long each bulk stream took to send its data and read the echo back.
-    pub bulk_elapsed: Vec<Duration>,
-    /// Round trip of each completed ping pong exchange.
-    pub latencies: Vec<Duration>,
-}
-
 /// Runs the workload on `muxer` and closes the connection.
 ///
 /// The iteration ends when every bulk stream has read its echo back. A ping
 /// pong exchange still in flight is abandoned: its stream is closed and
 /// drained rather than dropped, so the server is never mid-echo on a
 /// connection that is going away, but the exchange is not counted.
-pub async fn run<M: Muxer>(muxer: M, workload: &Workload) -> anyhow::Result<Measurements> {
+pub async fn run<M: Muxer>(muxer: M, workload: &Workload) -> anyhow::Result<Samples> {
     let streams = workload.bulk_streams + usize::from(workload.ping_pong_size.is_some());
     let mut selector: Selector<IterationTask<M>, Phase> = Selector::new(Phase::Running);
     selector.push(IterationTask::Driver(Driver {
@@ -61,7 +50,10 @@ pub async fn run<M: Muxer>(muxer: M, workload: &Workload) -> anyhow::Result<Meas
         to_open: streams,
     }));
 
-    let mut measurements = Measurements::default();
+    let mut samples = Samples::default();
+    let cpu_time_at_start = cpu::cpu_time()?;
+    let start_at = Instant::now();
+
     let mut remaining_bulk = workload.bulk_streams;
     // The ping pong stream goes first, so its samples cover the whole bulk phase.
     let mut ping_pong_pending = workload.ping_pong_size;
@@ -84,9 +76,9 @@ pub async fn run<M: Muxer>(muxer: M, workload: &Workload) -> anyhow::Result<Meas
                     )));
                 },
             },
-            Event::Latency(latency) => measurements.latencies.push(latency),
+            Event::Latency(latency) => samples.ping_pong_latency.push(latency),
             Event::BulkDone { elapsed } => {
-                measurements.bulk_elapsed.push(elapsed);
+                samples.bulk_elapsed.push(elapsed);
                 remaining_bulk -= 1;
                 if remaining_bulk == 0 {
                     // Tasks are parked on the connection's wakers, none of
@@ -109,10 +101,14 @@ pub async fn run<M: Muxer>(muxer: M, workload: &Workload) -> anyhow::Result<Meas
                     remaining_bulk == 0,
                     "the connection closed with {remaining_bulk} bulk streams unfinished"
                 );
-                return Ok(measurements);
+                break;
             },
         }
     }
+
+    samples.cpu = cpu::cpu_time()? - cpu_time_at_start;
+    samples.elapsed = start_at.elapsed();
+    Ok(samples)
 }
 
 /// What the tasks are doing, shared with all of them as the selector's strategy.

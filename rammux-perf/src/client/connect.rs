@@ -2,6 +2,7 @@
 //! hands the connection over to the multiplexer.
 
 use anyhow::Context;
+use base64::Engine;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
 use hyper::{
@@ -10,6 +11,7 @@ use hyper::{
     upgrade::Upgraded,
 };
 use hyper_util::rt::TokioIo;
+use serde::Serialize;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
@@ -22,12 +24,17 @@ use crate::{
 
 /// Connects to the server and upgrades the connection to `protocol`.
 ///
-/// `muxer_config` carries the multiplexer's configuration serialized to JSON and encoded with base64.
-pub async fn connect(
+/// `muxer_config` carries the multiplexer's configuration.
+pub async fn connect<M: Serialize>(
     config: &ClientConfig,
     protocol: &str,
-    muxer_config: Vec<u8>,
+    muxer_config: &M,
 ) -> anyhow::Result<Upgraded> {
+    let muxer_config = serde_json::to_vec(muxer_config).expect("failed to serialize muxer config");
+    let muxer_config = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(muxer_config)
+        .into_bytes();
+
     let tcp = TcpStream::connect(config.server_addr)
         .await
         .with_context(|| format!("failed to connect to {}", config.server_addr))?;

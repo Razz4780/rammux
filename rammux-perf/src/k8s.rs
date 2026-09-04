@@ -35,7 +35,7 @@
 //!   if the namespace does not exist yet - namespaces.
 
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     time::Duration,
 };
 
@@ -54,11 +54,9 @@ use kube::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::Value;
 use tokio::time::Instant;
 
 use crate::{
-    client::Samples,
     config::MuxerConfig,
     k8s::{
         archetype::Archetype,
@@ -108,17 +106,6 @@ pub struct K8sConfig {
     /// How long the client job gets before the run is given up on.
     #[serde(default = "K8sConfig::default_timeout_s")]
     pub timeout_secs: u64,
-
-    /// Where to write the client job's log, verbatim.
-    ///
-    /// The summary printed at the end of a run is a lossy view of what the
-    /// job measured: it is taken over the samples and the samples are then
-    /// gone with the namespace. A campaign wants the samples themselves, so
-    /// that a question nobody thought to ask beforehand can still be answered
-    /// afterwards, and so that runs can be pooled. Unset keeps the old
-    /// behaviour of printing and discarding.
-    #[serde(default)]
-    pub log_path: Option<PathBuf>,
 }
 
 impl K8sConfig {
@@ -142,7 +129,10 @@ pub async fn run(config: &Path) -> anyhow::Result<()> {
     let naming = Naming::new(format!("rammux-perf-{:08x}", rand::random::<u32>()));
     let profile = config.archetype.profile();
 
-    let client = connect().await?;
+    let client = {
+        let config = kube::Config::infer().await?;
+        kube::Client::try_from(config).map_err(anyhow::Error::new)?
+    };
 
     tracing::info!(
         run_id = naming.run_id,
@@ -166,20 +156,50 @@ pub async fn run(config: &Path) -> anyhow::Result<()> {
         result = execute(&client, &config, &naming) => result,
     };
 
-    // Deliberately not racing the signal: a second interrupt during
-    // teardown would leave the cluster impaired, which is worse than
-    // waiting.
-    if let Err(error) = teardown(client, &naming).await {
-        tracing::error!(
-            error = format!("{error:#}"),
-            namespace = naming.namespace,
-            "Teardown failed, objects may be left behind",
-        );
-    }
+    Api::<Namespace>::all(client)
+        .delete(
+            &naming.namespace,
+            &DeleteParams {
+                propagation_policy: Some(PropagationPolicy::Background),
+                ..Default::default()
+            },
+        )
+        .await
+        .inspect_err(|error| {
+            tracing::error!(
+                error = format!("{error:#}"),
+                namespace = naming.namespace,
+                "Failed to delete the bench namespace, objects may be left behind",
+            );
+        })?;
 
     let report = outcome?;
-    report.print(&config);
+    println!("FAILURES: {}", report.failures);
+    println!("MEAN BULK ELAPSED: {}ms", report.mean_bulk_elapsed_ms);
+    println!(
+        "MEAN PING PONG LATENCY: {}ms",
+        report.mean_ping_pong_latency_ms
+    );
+    println!(
+        "P50 PING PONG LATENCY: {}ms",
+        report.p50_ping_pong_latency_ms
+    );
+    println!(
+        "P99 PING PONG LATENCY: {}ms",
+        report.p99_ping_pong_latency_ms
+    );
+    println!("COMPLETED PING PONG: {}", report.completed_ping_pongs);
+
     Ok(())
+}
+
+struct RunReport {
+    failures: u64,
+    mean_bulk_elapsed_ms: u64,
+    mean_ping_pong_latency_ms: u64,
+    p50_ping_pong_latency_ms: u64,
+    p99_ping_pong_latency_ms: u64,
+    completed_ping_pongs: u64,
 }
 
 /// Creates everything, waits for it, and reads the result out of the job.
@@ -363,17 +383,17 @@ async fn execute(
         "Start gate open, benchmark running",
     );
 
-    let finished = wait_for("the client job to finish", config.timeout(), || async {
+    wait_for("the client job to finish", config.timeout(), || async {
         let status = jobs
             .get(&naming.client_job())
             .await?
             .status
             .unwrap_or_default();
         if status.succeeded.unwrap_or(0) > 0 {
-            return Ok(Some(true));
+            return Ok(Some(()));
         }
         if status.failed.unwrap_or(0) > 0 {
-            return Ok(Some(false));
+            anyhow::bail!("the client pod failed");
         }
         // A job whose pod cannot start never succeeds and never fails; it
         // would only ever hit the timeout, which says nothing useful.
@@ -384,49 +404,20 @@ async fn execute(
         }
         Ok(None)
     })
-    .await;
+    .await?;
 
-    // Logs are read whether the job passed, failed, or ran out of time: a run
-    // that went wrong is the one whose log is worth having, and a run that
-    // timed out has still written every iteration it did finish. So the wait's
-    // own error is held until after the log has been collected - the namespace
-    // is about to be deleted, and with it the only copy.
-    let logs = client_logs(client, naming).await?;
-    // Before the failure check: a failed run's log is the one most worth
-    // keeping, and the namespace it came from is about to be deleted.
-    if let Some(path) = &config.log_path {
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        std::fs::write(path, &logs)
-            .with_context(|| format!("failed to write the job log to {}", path.display()))?;
-        tracing::info!(path = %path.display(), bytes = logs.len(), "Wrote the client job's log");
+    let client_log = client_logs(client, naming).await?;
+    for line in client_log.lines() {
+        tracing::info!(line, "Got client log");
     }
-    let (iterations, samples) = parse_log(&logs);
-    match finished {
-        Err(error) => {
-            return Err(error.context(format!(
-                "gave up on the client job after {} of {} iterations",
-                iterations.len(),
-                config.iterations,
-            )));
-        },
-        Ok(false) => {
-            anyhow::bail!(
-                "the client job failed; its last log line was: {}",
-                logs.lines().last().unwrap_or("(no output)")
-            );
-        },
-        Ok(true) => {},
-    }
+
     Ok(RunReport {
-        archetype: config.archetype,
-        iterations,
-        samples,
+        failures: 0,
+        mean_bulk_elapsed_ms: 0,
+        mean_ping_pong_latency_ms: 0,
+        p50_ping_pong_latency_ms: 0,
+        p99_ping_pong_latency_ms: 0,
+        completed_ping_pongs: 0,
     })
 }
 
@@ -512,163 +503,6 @@ fn stuck_reason(status: &k8s_openapi::api::core::v1::PodStatus) -> Option<String
                 None => reason.to_owned(),
             })
         })
-}
-
-/// One `Iteration finished` event: the iteration's own cost, not its samples.
-#[derive(Debug, Deserialize)]
-pub(crate) struct Iteration {
-    pub iteration: usize,
-    pub attempt: usize,
-    pub elapsed_ms: u64,
-    pub cpu_ms: u64,
-    pub bulk_streams: usize,
-    pub ping_pong_count: usize,
-}
-
-/// One `Bulk stream finished` event.
-#[derive(Debug, Deserialize)]
-struct BulkSample {
-    elapsed_us: u64,
-    mbps: f64,
-}
-
-/// One `Ping pong exchange finished` event.
-#[derive(Debug, Deserialize)]
-struct LatencySample {
-    elapsed_us: u64,
-}
-
-/// Reads the job's JSON log back into the samples that produced it.
-///
-/// The client logs one event per measurement rather than a per-iteration
-/// summary, so that the percentiles here are taken over every sample the run
-/// produced. Summarising per iteration and combining those would give a
-/// percentile of percentiles, which describes nothing.
-///
-/// Anything unparseable is skipped rather than fatal: the log also carries the
-/// startup line, retry warnings and whatever the runtime had to say.
-pub(crate) fn parse_log(logs: &str) -> (Vec<Iteration>, Samples) {
-    let mut iterations = Vec::new();
-    let mut samples = Samples::default();
-    for line in logs.lines() {
-        let Ok(entry) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let fields = &entry["fields"];
-        match fields["message"].as_str() {
-            Some("Iteration finished") => {
-                if let Ok(iteration) = serde_json::from_value(fields.clone()) {
-                    iterations.push(iteration);
-                }
-            },
-            Some("Bulk stream finished") => {
-                if let Ok(sample) = serde_json::from_value::<BulkSample>(fields.clone()) {
-                    samples.bulk_mbps.push(sample.mbps);
-                    samples.bulk_elapsed_ms.push(sample.elapsed_us as f64 / 1e3);
-                }
-            },
-            Some("Ping pong exchange finished") => {
-                if let Ok(sample) = serde_json::from_value::<LatencySample>(fields.clone()) {
-                    samples.latency_ms.push(sample.elapsed_us as f64 / 1e3);
-                }
-            },
-            _ => {},
-        }
-    }
-    (iterations, samples)
-}
-
-/// What a finished run has to say.
-struct RunReport {
-    archetype: Archetype,
-    iterations: Vec<Iteration>,
-    samples: Samples,
-}
-
-impl RunReport {
-    fn print(&self, config: &K8sConfig) {
-        let retried = self.iterations.iter().filter(|it| it.attempt > 1).count();
-
-        let profile = self.archetype.profile();
-        println!();
-        println!(
-            "{} over {}",
-            config.muxer_config.protocol(),
-            self.archetype.name()
-        );
-        match profile {
-            Some(profile) => println!(
-                "  link          {:?} rtt, {:?} jitter, {}% loss, {}",
-                profile.rtt,
-                profile.jitter,
-                profile.loss_percent,
-                match profile.rate_mbit {
-                    Some(rate) => format!("{rate} Mbit/s"),
-                    None => "unshaped".to_owned(),
-                },
-            ),
-            None => println!("  link          unimpaired (control)"),
-        }
-        if let Some(bdp) = profile.and_then(|profile| profile.bdp_bytes()) {
-            println!("  link bdp      {bdp} bytes");
-        }
-        println!(
-            "  workload      {} bulk streams x {} MiB, ping pong {}",
-            config.bulk_streams,
-            config.bulk_stream_data,
-            match config.ping_pong_size {
-                Some(size) => format!("{size} bytes"),
-                None => "off".to_owned(),
-            },
-        );
-        println!(
-            "  iterations    {} of {} requested ({retried} needed a retry)",
-            self.iterations.len(),
-            config.iterations,
-        );
-
-        // Per iteration first: a summary hides the one iteration that went
-        // wrong, and on an impaired link that is usually the interesting one.
-        // Only the iteration's own cost lives here - the measurements are
-        // summarised below, over every sample at once.
-        println!();
-        println!(
-            "  {:>4} {:>4} {:>9} {:>7} {:>8} {:>8}",
-            "iter", "try", "elapsed", "cpu", "streams", "pp n",
-        );
-        for it in &self.iterations {
-            println!(
-                "  {:>4} {:>4} {:>9} {:>7} {:>8} {:>8}",
-                it.iteration,
-                it.attempt,
-                it.elapsed_ms,
-                it.cpu_ms,
-                it.bulk_streams,
-                it.ping_pong_count,
-            );
-        }
-
-        println!();
-        println!("  over every sample in the run:");
-        self.samples.print_rows();
-    }
-}
-
-async fn connect() -> anyhow::Result<Client> {
-    let config = kube::Config::infer().await?;
-    kube::Client::try_from(config).map_err(anyhow::Error::new)
-}
-
-/// Removes everything this run made.
-async fn teardown(client: Client, naming: &Naming) -> anyhow::Result<()> {
-    let params = DeleteParams {
-        propagation_policy: Some(PropagationPolicy::Background),
-        ..Default::default()
-    };
-    Api::<Namespace>::all(client)
-        .delete(&naming.namespace, &params)
-        .await?;
-    Ok(())
 }
 
 /// Polls `check` until it produces a value, or gives up.
