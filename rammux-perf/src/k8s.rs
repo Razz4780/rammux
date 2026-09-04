@@ -363,7 +363,7 @@ async fn execute(
         "Start gate open, benchmark running",
     );
 
-    let succeeded = wait_for("the client job to finish", config.timeout(), || async {
+    let finished = wait_for("the client job to finish", config.timeout(), || async {
         let status = jobs
             .get(&naming.client_job())
             .await?
@@ -384,10 +384,13 @@ async fn execute(
         }
         Ok(None)
     })
-    .await?;
+    .await;
 
-    // Logs are read whether the job passed or failed: a failed run's warnings
-    // are the whole reason to look.
+    // Logs are read whether the job passed, failed, or ran out of time: a run
+    // that went wrong is the one whose log is worth having, and a run that
+    // timed out has still written every iteration it did finish. So the wait's
+    // own error is held until after the log has been collected - the namespace
+    // is about to be deleted, and with it the only copy.
     let logs = client_logs(client, naming).await?;
     // Before the failure check: a failed run's log is the one most worth
     // keeping, and the namespace it came from is about to be deleted.
@@ -404,11 +407,21 @@ async fn execute(
         tracing::info!(path = %path.display(), bytes = logs.len(), "Wrote the client job's log");
     }
     let (iterations, samples) = parse_log(&logs);
-    if !succeeded {
-        anyhow::bail!(
-            "the client job failed; its last log line was: {}",
-            logs.lines().last().unwrap_or("(no output)")
-        );
+    match finished {
+        Err(error) => {
+            return Err(error.context(format!(
+                "gave up on the client job after {} of {} iterations",
+                iterations.len(),
+                config.iterations,
+            )));
+        },
+        Ok(false) => {
+            anyhow::bail!(
+                "the client job failed; its last log line was: {}",
+                logs.lines().last().unwrap_or("(no output)")
+            );
+        },
+        Ok(true) => {},
     }
     Ok(RunReport {
         archetype: config.archetype,

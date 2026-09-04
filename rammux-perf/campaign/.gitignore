@@ -1,0 +1,8 @@
+# Generated per campaign, from gen.py - reproducible, so not worth keeping.
+runs/
+# Raw job logs: hundreds of megabytes. A run on a 1 ms link logs one line per
+# ping pong exchange, and there are tens of thousands of them.
+results/logs/
+results/driver/
+results/summaries/
+# results/summary.jsonl is deliberately not ignored: it is the handover.
