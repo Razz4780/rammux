@@ -34,10 +34,7 @@
 //!   and secrets in the namespace, `networkchaos` in `chaos-mesh.org`, and - only
 //!   if the namespace does not exist yet - namespaces.
 
-use std::{
-    path::Path,
-    time::Duration,
-};
+use std::{path::Path, time::Duration};
 
 use anyhow::Context as _;
 use k8s_openapi::api::{
@@ -193,6 +190,7 @@ pub async fn run(config: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Deserialize)]
 struct RunReport {
     failures: u64,
     mean_bulk_elapsed_ms: u64,
@@ -200,6 +198,27 @@ struct RunReport {
     p50_ping_pong_latency_ms: u64,
     p99_ping_pong_latency_ms: u64,
     completed_ping_pongs: u64,
+}
+
+impl RunReport {
+    fn from_logs(logs: &str) -> Option<Self> {
+        logs.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find_map(|object| {
+                let serde_json::Value::Object(mut object) = object else {
+                    return None;
+                };
+                let fields = object.remove("fields")?;
+                if fields.get("message")?.as_str()? != "Finished all iterations" {
+                    return None;
+                };
+                serde_json::from_value(fields)
+                    .inspect_err(|error| {
+                        tracing::warn!(%error, "Failed to deserialize run report");
+                    })
+                    .ok()
+            })
+    }
 }
 
 /// Creates everything, waits for it, and reads the result out of the job.
@@ -406,19 +425,14 @@ async fn execute(
     })
     .await?;
 
-    let client_log = client_logs(client, naming).await?;
-    for line in client_log.lines() {
-        tracing::info!(line, "Got client log");
+    let client_logs = client_logs(client, naming).await?;
+    for line in client_logs.lines() {
+        tracing::debug!(line, "Got client log");
     }
+    let report = RunReport::from_logs(&client_logs)
+        .context("final run report was not found in the client logs")?;
 
-    Ok(RunReport {
-        failures: 0,
-        mean_bulk_elapsed_ms: 0,
-        mean_ping_pong_latency_ms: 0,
-        p50_ping_pong_latency_ms: 0,
-        p99_ping_pong_latency_ms: 0,
-        completed_ping_pongs: 0,
-    })
+    Ok(report)
 }
 
 /// Whether Chaos Mesh reports every selected pod as impaired.

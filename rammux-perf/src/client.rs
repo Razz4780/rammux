@@ -102,10 +102,10 @@ pub async fn run(config: &Path) -> anyhow::Result<()> {
     tracing::info!(
         iterations = config.iterations.get(),
         failures,
-        mean_bulk_elapsed_ms = mean_bulk_elapsed.as_millis(),
-        mean_ping_pong_latency_ms = mean_ping_pong_latency.as_millis(),
-        p50_ping_pong_latency_ms = p50_ping_pong_latency.as_millis(),
-        p99_ping_pong_latency_ms = p99_ping_pong_latency.as_millis(),
+        mean_bulk_elapsed_ms = mean_bulk_elapsed.as_millis() as u64,
+        mean_ping_pong_latency_ms = mean_ping_pong_latency.as_millis() as u64,
+        p50_ping_pong_latency_ms = p50_ping_pong_latency.as_millis() as u64,
+        p99_ping_pong_latency_ms = p99_ping_pong_latency.as_millis() as u64,
         completed_ping_pongs = samples.ping_pong_latency.len(),
         "Finished all iterations",
     );
