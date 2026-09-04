@@ -43,10 +43,8 @@ impl EchoImpl for RammuxEcho {
             TokioIo::new(conn),
             config.to_rammux_config(),
         );
-        let mut selector: Selector<RammuxTask, RttSchedule> = Selector::new(RttSchedule::new(
-            config.probe_interval(),
-            config.ping_interval(),
-        ));
+        let mut selector: Selector<RammuxTask, RttSchedule> =
+            Selector::new(config.to_rtt_schedule());
         selector.push(RammuxTask::Connection(Box::new(connection)));
         let downgraded = loop {
             match selector.next().await.unwrap() {

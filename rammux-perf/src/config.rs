@@ -10,6 +10,8 @@ use rammux::config::RammuxConfig;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::rammux_rtt::RttSchedule;
+
 /// Echo server configuration.
 #[derive(Deserialize, JsonSchema)]
 pub struct ServerConfig {
@@ -149,6 +151,10 @@ pub struct RammuxMuxerConfig {
     /// Autotune limit of the transit window, in bytes.
     pub transit_window_max: u32,
     /// Interval of the link-clearing probe, in seconds. Also its timeout.
+    ///
+    /// Ignored as an interval when `transit_window` is `0`, since a probe
+    /// only exists to size the transit window; it stays the timeout for a
+    /// probe the peer initiates.
     pub probe_interval: NonZeroU64,
     /// Interval of the plain ping, in seconds. Also its timeout.
     pub ping_interval: NonZeroU64,
@@ -174,14 +180,23 @@ impl RammuxMuxerConfig {
         config
     }
 
-    /// The probe schedule both sides run with.
-    pub fn probe_interval(&self) -> Duration {
-        Duration::from_secs(self.probe_interval.get())
-    }
-
-    /// The plain ping schedule both sides run with.
-    pub fn ping_interval(&self) -> Duration {
-        Duration::from_secs(self.ping_interval.get())
+    /// The RTT schedule both sides run with.
+    ///
+    /// Here for the same reason [`Self::to_rammux_config`] is: the client and
+    /// the server each build their own, and the two disagreeing is not
+    /// something either side can notice.
+    ///
+    /// A disabled transit window means no probes. The clean RTT a probe
+    /// measures has one consumer - the transit window is sized from it - so
+    /// with that window off the probe measures something nothing reads, and
+    /// pays for it by pausing data output on both sides for a round trip.
+    pub fn to_rtt_schedule(&self) -> RttSchedule {
+        let probe_interval = Duration::from_secs(self.probe_interval.get());
+        let ping_interval = Duration::from_secs(self.ping_interval.get());
+        match self.transit_window {
+            0 => RttSchedule::pings_only(probe_interval, ping_interval),
+            _ => RttSchedule::new(probe_interval, ping_interval),
+        }
     }
 }
 

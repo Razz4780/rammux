@@ -87,6 +87,10 @@ TIMEOUT_SECS = 900
 # probe kills the connection. At 10 s that is 50 round trips even on
 # `lossy-wan`, so the deadline is not what is being traded here - the stall
 # rate is, which is why the probe interval is an axis of its own below.
+#
+# On a point whose transit window is 0 neither value is an interval at all:
+# that connection never probes, and `probe_interval` is left as the deadline
+# for a probe the peer starts.
 PROBE_INTERVAL = 10
 PING_INTERVAL = 5
 # Probe intervals to sweep, on top of the default. A run's iteration lasts
@@ -118,6 +122,12 @@ def rammux_ladder(bdp):
     disabled and its receive windows sized to the link, which is the same flow
     control yamux and h2 have; that is the baseline the transit window has to
     beat to have earned its place.
+
+    Neither probes: a zero transit window turns the probe off, since the clean
+    round trip it measures is what sizes that window and nothing else reads
+    it. The `probe_interval` they carry is only the deadline for a probe the
+    peer starts. That makes these two the honest baseline they are meant to
+    be - they pay for none of the mechanism they are the control for.
     """
     points = [
         ("off-open", {
