@@ -90,7 +90,7 @@ impl RammuxMuxer {
                 TokioIo::new(upgraded),
                 config.to_rammux_config(),
             ))),
-            schedule: config.to_rtt_schedule(),
+            schedule: RttSchedule::new(config.probe_interval(), config.ping_interval()),
         }
     }
 }

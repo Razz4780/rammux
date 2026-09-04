@@ -42,6 +42,3 @@ yamux.workspace = true
 [dev-dependencies]
 rstest.workspace = true
 tempfile.workspace = true
-# `full` deliberately leaves out `test-util`, and the RTT schedule's tests
-# turn on hours of simulated time in milliseconds without it.
-tokio = { workspace = true, features = ["full", "test-util"] }
