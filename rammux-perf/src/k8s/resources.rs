@@ -31,6 +31,8 @@ const CERT_DIR: &str = "/etc/rammux-perf/tls";
 pub const HTTP_PORT: u16 = 8080;
 /// Port the echo server's HTTPS listener binds.
 pub const HTTPS_PORT: u16 = 8443;
+/// UDP port the echo server's QUIC listener binds.
+pub const QUIC_PORT: u16 = 8444;
 
 /// Names and labels for one run's objects.
 pub struct Naming {
@@ -126,13 +128,24 @@ pub fn config_map(name: String, naming: &Naming, config: &Value) -> anyhow::Resu
     .context("failed to build a config map")
 }
 
-/// The server's config, which is the same whatever the client runs.
-pub fn server_config() -> Value {
-    json!({
+/// The server's config.
+///
+/// Carries the muxer config only for QUIC, whose windows are transport
+/// parameters: the server has to have them before it binds, so unlike the
+/// other three it cannot learn them from the client's upgrade request. The
+/// client sends its copy anyway and the server rejects a mismatch, so writing
+/// both from `muxer` here is what keeps them equal.
+pub fn server_config(muxer: &Value) -> Value {
+    let mut config = json!({
         "http_addr": format!("0.0.0.0:{HTTP_PORT}"),
         "https_addr": format!("0.0.0.0:{HTTPS_PORT}"),
+        "quic_addr": format!("0.0.0.0:{QUIC_PORT}"),
         "cert_path": format!("{CERT_DIR}/cert.pem"),
-    })
+    });
+    if muxer["protocol"] == "quic" {
+        config["quic"] = muxer.clone();
+    }
+    config
 }
 
 /// The client's config, pointed at the server pod's own address.
@@ -140,7 +153,14 @@ pub fn server_config() -> Value {
 /// Deliberately the pod IP and not a Service: a Service would put kube-proxy's
 /// DNAT and its conntrack entry in the path, and this is a latency benchmark.
 pub fn client_config(naming: &Naming, args: &K8sArgs, server_ip: &str, muxer: &Value) -> Value {
-    let port = if args.tls { HTTPS_PORT } else { HTTP_PORT };
+    // QUIC is always encrypted and has an address of its own; the other three
+    // choose between the plain and the TLS port.
+    let quic = muxer["protocol"] == "quic";
+    let port = match (quic, args.tls) {
+        (true, _) => QUIC_PORT,
+        (false, true) => HTTPS_PORT,
+        (false, false) => HTTP_PORT,
+    };
     let mut config = json!({
         "server_addr": format!("{server_ip}:{port}"),
         "iterations": args.iterations,
@@ -152,7 +172,7 @@ pub fn client_config(naming: &Naming, args: &K8sArgs, server_ip: &str, muxer: &V
     if let Some(size) = args.ping_pong_size {
         config["ping_pong_size"] = json!(size);
     }
-    if args.tls {
+    if args.tls || quic {
         config["cert_path"] = json!(format!("{CERT_DIR}/cert.pem"));
     }
     config

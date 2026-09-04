@@ -5,11 +5,12 @@ use std::{path::Path, time::Duration};
 
 use anyhow::Context;
 use base64::Engine;
+use serde::Serialize;
 use tokio::time::Instant;
 
 use crate::{
     client::{
-        muxer::{H2Muxer, RammuxMuxer, YamuxMuxer},
+        muxer::{H2Muxer, Muxer, QuicMuxer, RammuxMuxer, YamuxMuxer},
         workload::{Measurements, Workload},
     },
     config::{ClientConfig, MuxerConfig},
@@ -129,32 +130,55 @@ async fn await_endpoint(endpoint: &str) -> anyhow::Result<()> {
 }
 
 /// Connects, runs the workload once, and closes the connection.
+///
+/// Three of the four protocols get to the multiplexer the same way, over an
+/// HTTP/1.1 upgrade that carries their config to the server. QUIC does not:
+/// it is UDP, its TLS handshake is the connection's own, and its windows are
+/// transport parameters the server has to know before the handshake - so it
+/// connects on its own terms. Only the connecting differs; what is measured
+/// afterwards is identical, which is what [`measure`] is for.
 async fn run_iteration(config: &ClientConfig, workload: &Workload) -> anyhow::Result<Report> {
-    let encoded = match &config.muxer {
-        MuxerConfig::Rammux(muxer) => serde_json::to_vec(muxer),
-        MuxerConfig::Yamux(muxer) => serde_json::to_vec(muxer),
-        MuxerConfig::H2(muxer) => serde_json::to_vec(muxer),
+    match &config.muxer {
+        MuxerConfig::Rammux(muxer) => {
+            let upgraded = upgrade(config, muxer).await?;
+            measure(RammuxMuxer::new(upgraded, muxer), workload).await
+        },
+        MuxerConfig::Yamux(muxer) => {
+            let upgraded = upgrade(config, muxer).await?;
+            measure(YamuxMuxer::new(upgraded, muxer)?, workload).await
+        },
+        MuxerConfig::H2(muxer) => {
+            let upgraded = upgrade(config, muxer).await?;
+            measure(H2Muxer::new(upgraded, muxer).await?, workload).await
+        },
+        MuxerConfig::Quic(muxer) => {
+            let connection =
+                QuicMuxer::connect(config.server_addr, config.cert_path.as_deref(), muxer).await?;
+            measure(connection, workload).await
+        },
     }
-    .expect("failed to serialize muxer config");
+}
+
+/// Upgrades a fresh HTTP/1.1 connection, carrying `muxer` to the server.
+async fn upgrade<M: Serialize>(
+    config: &ClientConfig,
+    muxer: &M,
+) -> anyhow::Result<hyper::upgrade::Upgraded> {
+    let encoded = serde_json::to_vec(muxer).expect("failed to serialize muxer config");
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(encoded)
         .into_bytes();
-    let upgraded = connect::connect(config, config.muxer.protocol(), encoded).await?;
+    connect::connect(config, config.muxer.protocol(), encoded).await
+}
 
+/// Runs the workload, timing and costing only that.
+///
+/// Connection setup is deliberately outside: every protocol pays a different
+/// handshake, and this benchmark is about what happens afterwards.
+async fn measure<M: Muxer>(muxer: M, workload: &Workload) -> anyhow::Result<Report> {
     let started = Instant::now();
     let cpu_before = cpu::cpu_time()?;
-    let measurements = match &config.muxer {
-        MuxerConfig::Rammux(muxer) => {
-            workload::run(RammuxMuxer::new(upgraded, muxer), workload).await?
-        },
-        MuxerConfig::Yamux(muxer) => {
-            workload::run(YamuxMuxer::new(upgraded, muxer)?, workload).await?
-        },
-        MuxerConfig::H2(muxer) => {
-            workload::run(H2Muxer::new(upgraded, muxer).await?, workload).await?
-        },
-    };
-
+    let measurements = workload::run(muxer, workload).await?;
     Ok(Report {
         elapsed: started.elapsed(),
         cpu: cpu::cpu_time()?.saturating_sub(cpu_before),

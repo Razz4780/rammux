@@ -243,7 +243,7 @@ async fn execute(
             &resources::config_map(
                 naming.server_config_map(),
                 naming,
-                &resources::server_config(),
+                &resources::server_config(muxer),
             )?,
         )
         .await
@@ -420,7 +420,7 @@ fn dry_run(args: &K8sArgs, naming: &Naming, muxer: &Value) -> anyhow::Result<()>
         serde_yaml_value(&resources::config_map(
             naming.server_config_map(),
             naming,
-            &resources::server_config(),
+            &resources::server_config(muxer),
         )?)?,
         serde_yaml_value(&resources::server_pod(naming, args)?)?,
         serde_yaml_value(&resources::config_map(

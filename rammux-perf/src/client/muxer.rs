@@ -3,8 +3,11 @@
 use std::{
     cell::RefCell,
     io,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::Path,
     pin::Pin,
     rc::Rc,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -19,6 +22,7 @@ use hyper::{
     upgrade::Upgraded,
 };
 use hyper_util::rt::TokioIo;
+use quinn::{Endpoint, crypto::rustls::QuicClientConfig};
 use rammux::{
     config::RammuxRole,
     connection::{Downgraded, RammuxConnection, RammuxProgress},
@@ -26,16 +30,17 @@ use rammux::{
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
 use crate::{
-    config::{H2MuxerConfig, RammuxMuxerConfig, YamuxMuxerConfig},
+    config::{H2MuxerConfig, QuicMuxerConfig, RammuxMuxerConfig, YamuxMuxerConfig},
     rammux_rtt::RttSchedule,
-    stream_util::{ChannelBody, RammuxIo},
+    stream_util::{ChannelBody, QuicDuplex, RammuxIo},
+    tls,
 };
 
 /// A multiplexed connection to the echo server.
 ///
-/// The three protocols differ in how a connection is driven, how a stream is
-/// opened and how the connection is closed; the workload does not care about
-/// any of that.
+/// The four protocols differ in how a connection is driven, how a stream is
+/// opened and how the connection is closed - and QUIC differs in how it is
+/// reached at all; the workload does not care about any of that.
 pub trait Muxer: Unpin {
     /// One logical stream over the connection.
     type Stream: Sink<Bytes, Error = io::Error> + Stream<Item = io::Result<Bytes>> + Unpin;
@@ -468,5 +473,144 @@ impl Sink<Bytes> for H2Stream {
             .outgoing
             .poll_close_unpin(cx)
             .map_err(io::Error::other)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// QUIC
+// ---------------------------------------------------------------------------
+
+/// A QUIC connection, one bidirectional stream per logical stream.
+///
+/// The odd one out in this file. QUIC carries its own TLS and its own
+/// congestion control, so there is no upgrade to ride and no plaintext
+/// variant, and `quinn` services the socket from the endpoint's own task
+/// rather than from a future the caller polls. [`Muxer::poll_drive`] therefore
+/// has nothing to move; it only watches for the connection ending, which is
+/// what driving it reports for every other protocol here.
+pub struct QuicMuxer {
+    connection: quinn::Connection,
+    /// Held only to keep it alive: dropping the endpoint stops the task that
+    /// services the socket, and the connection would go with it.
+    _endpoint: Endpoint,
+    /// Resolves when the connection ends, however it ends. Taken once it
+    /// has: [`Muxer::poll_close`] drives this to completion and then keeps
+    /// polling for the endpoint to go idle, and a resolved future must not be
+    /// polled again.
+    closed: Option<Pin<Box<dyn Future<Output = quinn::ConnectionError>>>>,
+    /// Set once the close has been asked for, so it is asked for once.
+    closing: bool,
+}
+
+impl QuicMuxer {
+    /// Connects, and hands the server the config it should be running.
+    ///
+    /// The server cannot take its windows from what the client sends: they are
+    /// transport parameters, so the handshake has already fixed them by the
+    /// time any stream data arrives. It runs from its own config instead, and
+    /// this only tells it what to compare against - a mismatch closes the
+    /// connection rather than quietly measuring two different settings.
+    pub async fn connect(
+        server_addr: SocketAddr,
+        cert_path: Option<&Path>,
+        config: &QuicMuxerConfig,
+    ) -> anyhow::Result<Self> {
+        let cert_path = cert_path.context(
+            "a QUIC run needs `cert_path`: QUIC is always encrypted, so there is no plaintext \
+             variant to run without one",
+        )?;
+        let crypto = tls::CertBundle::read(cert_path)?.client_config()?;
+        let crypto =
+            QuicClientConfig::try_from(crypto).context("the TLS config cannot be used for QUIC")?;
+        let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
+        client_config.transport_config(Arc::new(config.to_transport_config()));
+
+        // Whatever local address matches the server's family; the benchmark
+        // never needs a fixed one.
+        let bind: SocketAddr = if server_addr.is_ipv4() {
+            (Ipv4Addr::UNSPECIFIED, 0).into()
+        } else {
+            (Ipv6Addr::UNSPECIFIED, 0).into()
+        };
+        let mut endpoint = Endpoint::client(bind).context("failed to bind a QUIC socket")?;
+        endpoint.set_default_client_config(client_config);
+
+        let name = tls::server_name().to_str().into_owned();
+        let connection = endpoint
+            .connect(server_addr, &name)
+            .context("failed to start a QUIC connection")?
+            .await
+            .with_context(|| format!("QUIC handshake with {server_addr} failed"))?;
+
+        let mut control = connection
+            .open_uni()
+            .await
+            .context("failed to open the QUIC control stream")?;
+        let encoded = serde_json::to_vec(config).expect("the config serializes");
+        control
+            .write_all(&encoded)
+            .await
+            .context("failed to send the QUIC config")?;
+        control
+            .finish()
+            .context("failed to finish the QUIC control stream")?;
+
+        let closed = {
+            let connection = connection.clone();
+            Some(Box::pin(async move { connection.closed().await }) as Pin<Box<_>>)
+        };
+        Ok(Self {
+            connection,
+            _endpoint: endpoint,
+            closed,
+            closing: false,
+        })
+    }
+}
+
+impl Muxer for QuicMuxer {
+    type Stream = QuicDuplex;
+
+    fn poll_open(&mut self, cx: &mut Context<'_>) -> Poll<anyhow::Result<Self::Stream>> {
+        // `open_bi` borrows the connection, so its future cannot be parked in
+        // a field here. Both the clone and the future are cheap, and a stream
+        // is opened once, so it is rebuilt per poll instead.
+        let mut opening = Box::pin(self.connection.open_bi());
+        opening.as_mut().poll(cx).map(|result| {
+            result
+                .map(|(send, recv)| QuicDuplex::new(send, recv))
+                .context("failed to open a QUIC stream")
+        })
+    }
+
+    fn poll_drive(&mut self, cx: &mut Context<'_>) -> Poll<anyhow::Result<()>> {
+        let Some(closed) = self.closed.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        let error = std::task::ready!(closed.as_mut().poll(cx));
+        self.closed = None;
+        match error {
+            // Our own close, or the peer's clean one.
+            quinn::ConnectionError::LocallyClosed
+            | quinn::ConnectionError::ApplicationClosed(..) => Poll::Ready(Ok(())),
+            error => Poll::Ready(Err(
+                anyhow::Error::new(error).context("QUIC connection failed")
+            )),
+        }
+    }
+
+    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<anyhow::Result<()>> {
+        if !self.closing {
+            self.closing = true;
+            self.connection.close(0u32.into(), b"done");
+        }
+        // `close` puts the CONNECTION_CLOSE on the wire itself, so waiting for
+        // the connection to reach its closed state is enough for the peer to
+        // see a clean shutdown rather than a timeout.
+        //
+        // Not `Endpoint::wait_idle`, which is the obvious-looking thing to
+        // reach for: it waits until the endpoint has no connections left, and
+        // this one is still held right here, so it would never return.
+        self.poll_drive(cx)
     }
 }

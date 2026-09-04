@@ -17,6 +17,13 @@ const CERT_SAN: &str = "echo-server";
 /// The only TLS version the benchmarked protocols speak.
 const PROTOCOL_VERSIONS: &[&SupportedProtocolVersion] = &[&TLS13];
 
+/// The ALPN both sides offer.
+///
+/// Only QUIC needs it - its handshake is the connection's, so there is no
+/// upgrade request to name the protocol in - but setting it on the shared
+/// configs keeps the two paths from drifting.
+const ALPN: &[u8] = b"rammux-perf";
+
 /// Generates a self-signed certificate to be used by the echo server.
 pub fn generate_cert() -> anyhow::Result<CertifiedKey<KeyPair>> {
     rcgen::generate_simple_self_signed(vec![CERT_SAN.to_string()])
@@ -64,27 +71,40 @@ impl CertBundle {
 
     /// Builds a [`TlsAcceptor`] serving this bundle's certificate.
     pub fn acceptor(&self) -> anyhow::Result<TlsAcceptor> {
-        let config = ServerConfig::builder_with_protocol_versions(PROTOCOL_VERSIONS)
+        Ok(TlsAcceptor::from(Arc::new(self.server_config()?)))
+    }
+
+    /// The server side as `rustls` sees it, for a caller that needs the config
+    /// itself rather than an acceptor - QUIC, whose handshake is its own.
+    pub fn server_config(&self) -> anyhow::Result<ServerConfig> {
+        let mut config = ServerConfig::builder_with_protocol_versions(PROTOCOL_VERSIONS)
             .with_no_client_auth()
             .with_single_cert(self.chain.clone(), self.key.clone_key())
             .context("failed to build a TLS server config from the bundle")?;
-        Ok(TlsAcceptor::from(Arc::new(config)))
+        config.alpn_protocols = vec![ALPN.to_vec()];
+        Ok(config)
     }
 
     /// Builds a [`TlsConnector`] trusting this bundle's certificate, and nothing else.
     ///
     /// Connect with [`server_name`]; no other name is certified.
     pub fn connector(&self) -> anyhow::Result<TlsConnector> {
+        Ok(TlsConnector::from(Arc::new(self.client_config()?)))
+    }
+
+    /// The client side as `rustls` sees it, for QUIC.
+    pub fn client_config(&self) -> anyhow::Result<ClientConfig> {
         let mut roots = RootCertStore::empty();
         for cert in &self.chain {
             roots
                 .add(cert.clone())
                 .context("failed to pin the bundle's certificate as a trust root")?;
         }
-        let config = ClientConfig::builder_with_protocol_versions(PROTOCOL_VERSIONS)
+        let mut config = ClientConfig::builder_with_protocol_versions(PROTOCOL_VERSIONS)
             .with_root_certificates(roots)
             .with_no_client_auth();
-        Ok(TlsConnector::from(Arc::new(config)))
+        config.alpn_protocols = vec![ALPN.to_vec()];
+        Ok(config)
     }
 }
 

@@ -27,8 +27,30 @@ pub struct ServerConfig {
     /// `rammux`, `h2`, `yamux`. Configuration of the server's multiplexer is passed in the UPGRADE request headers.
     pub https_addr: SocketAddr,
 
+    /// Address of the server's QUIC API.
+    ///
+    /// QUIC is UDP, and its TLS handshake is the connection's own, so there is
+    /// no HTTP upgrade here and no plaintext variant - a QUIC run is always
+    /// encrypted, and compares against the other protocols' HTTPS addresses.
+    pub quic_addr: SocketAddr,
+
     /// Path to a PEM file with a TLS certificate and key to be used by the server.
     pub cert_path: PathBuf,
+
+    /// QUIC settings the server runs with.
+    ///
+    /// Defaulted, so a config for a server that will never see a QUIC client
+    /// need not spell it out.
+    ///
+    /// The odd one out: every other protocol takes its settings from the
+    /// client's upgrade request, so the two sides cannot disagree. QUIC's
+    /// windows and stream limits are transport parameters, fixed in the
+    /// handshake, so the server has to know them before a client says
+    /// anything. The client sends its copy on a control stream anyway and the
+    /// server refuses a connection whose config differs from this one, which
+    /// buys back the guarantee the header gave the others.
+    #[serde(default)]
+    pub quic: QuicMuxerConfig,
 }
 
 /// Client configuration.
@@ -96,6 +118,8 @@ pub enum MuxerConfig {
     Yamux(YamuxMuxerConfig),
     /// HTTP/2, one request per stream.
     H2(H2MuxerConfig),
+    /// QUIC, one bidirectional stream per logical stream.
+    Quic(QuicMuxerConfig),
 }
 
 impl MuxerConfig {
@@ -108,6 +132,7 @@ impl MuxerConfig {
             Self::Rammux(..) => "rammux",
             Self::Yamux(..) => "yamux",
             Self::H2(..) => "h2",
+            Self::Quic(..) => "quic",
         }
     }
 }
@@ -193,6 +218,56 @@ impl YamuxMuxerConfig {
             .set_split_send_size(16 * 1024)
             .set_read_after_close(true);
         Ok(config)
+    }
+}
+
+/// QUIC configuration. Both sides use the same values.
+///
+/// Compare with [`H2MuxerConfig`]: the same three knobs, so the two protocols
+/// can be given the same budget and the difference measured is the protocol
+/// rather than the sizing.
+#[derive(Deserialize, Serialize, JsonSchema, PartialEq, Eq, Debug)]
+#[serde(default)]
+pub struct QuicMuxerConfig {
+    /// Fixed size of each stream's receive window.
+    pub stream_recv_window: u32,
+    /// Upper limit for the total size of all streams' receive windows.
+    pub global_recv_window: u32,
+    /// Limit for the number of concurrent streams.
+    pub max_streams: u32,
+}
+
+impl Default for QuicMuxerConfig {
+    /// What `quinn` itself defaults to, near enough: a 1 MiB stream window,
+    /// 8 MiB across the connection, and 100 streams. Only reached by a server
+    /// whose config says nothing about QUIC, which is every server that is
+    /// not benchmarking it.
+    fn default() -> Self {
+        Self {
+            stream_recv_window: 1024 * 1024,
+            global_recv_window: 8 * 1024 * 1024,
+            max_streams: 100,
+        }
+    }
+}
+
+impl QuicMuxerConfig {
+    /// The [`quinn::TransportConfig`] both sides run with.
+    pub fn to_transport_config(&self) -> quinn::TransportConfig {
+        let mut config = quinn::TransportConfig::default();
+        config
+            .stream_receive_window(self.stream_recv_window.into())
+            .receive_window(self.global_recv_window.into())
+            .max_concurrent_bidi_streams(self.max_streams.into())
+            // The workload opens one uni stream, to carry the config. Nothing
+            // else uses them, and leaving the default in place would let a
+            // peer open streams this benchmark would never read.
+            .max_concurrent_uni_streams(1u32.into())
+            // Nothing here is idle: a connection that goes quiet has stalled,
+            // and should fail rather than be timed out and counted as a slow
+            // iteration.
+            .keep_alive_interval(Some(Duration::from_secs(5)));
+        config
     }
 }
 

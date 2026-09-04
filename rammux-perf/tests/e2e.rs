@@ -16,8 +16,11 @@ use tempfile::TempDir;
 const BIN: &str = env!("CARGO_BIN_EXE_rammux-perf");
 /// One port pair per test: the tests run in parallel, and two servers cannot
 /// bind the same address.
-const PROTOCOL_ADDRS: (&str, &str) = ("127.0.0.1:28080", "127.0.0.1:28443");
-const GATE_ADDRS: (&str, &str) = ("127.0.0.1:28090", "127.0.0.1:28453");
+/// Each triple is (http, https, quic); QUIC is UDP, so it may reuse a number.
+const PROTOCOL_ADDRS: Addrs = ("127.0.0.1:28080", "127.0.0.1:28443", "127.0.0.1:28444");
+const GATE_ADDRS: Addrs = ("127.0.0.1:28090", "127.0.0.1:28453", "127.0.0.1:28454");
+
+type Addrs = (&'static str, &'static str, &'static str);
 
 const RAMMUX: &str = r#"{ "protocol": "rammux",
     "stream_recv_window": 262144, "global_recv_window": 4194304,
@@ -25,6 +28,9 @@ const RAMMUX: &str = r#"{ "protocol": "rammux",
     "probe_interval": 20, "ping_interval": 5 }"#;
 const YAMUX: &str = r#"{ "protocol": "yamux", "global_recv_window": 1073741824 }"#;
 const H2: &str = r#"{ "protocol": "h2", "adaptive_window": true, "global_recv_window": 1048576, "stream_recv_window": 262144 }"#;
+/// The same budget as H2, so what is compared is the protocol, not the sizing.
+const QUIC: &str = r#"{ "protocol": "quic", "global_recv_window": 1048576,
+    "stream_recv_window": 262144, "max_streams": 128 }"#;
 
 /// The echo server, killed on drop.
 struct Server(Child);
@@ -45,7 +51,7 @@ fn write(dir: &Path, name: &str, contents: &str) -> String {
     path.display().to_string()
 }
 
-fn start_server(dir: &Path, (http_addr, https_addr): (&str, &str)) -> (Server, String) {
+fn start_server(dir: &Path, (http_addr, https_addr, quic_addr): Addrs) -> (Server, String) {
     let cert = Command::new(BIN).arg("generate-cert").output().unwrap();
     assert!(cert.status.success(), "generate-cert failed");
     let cert_path = write(dir, "cert.pem", &String::from_utf8(cert.stdout).unwrap());
@@ -53,7 +59,8 @@ fn start_server(dir: &Path, (http_addr, https_addr): (&str, &str)) -> (Server, S
         dir,
         "server.json",
         &format!(
-            r#"{{ "http_addr": "{http_addr}", "https_addr": "{https_addr}", "cert_path": "{cert_path}" }}"#
+            r#"{{ "http_addr": "{http_addr}", "https_addr": "{https_addr}",
+                "quic_addr": "{quic_addr}", "cert_path": "{cert_path}", "quic": {QUIC} }}"#
         ),
     );
     let child = Command::new(BIN)
@@ -80,9 +87,13 @@ fn run_client(
     muxer: &str,
     cert_path: Option<&str>,
 ) -> Vec<serde_json::Value> {
-    let (addr, tls) = match cert_path {
-        Some(path) => (PROTOCOL_ADDRS.1, format!(r#""cert_path": "{path}","#)),
-        None => (PROTOCOL_ADDRS.0, String::new()),
+    // QUIC is always encrypted and has its own address; the other three
+    // choose between the plain and the TLS one.
+    let (addr, tls) = match (muxer == QUIC, cert_path) {
+        (true, Some(path)) => (PROTOCOL_ADDRS.2, format!(r#""cert_path": "{path}","#)),
+        (true, None) => panic!("a QUIC run needs the certificate"),
+        (false, Some(path)) => (PROTOCOL_ADDRS.1, format!(r#""cert_path": "{path}","#)),
+        (false, None) => (PROTOCOL_ADDRS.0, String::new()),
     };
     let config = write(
         dir,
@@ -116,9 +127,19 @@ fn every_protocol_against_one_server() {
     let dir = TempDir::new().unwrap();
     let (_server, cert_path) = start_server(dir.path(), PROTOCOL_ADDRS);
 
-    for (protocol, muxer) in [("rammux", RAMMUX), ("yamux", YAMUX), ("h2", H2)] {
-        for tls in [false, true] {
-            let name = format!("{protocol}{}", if tls { "_tls" } else { "" });
+    for (protocol, muxer) in [
+        ("rammux", RAMMUX),
+        ("yamux", YAMUX),
+        ("h2", H2),
+        ("quic", QUIC),
+    ] {
+        // QUIC has no plaintext variant to run.
+        for tls in if muxer == QUIC {
+            [true].as_slice()
+        } else {
+            [false, true].as_slice()
+        } {
+            let name = format!("{protocol}{}", if *tls { "_tls" } else { "" });
             let reports = run_client(dir.path(), &name, muxer, tls.then_some(cert_path.as_str()));
             assert_eq!(
                 reports.len(),

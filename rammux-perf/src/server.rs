@@ -1,4 +1,4 @@
-use std::{future::Ready, net::SocketAddr, path::Path};
+use std::{future::Ready, net::SocketAddr, path::Path, sync::Arc};
 
 use anyhow::Context;
 use base64::Engine;
@@ -24,6 +24,7 @@ use crate::{
 
 mod h2_echo;
 mod pipe;
+mod quic_echo;
 mod rammux_echo;
 mod yamux_echo;
 
@@ -34,7 +35,13 @@ pub async fn run(config: &Path) -> anyhow::Result<()> {
         serde_json::from_slice::<ServerConfig>(&raw)
             .with_context(|| format!("failed to parse config file at {}", config.display()))?
     };
-    let acceptor = tls::CertBundle::read(&config.cert_path)?.acceptor()?;
+    let bundle = tls::CertBundle::read(&config.cert_path)?;
+    let acceptor = bundle.acceptor()?;
+    // QUIC's transport parameters are settled during the handshake, so its
+    // config has to be in hand before the listener exists - unlike the other
+    // three, which take theirs from each client's upgrade request.
+    let quic_config = Arc::new(config.quic);
+    let quic = quic_echo::endpoint(config.quic_addr, &bundle, &quic_config)?;
     let mut signal = ExitSignal::new()?;
     let http_listener = TcpListener::bind(config.http_addr)
         .await
@@ -62,6 +69,14 @@ pub async fn run(config: &Path) -> anyhow::Result<()> {
                     result.context("failed to accept a TCP connection")?,
                     true,
                 )
+            },
+
+            incoming = quic.accept() => {
+                let Some(incoming) = incoming else {
+                    break Err(anyhow::anyhow!("the QUIC listener closed"));
+                };
+                tokio::spawn(quic_echo::handle_connection(incoming, quic_config.clone()));
+                continue;
             },
         };
         stream
