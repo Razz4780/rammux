@@ -42,156 +42,77 @@ KIB = 1024
 MIB = 1024 * 1024
 
 # Every link the campaign runs over.
-#
-# `bdp` is rate x RTT in bytes - the unit every window in the ladder is a
-# multiple of - and comes straight from `LinkProfile::bdp_bytes` for the
-# shaped links. `datacenter` is unshaped and so has no BDP of its own; the
-# value below is a nominal 2 Gbit/s x 1 ms, which is the right order of
-# magnitude for pod-to-pod on a mid-size node and is only ever used as the
-# ladder's unit.
-#
-# `mib` is how much data each bulk stream moves, sized per link so an
-# iteration takes roughly 15-20 s at that link's rate: long enough that
-# connection setup is not what is being measured, short enough that the whole
-# matrix fits in an afternoon. It also sets how many latency samples a run
-# collects, since the ping pong stream stops when the last bulk stream does -
-# on `lossy-wan` that is ~100 exchanges an iteration, elsewhere many more.
-LINKS = {
-    "none":       {"bdp": 250 * 1000, "mib": 128},
-    "datacenter": {"bdp": 250 * 1000, "mib": 128},
-    "wifi-vpn":   {"bdp": 250 * 1000, "mib": 24},
-    "wan":        {"bdp": 1_500_000,  "mib": 48},
-    "wan-vpn":    {"bdp": 1_062_500,  "mib": 24},
-    "lossy-wan":  {"bdp": 1_250_000,  "mib": 16},
-}
-# `none` is the unimpaired control. It is not part of the sweep - a ladder
-# over a link with no bottleneck measures the host - so it is opted into.
-LADDER_LINKS = [link for link in LINKS if link != "none"]
+LADDER_LINKS = [
+    "datacenter",
+    "wifi-vpn",
+    "wan",        
+    "wan-vpn",    
+    "lossy-wan",  
+]
 
 # Held constant, so that the ladder is about windows and nothing else.
 BULK_STREAMS = 8
-PING_PONG_SIZE = 1 * KIB
-ITERATIONS = 3
+PING_PONG_SIZE = KIB
+ITERATIONS = 10
 TLS = True
 TIMEOUT_SECS = 900
 
-# rammux's RTT schedule. The two are not interchangeable and the ordering is
-# structural, not a convention: a link-clearing probe pauses data output on
-# both sides, so it is a whole-connection stall and has to be rare, while a
-# plain ping holds nothing back but the next probe and can be frequent. The
-# code assumes that ordering too - a probe that is refused because one is
-# already running comes back after `ping_every`, so a ping interval above the
-# probe interval would back off for longer than the probe period.
-#
-# The probe interval also doubles as the probe's deadline, and an expired
-# probe kills the connection. At 10 s that is 50 round trips even on
-# `lossy-wan`, so the deadline is not what is being traded here - the stall
-# rate is, which is why the probe interval is an axis of its own below.
-PROBE_INTERVAL = 10
+PROBE_INTERVALS = [10, 30]
 PING_INTERVAL = 5
-# Probe intervals to sweep, on top of the default. A run's iteration lasts
-# 15-20 s and every iteration opens a fresh connection whose first probe fires
-# immediately, so 10 s buys about two probes an iteration and 30 s buys just
-# the opening one. Anything above 30 s measures the same single probe, so it
-# would cost cluster time and tell us nothing - to separate 60 s from 30 s the
-# iterations have to get longer, not the ladder wider.
-PROBE_SWEEP = [30]
-
-# What "receive windows are not the constraint" means for rammux, in the runs
-# where the transit window is the thing being laddered.
-RAMMUX_OPEN_STREAM = 1 * MIB
-RAMMUX_OPEN_GLOBAL = 16 * MIB
 
 
-def window(value):
-    """Windows are u32 in the config, and none of them may be zero."""
-    return max(64 * KIB, min(int(value), 0xFFFF_FFFF))
-
-
-def rammux_ladder(bdp):
-    """rammux: the transit window is the axis, receive windows are held open.
-
-    The window is always on. There are no zero-transit points - rammux is not
-    being asked whether the transit window should exist, only how big it
-    should be, and rammux-without-its-flow-control is neither a configuration
-    anyone would ship nor a protocol anyone would compare against. Flow
-    control that works the other way round is what yamux, h2 and QUIC are in
-    the matrix for.
+def rammux_ladder():
+    """rammux: the transit window and the probe interval are the axis.
     """
     points = []
-    for mult in (1, 2, 4, 8):
-        points.append((f"transit-{mult}x", {
-            # Initial and cap equal: a fixed window, so the point measures the
-            # size rather than autotune's path to it.
-            "transit_window": window(mult * bdp),
-            "transit_window_max": window(mult * bdp),
-            "stream_recv_window": window(RAMMUX_OPEN_STREAM),
-            "global_recv_window": RAMMUX_OPEN_GLOBAL,
-        }))
-    # Starts where the smallest fixed point sits and may grow to where the
-    # largest does, so it is directly comparable to both.
-    autotune = {
-        "transit_window": window(1 * bdp),
-        "transit_window_max": window(8 * bdp),
-        "stream_recv_window": window(RAMMUX_OPEN_STREAM),
-        "global_recv_window": RAMMUX_OPEN_GLOBAL,
-    }
-    points.append(("transit-auto", autotune))
-    ladder = [(name, dict(protocol="rammux", probe_interval=PROBE_INTERVAL,
-                          ping_interval=PING_INTERVAL, **fields))
-              for name, fields in points]
+    for transit_mult in (1, 2, 4, 8):
+            points.append((f"transit-{transit_mult}x", {
+                # Initial and cap equal: a fixed window, so the point measures the
+                # size rather than autotune's path to it.
+                "transit_window": transit_mult * 64 * KIB,
+                "transit_window_max": 16 * MIB,
+                "stream_recv_window": 256 * KIB,
+                "global_recv_window": 25 * MIB - 256 * KIB * 9,
+                "ping_interval": PING_INTERVAL,
+            }))
 
-    # The probe interval, swept where it does the most: on the autotuning
-    # point. The probe is both the cost and the value here - it stalls the
-    # connection, which lands in the latency tail, and it is what produces the
-    # clean round trip the transit window sizes itself from, so probing less
-    # often trades convergence against those stalls. On a fixed window there
-    # is nothing to converge and the sweep would only measure the cost.
-    for probe in PROBE_SWEEP:
-        ladder.append((f"transit-auto-probe-{probe}s",
-                       dict(protocol="rammux", probe_interval=probe,
-                            ping_interval=PING_INTERVAL, **autotune)))
+    ladder = []
+    for probe in PROBE_INTERVALS:
+        for name, fields in points:
+            ladder.append((f"{name}-probe-{probe}s", dict(protocol="rammux", probe_interval=probe, **fields)))
     return ladder
 
 
-def yamux_ladder(bdp):
-    """yamux: two points, because there is nowhere else to go.
+def yamux_ladder():
+    """yamux: just one point, because there's nothing to configure.
 
     yamux exposes one number and asserts it is at least 256 KiB per stream;
-    with the 100-stream limit both sides run, that is a 25 MiB floor. On every
-    link here the floor is already many times the BDP - 17x on `wan` - so
-    yamux cannot be sized down to the link even in principle. The second point
-    is there to show whether going further up changes anything.
+    with the 100-stream limit both sides can run, that is a 25 MiB floor.
     """
-    del bdp
     return [
         ("global-25mib", {"protocol": "yamux", "global_recv_window": 25 * MIB}),
-        ("global-64mib", {"protocol": "yamux", "global_recv_window": 64 * MIB}),
     ]
 
 
-def h2_ladder(bdp):
-    """h2: hyper's BDP estimator, against four fixed budgets.
-
-    `adaptive` is the interesting one - the only autotuning in the comparison
-    other than rammux's, and what a real hyper deployment runs. The fixed
-    points give it something to be measured against.
+def h2_ladder():
+    """hyper h2: autotune against fixed receive windows.
     """
+
     points = [("adaptive", {
         "protocol": "h2", "adaptive_window": True,
         # Ignored when adaptive is on, but the fields are not optional.
-        "stream_recv_window": window(bdp), "global_recv_window": window(2 * bdp),
+        "stream_recv_window": 0, "global_recv_window": 0,
     })]
-    for mult in (1, 2, 4, 8):
-        points.append((f"fixed-{mult}x", {
-            "protocol": "h2", "adaptive_window": False,
-            "stream_recv_window": window(mult * bdp / 4),
-            "global_recv_window": window(mult * bdp),
-        }))
+    points.append((f"fixed-256kb", {
+        "protocol": "h2", "adaptive_window": False,
+        "stream_recv_window": 256 * KIB,
+        "global_recv_window": 25 * MIB,
+    }))
+
     return points
 
 
-def quic_ladder(bdp):
+def quic_ladder():
     """QUIC: three points, spread wide rather than dense.
 
     quinn runs its own congestion controller, so bytes in flight are bounded
@@ -201,17 +122,17 @@ def quic_ladder(bdp):
     """
     return [(f"fixed-{mult}x", {
         "protocol": "quic",
-        "stream_recv_window": window(mult * bdp / 4),
-        "global_recv_window": window(mult * bdp),
+        "stream_recv_window": mult * 64 * KIB,
+        "global_recv_window": 25 * MIB,
         "max_streams": 100,
-    }) for mult in (1, 2, 8)]
+    }) for mult in (1, 2, 4, 8)]
 
 
 LADDERS = {
-    "rammux": rammux_ladder,
-    "h2": h2_ladder,
-    "quic": quic_ladder,
-    "yamux": yamux_ladder,
+    "rammux": rammux_ladder(),
+    "h2": h2_ladder(),
+    "quic": quic_ladder(),
+    "yamux": yamux_ladder(),
 }
 
 # Three cheap runs that between them exercise everything a real one needs, so
@@ -222,7 +143,7 @@ LADDERS = {
 # others.
 SMOKE = [
     ("none", "rammux", "smoke", {
-        "protocol": "rammux", "probe_interval": PROBE_INTERVAL,
+        "protocol": "rammux", "probe_interval": PROBE_INTERVALS[0],
         "ping_interval": PING_INTERVAL, "transit_window": 256 * KIB,
         "transit_window_max": 256 * KIB, "stream_recv_window": 256 * KIB,
         "global_recv_window": 4 * MIB,
@@ -255,8 +176,7 @@ def matrix(links, protocols):
     """
     runs = []
     for link in links:
-        bdp = LINKS[link]["bdp"]
-        ladders = {name: LADDERS[name](bdp) for name in protocols}
+        ladders = {name: LADDERS[name] for name in protocols}
         block = []
         for index in range(max(len(points) for points in ladders.values())):
             for protocol in protocols:
@@ -282,7 +202,7 @@ def config_for(link, muxer, image, iterations, smoke=False):
     # A smoke run is checking that the plumbing works, not measuring anything,
     # so it moves as little data as it can get away with. Inheriting the
     # link's own sizing would make the "cheap check" a gigabyte.
-    streams, mib = (2, 4) if smoke else (BULK_STREAMS, LINKS[link]["mib"])
+    streams, mib = (2, 4) if smoke else (BULK_STREAMS, 8)
     return {
         "image": image,
         "archetype": link,
@@ -427,7 +347,7 @@ def main():
     parser.add_argument("--binary", default="rammux-perf", help="the rammux-perf to run")
     parser.add_argument("--out", type=pathlib.Path, default=pathlib.Path("results"),
                         help="directory for the configs, the results and the stderr")
-    parser.add_argument("--links", nargs="*", default=None, choices=list(LINKS),
+    parser.add_argument("--links", nargs="*", default=None, choices=LADDER_LINKS,
                         help=f"default: {' '.join(LADDER_LINKS)}")
     parser.add_argument("--protocols", nargs="*", default=list(LADDERS),
                         choices=list(LADDERS))
