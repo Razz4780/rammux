@@ -78,7 +78,7 @@ const QUIC_READ_CHUNK: usize = 64 * 1024;
 ///
 /// Both sides use it: the client for a stream it opened, the server for one it
 /// accepted. QUIC's two halves are separate objects, so this is where they are
-/// put back together into the shape the rest of the crate speaks.
+/// put back together into the shape the rest of the crate uses.
 pub struct QuicDuplex {
     send: quinn::SendStream,
     recv: quinn::RecvStream,

@@ -253,7 +253,7 @@ pub fn server_pod(naming: &Naming, args: &K8sConfig) -> anyhow::Result<Pod> {
             "containers": [container(
                 "server",
                 args,
-                json!(["server", "run", "--json-log", "--config-path", format!("{CONFIG_DIR}/config.json")]),
+                json!(["--json-log", "server", "run", "--config-path", format!("{CONFIG_DIR}/config.json")]),
             )],
             "volumes": volumes(naming, naming.server_config_map()),
         },
@@ -283,7 +283,7 @@ pub fn client_job(naming: &Naming, args: &K8sConfig) -> anyhow::Result<Job> {
                     "containers": [container(
                         "client",
                         args,
-                        json!(["client", "run", "--json-log", "--config-path", format!("{CONFIG_DIR}/config.json")]),
+                        json!(["--json-log", "client", "run", "--config-path", format!("{CONFIG_DIR}/config.json")]),
                     )],
                     "volumes": volumes(naming, naming.client_config_map()),
                 },

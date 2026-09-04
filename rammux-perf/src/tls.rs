@@ -17,13 +17,6 @@ const CERT_SAN: &str = "echo-server";
 /// The only TLS version the benchmarked protocols speak.
 const PROTOCOL_VERSIONS: &[&SupportedProtocolVersion] = &[&TLS13];
 
-/// The ALPN both sides offer.
-///
-/// Only QUIC needs it - its handshake is the connection's, so there is no
-/// upgrade request to name the protocol in - but setting it on the shared
-/// configs keeps the two paths from drifting.
-const ALPN: &[u8] = b"rammux-perf";
-
 /// Generates a self-signed certificate to be used by the echo server.
 pub fn generate_cert() -> anyhow::Result<CertifiedKey<KeyPair>> {
     rcgen::generate_simple_self_signed(vec![CERT_SAN.to_string()])
@@ -36,11 +29,6 @@ pub fn server_name() -> ServerName<'static> {
 }
 
 /// A certificate chain and its private key, as read from a PEM bundle.
-///
-/// This is the file [`generate_cert`] produces, in the layout the `generate-cert`
-/// subcommand prints it: the certificate first, its private key second. Both
-/// peers read the same bundle, because nothing but the certificate itself
-/// certifies a self-signed identity.
 pub struct CertBundle {
     chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
@@ -77,12 +65,10 @@ impl CertBundle {
     /// The server side as `rustls` sees it, for a caller that needs the config
     /// itself rather than an acceptor - QUIC, whose handshake is its own.
     pub fn server_config(&self) -> anyhow::Result<ServerConfig> {
-        let mut config = ServerConfig::builder_with_protocol_versions(PROTOCOL_VERSIONS)
+        ServerConfig::builder_with_protocol_versions(PROTOCOL_VERSIONS)
             .with_no_client_auth()
             .with_single_cert(self.chain.clone(), self.key.clone_key())
-            .context("failed to build a TLS server config from the bundle")?;
-        config.alpn_protocols = vec![ALPN.to_vec()];
-        Ok(config)
+            .context("failed to build a TLS server config from the bundle")
     }
 
     /// Builds a [`TlsConnector`] trusting this bundle's certificate, and nothing else.
@@ -100,10 +86,9 @@ impl CertBundle {
                 .add(cert.clone())
                 .context("failed to pin the bundle's certificate as a trust root")?;
         }
-        let mut config = ClientConfig::builder_with_protocol_versions(PROTOCOL_VERSIONS)
+        let config = ClientConfig::builder_with_protocol_versions(PROTOCOL_VERSIONS)
             .with_root_certificates(roots)
             .with_no_client_auth();
-        config.alpn_protocols = vec![ALPN.to_vec()];
         Ok(config)
     }
 }

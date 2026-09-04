@@ -39,7 +39,7 @@ use std::{path::Path, time::Duration};
 use anyhow::Context as _;
 use k8s_openapi::api::{
     batch::v1::Job,
-    core::v1::{ConfigMap, Namespace, Pod, Secret, Service},
+    core::v1::{ConfigMap, Namespace, Pod, PodStatus, Secret, Service},
 };
 use kube::{
     Api, Client,
@@ -172,18 +172,18 @@ pub async fn run(config: &Path) -> anyhow::Result<()> {
 
     let report = outcome?;
     println!("FAILURES: {}", report.failures);
-    println!("MEAN BULK ELAPSED: {}ms", report.mean_bulk_elapsed_ms);
+    println!("MEAN BULK ELAPSED: {}μs", report.mean_bulk_elapsed_micros);
     println!(
-        "MEAN PING PONG LATENCY: {}ms",
-        report.mean_ping_pong_latency_ms
+        "MEAN PING PONG LATENCY: {}μs",
+        report.mean_ping_pong_latency_micros
     );
     println!(
-        "P50 PING PONG LATENCY: {}ms",
-        report.p50_ping_pong_latency_ms
+        "P50 PING PONG LATENCY: {}μs",
+        report.p50_ping_pong_latency_micros
     );
     println!(
-        "P99 PING PONG LATENCY: {}ms",
-        report.p99_ping_pong_latency_ms
+        "P99 PING PONG LATENCY: {}μs",
+        report.p99_ping_pong_latency_micros
     );
     println!("COMPLETED PING PONG: {}", report.completed_ping_pongs);
 
@@ -193,10 +193,10 @@ pub async fn run(config: &Path) -> anyhow::Result<()> {
 #[derive(Deserialize)]
 struct RunReport {
     failures: u64,
-    mean_bulk_elapsed_ms: u64,
-    mean_ping_pong_latency_ms: u64,
-    p50_ping_pong_latency_ms: u64,
-    p99_ping_pong_latency_ms: u64,
+    mean_bulk_elapsed_micros: u64,
+    mean_ping_pong_latency_micros: u64,
+    p50_ping_pong_latency_micros: u64,
+    p99_ping_pong_latency_micros: u64,
     completed_ping_pongs: u64,
 }
 
@@ -478,7 +478,7 @@ async fn client_logs(client: &Client, naming: &Naming) -> anyhow::Result<String>
 /// in `Pending` indefinitely: nothing about it ever becomes ready and nothing
 /// ever fails, so without this a wrong `--image` costs the full timeout and
 /// reports only that the wait expired.
-fn stuck_reason(status: &k8s_openapi::api::core::v1::PodStatus) -> Option<String> {
+fn stuck_reason(status: &PodStatus) -> Option<String> {
     const TERMINAL: &[&str] = &[
         "ErrImagePull",
         "ImagePullBackOff",

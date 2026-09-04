@@ -95,6 +95,7 @@ pub async fn run(config: &Path) -> anyhow::Result<()> {
         }
     }
 
+    // This log is expected, in this format.
     let mean_bulk_elapsed = mean(&samples.bulk_elapsed);
     let mean_ping_pong_latency = mean(&samples.ping_pong_latency);
     let p50_ping_pong_latency = percentile(&mut samples.ping_pong_latency, 0.50);
@@ -102,10 +103,10 @@ pub async fn run(config: &Path) -> anyhow::Result<()> {
     tracing::info!(
         iterations = config.iterations.get(),
         failures,
-        mean_bulk_elapsed_ms = mean_bulk_elapsed.as_millis() as u64,
-        mean_ping_pong_latency_ms = mean_ping_pong_latency.as_millis() as u64,
-        p50_ping_pong_latency_ms = p50_ping_pong_latency.as_millis() as u64,
-        p99_ping_pong_latency_ms = p99_ping_pong_latency.as_millis() as u64,
+        mean_bulk_elapsed_micros = mean_bulk_elapsed.as_micros() as u64,
+        mean_ping_pong_latency_micros = mean_ping_pong_latency.as_micros() as u64,
+        p50_ping_pong_latency_micros = p50_ping_pong_latency.as_micros() as u64,
+        p99_ping_pong_latency_micros = p99_ping_pong_latency.as_micros() as u64,
         completed_ping_pongs = samples.ping_pong_latency.len(),
         "Finished all iterations",
     );

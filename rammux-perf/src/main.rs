@@ -17,22 +17,12 @@ mod tls;
 /// Multi-purpose CLI tool for benchmarking rammux against other multiplexing frameworks.
 #[derive(Parser)]
 struct Args {
+    /// Whether to print the logs in JSON format.
+    #[arg(long, short, env = "JSON_LOG", default_value_t = false)]
+    json_log: bool,
+
     #[clap(subcommand)]
     command: Command,
-}
-
-impl Args {
-    fn json_log(&self) -> bool {
-        match &self.command {
-            Command::Client { command }
-            | Command::Server { command }
-            | Command::K8s { command } => match command {
-                CommandWithConfig::Run { json_log, .. } => *json_log,
-                CommandWithConfig::Schema => false,
-            },
-            Command::GenerateCert => false,
-        }
-    }
 }
 
 #[derive(Subcommand)]
@@ -95,10 +85,6 @@ enum CommandWithConfig {
     Schema,
     /// Run the benchmark side.
     Run {
-        /// Whether to print the logs in JSON format.
-        #[arg(long, short, env = "JSON_LOG", default_value_t = false)]
-        json_log: bool,
-
         /// Path to the config file.
         #[arg(long, short, env = "CONFIG_PATH")]
         config_path: PathBuf,
@@ -117,7 +103,7 @@ async fn main() -> ExitCode {
         .with_file(true)
         .with_line_number(true)
         .with_writer(std::io::stderr);
-    let fmt_layer = if args.json_log() {
+    let fmt_layer = if args.json_log {
         fmt_layer.with_ansi(false).json().boxed()
     } else {
         fmt_layer.with_ansi(true).pretty().boxed()
