@@ -112,6 +112,8 @@ pub async fn run(config: &Path) -> anyhow::Result<()> {
         p50_ping_pong_latency_micros = p50_ping_pong_latency.as_micros() as u64,
         p99_ping_pong_latency_micros = p99_ping_pong_latency.as_micros() as u64,
         completed_ping_pongs = samples.ping_pong_latency.len(),
+        total_time_micros = samples.elapsed.as_micros() as u64,
+        total_cpu_time_micros = samples.cpu.as_micros() as u64,
         "Finished all iterations",
     );
 

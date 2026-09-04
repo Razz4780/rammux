@@ -186,6 +186,8 @@ pub async fn run(config: &Path) -> anyhow::Result<()> {
         report.p99_ping_pong_latency_micros
     );
     println!("COMPLETED PING PONG: {}", report.completed_ping_pongs);
+    println!("TOTAL TIME: {}μs", report.total_time_micros);
+    println!("TOTAL CPU TIME: {}μs", report.total_cpu_time_micros);
 
     Ok(())
 }
@@ -198,6 +200,8 @@ struct RunReport {
     p50_ping_pong_latency_micros: u64,
     p99_ping_pong_latency_micros: u64,
     completed_ping_pongs: u64,
+    total_time_micros: u64,
+    total_cpu_time_micros: u64,
 }
 
 impl RunReport {
