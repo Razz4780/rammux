@@ -47,11 +47,10 @@ use k8s_openapi::api::{
 use kube::{
     Api, Client,
     api::{DeleteParams, DynamicObject, ListParams, LogParams, PostParams, PropagationPolicy},
-    config::{Config, KubeConfigOptions, Kubeconfig},
     discovery,
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::time::Instant;
 
 use crate::{
@@ -79,26 +78,8 @@ pub struct K8sArgs {
     #[arg(long)]
     pub image: String,
 
-    /// Pull policy for that image.
-    #[arg(long, default_value = "IfNotPresent")]
-    pub image_pull_policy: String,
-
-    /// Namespace to run in. Created if missing, and removed again only if this
-    /// run is what created it.
-    #[arg(long, default_value = "rammux-perf")]
-    pub namespace: String,
-
-    /// Path to a kubeconfig file. Defaults to the usual resolution, and to the
-    /// in-cluster environment when running as a pod.
-    #[arg(long)]
-    pub kubeconfig: Option<PathBuf>,
-
-    /// Kubeconfig context to use.
-    #[arg(long)]
-    pub context: Option<String>,
-
     /// Which emulated link to run over.
-    #[arg(long, default_value = "datacenter")]
+    #[arg(long)]
     pub archetype: Archetype,
 
     /// Path to a JSON file with the muxer configuration - the `muxer` object
@@ -107,15 +88,15 @@ pub struct K8sArgs {
     pub muxer_config: PathBuf,
 
     /// Number of iterations to run.
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 10)]
     pub iterations: usize,
 
     /// How many bulk streams each iteration runs.
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 8)]
     pub bulk_streams: usize,
 
-    /// How much data each bulk stream sends, and reads back, in bytes.
-    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    /// How much data each bulk stream sends, and reads back, in MiB.
+    #[arg(long, default_value_t = 16)]
     pub bulk_stream_data: usize,
 
     /// Size of the ping pong message in bytes. Omitted runs no ping pong
@@ -130,18 +111,6 @@ pub struct K8sArgs {
     /// How long the client job gets before the run is given up on.
     #[arg(long, default_value_t = 900)]
     pub timeout_secs: u64,
-
-    /// Leave everything in the cluster on exit, to be inspected by hand.
-    #[arg(long)]
-    pub keep: bool,
-
-    /// Print the objects a run would create, as YAML, and create nothing.
-    ///
-    /// Needs no cluster and no credentials. Pipe it through
-    /// `kubectl apply --dry-run=server -f -` to have a real API server check
-    /// it over.
-    #[arg(long)]
-    pub dry_run: bool,
 }
 
 impl K8sArgs {
@@ -158,18 +127,14 @@ pub async fn run(args: &K8sArgs) -> anyhow::Result<()> {
         .expect("validated above")
         .protocol();
 
-    let naming = Naming::new(args.namespace.clone());
+    let naming = Naming::new(format!("rammux-perf-{:08x}", rand::random::<u32>()));
     let profile = args.archetype.profile();
 
-    if args.dry_run {
-        return dry_run(args, &naming, &muxer);
-    }
-
-    let client = connect(args).await?;
+    let client = connect().await?;
 
     tracing::info!(
         run_id = naming.run_id,
-        namespace = args.namespace,
+        namespace = naming.namespace,
         archetype = args.archetype.name(),
         protocol,
         rtt_ms = profile.map(|p| p.rtt.as_millis() as u64),
@@ -180,10 +145,6 @@ pub async fn run(args: &K8sArgs) -> anyhow::Result<()> {
         "Starting a cluster run",
     );
 
-    // Outside the interruptible section: the flag deciding whether teardown
-    // may delete the namespace must not be able to disagree with reality.
-    let created_namespace = ensure_namespace(&client, &args.namespace).await?;
-
     let mut signal = ExitSignal::new()?;
     let outcome = tokio::select! {
         () = &mut signal => {
@@ -193,22 +154,15 @@ pub async fn run(args: &K8sArgs) -> anyhow::Result<()> {
         result = execute(&client, args, &naming, &muxer) => result,
     };
 
-    if args.keep {
-        tracing::warn!(
-            selector = naming.run_selector(),
-            "Leaving every object in the cluster, as asked",
+    // Deliberately not racing the signal: a second interrupt during
+    // teardown would leave the cluster impaired, which is worse than
+    // waiting.
+    if let Err(error) = teardown(client, &naming).await {
+        tracing::error!(
+            error = format!("{error:#}"),
+            namespace = naming.namespace,
+            "Teardown failed, objects may be left behind",
         );
-    } else {
-        // Deliberately not racing the signal: a second interrupt during
-        // teardown would leave the cluster impaired, which is worse than
-        // waiting.
-        if let Err(error) = teardown(&client, args, &naming, created_namespace).await {
-            tracing::error!(
-                error = format!("{error:#}"),
-                selector = naming.run_selector(),
-                "Teardown failed, objects may be left behind",
-            );
-        }
     }
 
     let report = outcome?;
@@ -223,7 +177,7 @@ async fn execute(
     naming: &Naming,
     muxer: &Value,
 ) -> anyhow::Result<RunReport> {
-    let ns = &args.namespace;
+    let ns = &naming.namespace;
 
     let bundle = tls::generate_cert()?;
     let cert_pem = format!(
@@ -304,7 +258,7 @@ async fn execute(
     .await
     .context("failed to create the client job")?;
     wait_for("the client pod to be running", SETUP_TIMEOUT, || async {
-        let Some(pod) = client_pod(client, args, naming).await? else {
+        let Some(pod) = client_pod(client, naming).await? else {
             return Ok(None);
         };
         let status = pod.status.unwrap_or_default();
@@ -387,7 +341,7 @@ async fn execute(
         }
         // A job whose pod cannot start never succeeds and never fails; it
         // would only ever hit the timeout, which says nothing useful.
-        if let Some(pod) = client_pod(client, args, naming).await?
+        if let Some(pod) = client_pod(client, naming).await?
             && let Some(reason) = stuck_reason(&pod.status.unwrap_or_default())
         {
             anyhow::bail!("the client pod cannot start: {reason}");
@@ -398,7 +352,7 @@ async fn execute(
 
     // Logs are read whether the job passed or failed: a failed run's warnings
     // are the whole reason to look.
-    let logs = client_logs(client, args, naming).await?;
+    let logs = client_logs(client, naming).await?;
     let iterations = parse_iterations(&logs);
     if !succeeded {
         anyhow::bail!(
@@ -412,66 +366,6 @@ async fn execute(
     })
 }
 
-/// Prints what a run would create, without a cluster or credentials.
-///
-/// The client's config normally names the server pod's address, which is only
-/// known once that pod is running, so here it gets a placeholder.
-fn dry_run(args: &K8sArgs, naming: &Naming, muxer: &Value) -> anyhow::Result<()> {
-    const PLACEHOLDER_IP: &str = "0.0.0.0";
-
-    let mut documents = vec![
-        serde_yaml_value(&resources::config_map(
-            naming.server_config_map(),
-            naming,
-            &resources::server_config(muxer),
-        )?)?,
-        serde_yaml_value(&resources::server_pod(naming, args)?)?,
-        serde_yaml_value(&resources::config_map(
-            naming.client_config_map(),
-            naming,
-            &resources::client_config(naming, args, PLACEHOLDER_IP, muxer),
-        )?)?,
-        serde_yaml_value(&resources::client_job(naming, args)?)?,
-    ];
-    if let Some(profile) = args.archetype.profile() {
-        let duration = args.timeout() + Duration::from_secs(120);
-        documents.push(serde_yaml_value(&resources::netem_chaos(
-            naming, &profile, duration,
-        )?)?);
-        if let Some(rate_mbit) = profile.rate_mbit {
-            documents.push(serde_yaml_value(&resources::bandwidth_chaos(
-                naming, &profile, rate_mbit, duration,
-            )?)?);
-        }
-    }
-    documents.push(serde_yaml_value(&resources::gate_service(naming)?)?);
-
-    println!(
-        "# rammux-perf run {}, archetype {}",
-        naming.run_id,
-        args.archetype.name()
-    );
-    println!("# the TLS secret is omitted: its contents are generated per run");
-    println!(
-        "# the client's server_addr is a placeholder, filled in once the server pod has an IP"
-    );
-    for document in documents {
-        println!("---");
-        print!("{document}");
-    }
-    Ok(())
-}
-
-/// Serializes an object the way `kubectl` would show it.
-///
-/// JSON is valid YAML, so this needs no YAML dependency; it is pretty-printed
-/// so the output is readable rather than one line per object.
-fn serde_yaml_value<T: serde::Serialize>(object: &T) -> anyhow::Result<String> {
-    let mut rendered = serde_json::to_string_pretty(object)?;
-    rendered.push('\n');
-    Ok(rendered)
-}
-
 /// Whether Chaos Mesh reports every selected pod as impaired.
 fn all_injected(object: &DynamicObject) -> bool {
     object.data["status"]["conditions"]
@@ -482,12 +376,8 @@ fn all_injected(object: &DynamicObject) -> bool {
 }
 
 /// The pod the client job produced, once it has produced one.
-async fn client_pod(
-    client: &Client,
-    args: &K8sArgs,
-    naming: &Naming,
-) -> anyhow::Result<Option<Pod>> {
-    let listed = Api::<Pod>::namespaced(client.clone(), &args.namespace)
+async fn client_pod(client: &Client, naming: &Naming) -> anyhow::Result<Option<Pod>> {
+    let listed = Api::<Pod>::namespaced(client.clone(), &naming.namespace)
         .list(&ListParams::default().labels(&format!(
             "{},{COMPONENT_LABEL}=client",
             naming.run_selector()
@@ -498,8 +388,8 @@ async fn client_pod(
 }
 
 /// Everything the client job wrote.
-async fn client_logs(client: &Client, args: &K8sArgs, naming: &Naming) -> anyhow::Result<String> {
-    let pod = client_pod(client, args, naming)
+async fn client_logs(client: &Client, naming: &Naming) -> anyhow::Result<String> {
+    let pod = client_pod(client, naming)
         .await?
         .context("the client job produced no pod")?;
     let name = pod
@@ -507,7 +397,7 @@ async fn client_logs(client: &Client, args: &K8sArgs, naming: &Naming) -> anyhow
         .name
         .as_deref()
         .context("client pod has no name")?;
-    Api::<Pod>::namespaced(client.clone(), &args.namespace)
+    Api::<Pod>::namespaced(client.clone(), &naming.namespace)
         .logs(name, &LogParams::default())
         .await
         .context("failed to read the client job's logs")
@@ -637,7 +527,7 @@ impl RunReport {
         println!(
             "  workload      {} bulk streams x {} bytes, ping pong {}",
             args.bulk_streams,
-            args.bulk_stream_data,
+            args.bulk_stream_data * 1024 * 1024,
             match args.ping_pong_size {
                 Some(size) => format!("{size} bytes"),
                 None => "off".to_owned(),
@@ -737,118 +627,21 @@ fn read_muxer_config(path: &PathBuf) -> anyhow::Result<Value> {
     Ok(value)
 }
 
-async fn connect(args: &K8sArgs) -> anyhow::Result<Client> {
-    let options = KubeConfigOptions {
-        context: args.context.clone(),
-        ..Default::default()
-    };
-    let config = match &args.kubeconfig {
-        Some(path) => {
-            let kubeconfig = Kubeconfig::read_from(path)
-                .with_context(|| format!("failed to read kubeconfig at {}", path.display()))?;
-            Config::from_custom_kubeconfig(kubeconfig, &options)
-                .await
-                .context("failed to build a client from the given kubeconfig")?
-        },
-        None => Config::from_kubeconfig(&options)
-            .await
-            .or_else(|error| {
-                // In a pod there is no kubeconfig, and the service account is
-                // the right thing to fall back to.
-                Config::incluster().map_err(|_| error)
-            })
-            .context("failed to find cluster credentials")?,
-    };
-    Client::try_from(config).context("failed to build a Kubernetes client")
-}
-
-/// Returns whether this run is what created the namespace.
-async fn ensure_namespace(client: &Client, name: &str) -> anyhow::Result<bool> {
-    let namespaces = Api::<Namespace>::all(client.clone());
-    if namespaces.get_opt(name).await?.is_some() {
-        return Ok(false);
-    }
-    let namespace: Namespace = serde_json::from_value(json!({
-        "apiVersion": "v1",
-        "kind": "Namespace",
-        "metadata": { "name": name, "labels": { "app.kubernetes.io/name": "rammux-perf" } },
-    }))?;
-    namespaces
-        .create(&PostParams::default(), &namespace)
-        .await
-        .with_context(|| format!("failed to create namespace {name}"))?;
-    tracing::info!(namespace = name, "Created the namespace");
-    Ok(true)
+async fn connect() -> anyhow::Result<Client> {
+    let config = kube::Config::infer().await?;
+    kube::Client::try_from(config).map_err(anyhow::Error::new)
 }
 
 /// Removes everything this run made.
-///
-/// Deletes by the run label rather than by name, so it removes what is there
-/// rather than what this process remembers creating. Every kind is attempted
-/// even if an earlier one fails, because a leftover NetworkChaos is much worse
-/// than a leftover config map.
-async fn teardown(
-    client: &Client,
-    args: &K8sArgs,
-    naming: &Naming,
-    created_namespace: bool,
-) -> anyhow::Result<()> {
-    let ns = &args.namespace;
-    let selector = ListParams::default().labels(&naming.run_selector());
+async fn teardown(client: Client, naming: &Naming) -> anyhow::Result<()> {
     let params = DeleteParams {
         propagation_policy: Some(PropagationPolicy::Background),
         ..Default::default()
     };
-    let mut failures = Vec::new();
-
-    // The impairment goes first: everything after this talks to the cluster,
-    // and there is no reason to do it over a link we broke on purpose.
-    if args.archetype.profile().is_some()
-        && let Ok((api_resource, _)) = discovery::pinned_kind(
-            client,
-            &kube::core::GroupVersionKind::gvk("chaos-mesh.org", "v1alpha1", "NetworkChaos"),
-        )
-        .await
-    {
-        let chaos: Api<DynamicObject> = Api::namespaced_with(client.clone(), ns, &api_resource);
-        if let Err(error) = chaos.delete_collection(&params, &selector).await {
-            failures.push(format!("NetworkChaos: {error}"));
-        }
-    }
-
-    macro_rules! delete {
-        ($kind:ty, $what:literal) => {
-            if let Err(error) = Api::<$kind>::namespaced(client.clone(), ns)
-                .delete_collection(&params, &selector)
-                .await
-            {
-                failures.push(format!("{}: {error}", $what));
-            }
-        };
-    }
-    delete!(Job, "jobs");
-    delete!(Pod, "pods");
-    delete!(Service, "services");
-    delete!(ConfigMap, "config maps");
-    delete!(Secret, "secrets");
-
-    if created_namespace
-        && let Err(error) = Api::<Namespace>::all(client.clone())
-            .delete(ns, &params)
-            .await
-    {
-        failures.push(format!("namespace: {error}"));
-    }
-
-    if failures.is_empty() {
-        tracing::info!(
-            run_id = naming.run_id,
-            "Removed everything this run created"
-        );
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("{}", failures.join("; ")))
-    }
+    Api::<Namespace>::all(client)
+        .delete(&naming.namespace, &params)
+        .await?;
+    Ok(())
 }
 
 /// Polls `check` until it produces a value, or gives up.

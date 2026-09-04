@@ -165,7 +165,7 @@ pub fn client_config(naming: &Naming, args: &K8sArgs, server_ip: &str, muxer: &V
         "server_addr": format!("{server_ip}:{port}"),
         "iterations": args.iterations,
         "bulk_streams": args.bulk_streams,
-        "bulk_stream_data": args.bulk_stream_data,
+        "bulk_stream_data": args.bulk_stream_data * 1024 * 1024,
         "muxer": muxer,
         "await_endpoint": gate_endpoint(naming),
     });
@@ -294,7 +294,7 @@ fn container(name: &str, args: &K8sArgs, command_args: Value) -> Value {
     json!({
         "name": name,
         "image": args.image,
-        "imagePullPolicy": args.image_pull_policy,
+        "imagePullPolicy": "IfNotPresent",
         "args": command_args,
         "env": [
             // Without this the subscriber's default filter drops every event

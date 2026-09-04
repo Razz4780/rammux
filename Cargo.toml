@@ -22,8 +22,8 @@ http-body = "1"
 http-body-util = "0.1"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }
-k8s-openapi = { version = "0.26", features = ["v1_33"] }
-kube = { version = "2", default-features = false, features = ["client", "rustls-tls"] }
+k8s-openapi = { version = "0.28", features = ["v1_33"] }
+kube = { version = "4", default-features = false, features = ["client", "rustls-tls"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rand = "0.10"
 rcgen = "0.14"
