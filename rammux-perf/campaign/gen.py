@@ -209,6 +209,30 @@ def interleave(per_protocol):
     return ordered
 
 
+# Three cheap runs that between them exercise everything a real run needs, so
+# that a broken image or a missing RBAC verb costs five minutes rather than
+# being discovered an hour into the campaign. In order: the plumbing with no
+# impairment at all, then Chaos Mesh actually injecting, then QUIC - which is
+# UDP, and so the one protocol whose behaviour under netem and a bandwidth
+# cap cannot be assumed from the others.
+SMOKE = [
+    ("none", "rammux", "smoke", {
+        "protocol": "rammux", "probe_interval": PROBE_INTERVAL,
+        "ping_interval": PING_INTERVAL, "transit_window": 256 * KIB,
+        "transit_window_max": 256 * KIB, "stream_recv_window": 256 * KIB,
+        "global_recv_window": 4 * MIB,
+    }),
+    ("datacenter", "h2", "smoke", {
+        "protocol": "h2", "adaptive_window": True,
+        "stream_recv_window": 256 * KIB, "global_recv_window": 1 * MIB,
+    }),
+    ("wan", "quic", "smoke", {
+        "protocol": "quic", "stream_recv_window": 512 * KIB,
+        "global_recv_window": 2 * MIB, "max_streams": 100,
+    }),
+]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -219,10 +243,33 @@ def main():
     parser.add_argument("--links", nargs="*", default=list(LINKS),
                         choices=list(LINKS), help="which links to generate for")
     parser.add_argument("--iterations", type=int, default=ITERATIONS)
+    parser.add_argument("--smoke", action="store_true",
+                        help="write the three cheap checks instead of the ladder")
     args = parser.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
     plan = []
+
+    if args.smoke:
+        for link, protocol, point, muxer in SMOKE:
+            name = f"{link}__{protocol}__{point}"
+            (args.out / f"{name}.json").write_text(json.dumps({
+                "image": args.image,
+                "archetype": link,
+                "muxer_config": muxer,
+                "iterations": 1,
+                "bulk_streams": 2,
+                "bulk_stream_data": 4,
+                "ping_pong_size": PING_PONG_SIZE,
+                "tls": TLS,
+                "timeout_secs": 300,
+                "log_path": f"results/logs/{name}.log",
+            }, indent=2) + "\n")
+            plan.append(name)
+        (args.out / "plan.txt").write_text("\n".join(plan) + "\n")
+        print(f"{len(plan)} smoke runs -> {args.out}")
+        return
+
     for link in args.links:
         spec = LINKS[link]
         bdp = spec["bdp"]

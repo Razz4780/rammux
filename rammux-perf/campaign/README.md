@@ -44,6 +44,12 @@ schedule.
 ```bash
 cd rammux-perf/campaign
 
+# 0. Three cheap checks first: the plumbing, then Chaos Mesh injecting, then
+#    QUIC over a shaped link. Five minutes, and it is where a wrong image or
+#    a missing RBAC verb should surface.
+./gen.py --image "$IMAGE" --out smoke --smoke
+KUBECONFIG=bench.kubeconfig ./run.sh smoke
+
 # 1. Configs. --links narrows it; the default is all five.
 ./gen.py --image "$IMAGE" --out runs --links wan
 
