@@ -331,7 +331,7 @@ def run_one(binary, config_path, env, timeout):
     """
     started = time.monotonic()
     process = subprocess.Popen(
-        [binary, "k8s", "run", "--config-path", str(config_path)],
+        [binary, "--json-log", "k8s", "run", "--config-path", str(config_path)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
     )
     interrupted = False
