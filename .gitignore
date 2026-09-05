@@ -7,3 +7,7 @@ target
 **/*.rs.bk
 
 Cargo.lock
+
+# bench.py writes its configs and results relative to the working directory.
+/results/
+rammux-perf/campaign/results/
