@@ -41,8 +41,13 @@ pub fn endpoint(
         .context("the TLS config cannot be used for QUIC")?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     server_config.transport_config(Arc::new(config.to_transport_config()));
-    Endpoint::server(server_config, addr)
-        .with_context(|| format!("failed to bind the QUIC listener on {addr}"))
+    Endpoint::new(
+        Default::default(),
+        Some(server_config),
+        config.bind_socket(addr)?,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .with_context(|| format!("failed to bind the QUIC listener on {addr}"))
 }
 
 /// Serves one accepted QUIC connection.

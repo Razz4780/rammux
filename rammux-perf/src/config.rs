@@ -2,9 +2,11 @@ use std::{
     net::SocketAddr,
     num::{NonZeroU32, NonZeroU64, NonZeroUsize},
     path::PathBuf,
+    sync::Arc,
     time::Duration,
 };
 
+use anyhow::Context as _;
 use hyper::header::HeaderName;
 use rammux::config::RammuxConfig;
 use schemars::JsonSchema;
@@ -235,6 +237,87 @@ pub struct QuicMuxerConfig {
     pub global_recv_window: u32,
     /// Limit for the number of concurrent streams.
     pub max_streams: u32,
+    /// Which congestion controller to run.
+    ///
+    /// All of a QUIC connection's streams share one, so this is the single
+    /// thing that decides how the whole connection behaves on a lossy path -
+    /// unlike the windows, which the measurements show are never the limit.
+    pub congestion: CongestionControl,
+    /// `SO_RCVBUF` for the UDP socket, in bytes.
+    ///
+    /// A QUIC receiver that cannot drain its socket fast enough drops
+    /// datagrams there, and its peer's congestion controller reads those
+    /// drops as congestion. The default is whatever `net.core.rmem_default`
+    /// says, which is 208 KiB on a stock kernel - under a millisecond of
+    /// buffering at these rates. `net.core.rmem_max` caps what the kernel
+    /// will grant.
+    pub socket_recv_buffer: Option<usize>,
+    /// `SO_SNDBUF` for the UDP socket, in bytes.
+    pub socket_send_buffer: Option<usize>,
+    /// Datagram size to start at, before path MTU discovery raises it.
+    ///
+    /// QUIC's floor is 1200, which is what quinn starts from; a path known to
+    /// carry more need not spend the discovery on finding that out.
+    pub initial_mtu: Option<u16>,
+}
+
+impl QuicMuxerConfig {
+    /// A UDP socket for a QUIC endpoint, with the buffers this config asks
+    /// for.
+    ///
+    /// quinn binds its own socket unless it is handed one, and the default
+    /// receive buffer is small enough that a fast sender overruns it. Those
+    /// drops are indistinguishable from congestion to the peer, so they cost
+    /// throughput out of all proportion to the memory saved.
+    ///
+    /// The kernel silently halves what it grants (`SO_RCVBUF` is reported
+    /// doubled) and clamps to `net.core.rmem_max`, so the size asked for is
+    /// an upper bound rather than a promise. Both are logged.
+    pub fn bind_socket(&self, addr: SocketAddr) -> anyhow::Result<std::net::UdpSocket> {
+        let domain = if addr.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        };
+        let socket =
+            socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+                .context("failed to create a UDP socket")?;
+        if let Some(size) = self.socket_recv_buffer {
+            socket
+                .set_recv_buffer_size(size)
+                .with_context(|| format!("failed to set SO_RCVBUF to {size}"))?;
+        }
+        if let Some(size) = self.socket_send_buffer {
+            socket
+                .set_send_buffer_size(size)
+                .with_context(|| format!("failed to set SO_SNDBUF to {size}"))?;
+        }
+        socket
+            .bind(&addr.into())
+            .with_context(|| format!("failed to bind a UDP socket on {addr}"))?;
+        tracing::info!(
+            %addr,
+            recv_buffer = socket.recv_buffer_size().ok(),
+            send_buffer = socket.send_buffer_size().ok(),
+            "Bound the QUIC socket",
+        );
+        Ok(socket.into())
+    }
+}
+
+/// The congestion controller a QUIC connection runs.
+#[derive(Deserialize, Serialize, JsonSchema, PartialEq, Eq, Debug, Default, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum CongestionControl {
+    /// quinn's default. Loss-based: every loss is read as congestion, so a
+    /// path that drops packets for any other reason costs throughput.
+    #[default]
+    Cubic,
+    /// Rate-based: models the bottleneck bandwidth and round trip rather than
+    /// counting losses, so random loss costs it much less.
+    Bbr,
+    /// The reference loss-based controller. Slower to recover than Cubic.
+    NewReno,
 }
 
 impl Default for QuicMuxerConfig {
@@ -247,6 +330,10 @@ impl Default for QuicMuxerConfig {
             stream_recv_window: 1024 * 1024,
             global_recv_window: 8 * 1024 * 1024,
             max_streams: 100,
+            congestion: CongestionControl::Cubic,
+            socket_recv_buffer: None,
+            socket_send_buffer: None,
+            initial_mtu: None,
         }
     }
 }
@@ -255,6 +342,18 @@ impl QuicMuxerConfig {
     /// The [`quinn::TransportConfig`] both sides run with.
     pub fn to_transport_config(&self) -> quinn::TransportConfig {
         let mut config = quinn::TransportConfig::default();
+        config.congestion_controller_factory(match self.congestion {
+            CongestionControl::Cubic => {
+                Arc::new(quinn::congestion::CubicConfig::default()) as Arc<_>
+            },
+            CongestionControl::Bbr => Arc::new(quinn::congestion::BbrConfig::default()) as Arc<_>,
+            CongestionControl::NewReno => {
+                Arc::new(quinn::congestion::NewRenoConfig::default()) as Arc<_>
+            },
+        });
+        if let Some(mtu) = self.initial_mtu {
+            config.initial_mtu(mtu);
+        }
         config
             .stream_receive_window(self.stream_recv_window.into())
             .receive_window(self.global_recv_window.into())

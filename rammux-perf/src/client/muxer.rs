@@ -532,7 +532,13 @@ impl QuicMuxer {
         } else {
             (Ipv6Addr::UNSPECIFIED, 0).into()
         };
-        let mut endpoint = Endpoint::client(bind).context("failed to bind a QUIC socket")?;
+        let mut endpoint = Endpoint::new(
+            Default::default(),
+            None,
+            config.bind_socket(bind)?,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .context("failed to create a QUIC endpoint")?;
         endpoint.set_default_client_config(client_config);
 
         let name = tls::server_name().to_str().into_owned();
@@ -602,6 +608,42 @@ impl Muxer for QuicMuxer {
     fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<anyhow::Result<()>> {
         if !self.closing {
             self.closing = true;
+            // Read before the close, while the numbers still describe the
+            // transfer. Six numbers separate the explanations for a slow QUIC
+            // connection that the report cannot tell apart: `cwnd` against
+            // `rtt` says whether congestion control is the limit,
+            // `data_blocked`/`stream_data_blocked` say whether flow control
+            // is, `lost_packets` over `sent_packets` gives the loss the path
+            // actually delivered rather than the one it was configured with,
+            // `current_mtu` and `black_holes_detected` catch a path that
+            // silently ate the large packets, and `datagrams` over `ios`
+            // shows whether GSO batching is happening at all.
+            let stats = self.connection.stats();
+            let path = stats.path;
+            tracing::info!(
+                rtt_us = path.rtt.as_micros() as u64,
+                cwnd = path.cwnd,
+                congestion_events = path.congestion_events,
+                lost_packets = path.lost_packets,
+                sent_packets = path.sent_packets,
+                loss_percent = if path.sent_packets > 0 {
+                    path.lost_packets as f64 * 100.0 / path.sent_packets as f64
+                } else {
+                    0.0
+                },
+                black_holes = path.black_holes_detected,
+                current_mtu = path.current_mtu,
+                lost_plpmtud_probes = path.lost_plpmtud_probes,
+                tx_datagrams = stats.udp_tx.datagrams,
+                tx_ios = stats.udp_tx.ios,
+                rx_datagrams = stats.udp_rx.datagrams,
+                rx_ios = stats.udp_rx.ios,
+                data_blocked = stats.frame_tx.data_blocked + stats.frame_rx.data_blocked,
+                stream_data_blocked =
+                    stats.frame_tx.stream_data_blocked + stats.frame_rx.stream_data_blocked,
+                acks_rx = stats.frame_rx.acks,
+                "QUIC connection stats",
+            );
             self.connection.close(0u32.into(), b"done");
         }
         // `close` puts the CONNECTION_CLOSE on the wire itself, so waiting for
