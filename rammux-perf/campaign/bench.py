@@ -231,6 +231,9 @@ def config_for(link, muxer, image, iterations, smoke=False):
         "ping_pong_size": PING_PONG_SIZE,
         "tls": TLS,
         "timeout_secs": 300 if smoke else TIMEOUT_SECS,
+        # Kept next to the summary, because the summary does not say why a
+        # protocol lost connections and this does.
+        "log_path": f"results/logs/{link}__{muxer['protocol']}__PLACEHOLDER.log",
     }
 
 
@@ -418,6 +421,9 @@ def main():
     out = args.out
     (out / "configs").mkdir(parents=True, exist_ok=True)
     (out / "stderr").mkdir(parents=True, exist_ok=True)
+    # The configs name their log relative to the working directory, so the
+    # runs have to happen from the directory that holds `results`.
+    pathlib.Path("results/logs").mkdir(parents=True, exist_ok=True)
     results = out / ("smoke.jsonl" if args.smoke else "results.jsonl")
     done = set() if args.redo else load_done(results)
 
@@ -433,6 +439,7 @@ def main():
     for link, protocol, point, muxer in runs:
         name = f"{link}__{protocol}__{point}"
         config = config_for(link, muxer, args.image, iterations, smoke=args.smoke)
+        config["log_path"] = f"results/logs/{name}.log"
         (out / "configs" / f"{name}.json").write_text(json.dumps(config, indent=2) + "\n")
         planned.append((name, link, protocol, point, config))
 

@@ -34,7 +34,10 @@
 //!   and secrets in the namespace, `networkchaos` in `chaos-mesh.org`, and - only
 //!   if the namespace does not exist yet - namespaces.
 
-use std::{path::Path, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::Context as _;
 use k8s_openapi::api::{
@@ -103,6 +106,16 @@ pub struct K8sConfig {
     /// How long the client job gets before the run is given up on.
     #[serde(default = "K8sConfig::default_timeout_s")]
     pub timeout_secs: u64,
+
+    /// Where to write the client job's log, verbatim.
+    ///
+    /// The report the run prints is six numbers; the log is why they came out
+    /// that way. It carries the per-iteration retries and the error each
+    /// failed iteration died of - which, when a protocol is losing
+    /// connections, is the only place that says what killed them. Unset keeps
+    /// the log in the namespace, which is deleted at the end of the run.
+    #[serde(default)]
+    pub log_path: Option<PathBuf>,
 }
 
 impl K8sConfig {
@@ -406,7 +419,7 @@ async fn execute(
         "Start gate open, benchmark running",
     );
 
-    wait_for("the client job to finish", config.timeout(), || async {
+    let finished = wait_for("the client job to finish", config.timeout(), || async {
         let status = jobs
             .get(&naming.client_job())
             .await?
@@ -416,23 +429,39 @@ async fn execute(
             return Ok(Some(()));
         }
         if status.failed.unwrap_or(0) > 0 {
-            anyhow::bail!("the client pod failed");
+            // Says nothing about why. The client exits non-zero when it runs
+            // out of retries, and the reason each iteration failed is in its
+            // own log - see `log_path`.
+            anyhow::bail!("the client pod failed; see its log for what killed the iterations");
         }
         // A job whose pod cannot start never succeeds and never fails; it
         // would only ever hit the timeout, which says nothing useful.
         if let Some(pod) = client_pod(client, naming).await?
             && let Some(reason) = stuck_reason(&pod.status.unwrap_or_default())
         {
-            anyhow::bail!("the client pod cannot start: {reason}");
+            anyhow::bail!("the client pod is not going to run: {reason}");
         }
         Ok(None)
     })
-    .await?;
+    .await;
 
+    // Deliberately after the wait rather than gated on it. A run that ended
+    // badly is the one whose log is worth having, and the namespace is about
+    // to be deleted with the only copy in it - so the wait's error is held
+    // until the log has been collected and written.
     let client_logs = client_logs(client, naming).await?;
-    for line in client_logs.lines() {
-        tracing::debug!(line, "Got client log");
+    if let Some(path) = &config.log_path {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        std::fs::write(path, &client_logs)
+            .with_context(|| format!("failed to write the job log to {}", path.display()))?;
     }
+    finished.context("the client job did not finish")?;
     let report = RunReport::from_logs(&client_logs)
         .context("final run report was not found in the client logs")?;
 
