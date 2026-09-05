@@ -82,27 +82,12 @@ def rammux_ladder():
             "ping_interval": PING_INTERVAL,
         }))
 
-    # Two axes, from what the first campaign's rammux numbers turned out to
-    # be about.
-    #
-    # `transit_update_threshold` is the root cause. The receiver used to
-    # re-grant transit credit once half the window had been freed, and a
-    # re-grant cannot reach the sender before it has emptied any window
-    # smaller than twice the BDP - so the sender stalled, the design had to
-    # target 2 x BDP with the full round trip of standing queue that implies,
-    # and the growth rule crawled because it sizes from a rate the stalls
-    # depress. Re-granting every 64 KiB whatever the window takes a fixed
-    # 1 x BDP window on the emulator at 60 ms from 104 to 171 Mbit/s and
-    # from 96 to 74 ms - below h2's 77 - and a cold 128 KiB start under the
-    # unchanged growth rule from 41 to 198 Mbit/s.
-    #
-    # `transit_growth` decides where growth stops. `rate-ceiling` is the
-    # existing rule; `rate-plateau` steps x1.5 while each step still raises
-    # the inbound rate and holds at the plateau, which at divisor 8 lands
-    # near 1.4 x BDP instead of 2.2 and returned 40 ms of latency at 60 ms.
-    #
-    # The probe interval is no longer an axis: across the first campaign the
-    # 10 s and 30 s points were within the anchors' spread on every link.
+    # `transit_growth` is what the finer cadence exposes. It moves the
+    # throughput knee from 2 x BDP to about 1 x BDP, and `rate-ceiling` was
+    # built for the old knee - its one constant sets growth speed and target
+    # together, so it lands at 2.25 x BDP with the standing queue that
+    # implies. `rate-plateau` steps x1.5 while each step still raises the
+    # inbound rate and holds at the plateau, landing at 1.4-2.1 x BDP.
     ladder = []
     for growth in TRANSIT_GROWTH:
         for tname, threshold in TRANSIT_UPDATE_THRESHOLDS:
