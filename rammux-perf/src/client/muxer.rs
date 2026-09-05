@@ -158,6 +158,25 @@ impl Muxer for RammuxMuxer {
             else {
                 unreachable!("checked above");
             };
+            // The transit window is a resource every stream on the connection
+            // draws from, and credit comes back from the peer in half-window
+            // bursts. A latency-sensitive stream that needs a few bytes while
+            // the bulk streams have spent the window waits for the next
+            // grant, and how long the connection spent in that state is what
+            // separates "the link is slow" from "rammux is holding its own
+            // ping pong behind its own bulk data". `transit_recv_window` is
+            // where autotune got to; against the link's BDP it says whether
+            // the window ever grew to fit the pipe.
+            let stats = connection.stats();
+            tracing::info!(
+                clean_rtt_us = stats.rtt.map(|d| d.as_micros() as u64),
+                loaded_rtt_us = stats.dirty_rtt.map(|d| d.as_micros() as u64),
+                transit_recv_window = stats.transit_recv_window,
+                transit_send_credit = stats.transit_send_credit,
+                transit_starved_ms = stats.transit_starved.as_millis() as u64,
+                transit_starved_events = stats.transit_starved_events,
+                "rammux connection stats",
+            );
             let downgraded = connection.downgrade().context("rammux downgrade failed")?;
             self.state = RammuxState::Downgrading(downgraded.with_shutdown());
         }
