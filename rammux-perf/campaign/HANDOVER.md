@@ -120,6 +120,56 @@ silence.
 
 ---
 
+## The rammux finding (second session)
+
+The first campaign's rammux numbers - 65-85% of h2's throughput on every
+impaired link, no latency advantage above 20 ms RTT - came down to one
+mechanism, found by reproducing `wan` on the userspace emulator with no loss
+and then changing one line.
+
+**The transit window's credit-return cadence blocks the sender unnecessarily.**
+The receiver re-grants credit once half the window has been freed. That
+re-grant cannot reach the sender before it has emptied any window smaller
+than 2 x BDP, so below that size the sender idles with an empty pipe. Three
+consequences follow: the design has to target 2 x BDP, which is a full round
+trip of standing queue and the whole latency gap to h2; the growth rule
+crawls, because it sizes the window from a rate the stalls depress (5-20% a
+step, tens of seconds to reach a WAN's BDP, where an iteration lasts six);
+and h2, whose credit comes back fine-grained, fills the link with 1.3 x BDP
+at RTT + 17 ms.
+
+Measured on the emulator (fixed windows, 60 ms / 200 Mbit, h2 = 199 Mb at
+77 ms): re-granting in eighths instead of halves takes 1 x BDP from 98 to
+160 Mb and 1.5 x BDP from 146 to 198 Mb, at lower latency in both cases. From
+a cold 128 KiB start with autotune, it takes the *unchanged* growth rule from
+41 to 198 Mb at 60 ms and from 6 to 44 Mb at 200 ms. The bloat regime (real
+kernel CUBIC, tbf queue, no propagation delay) is unaffected - rammux keeps
+its 9x latency win there.
+
+Two knobs now exist, defaults unchanged so the cluster decides:
+
+* `transit_update_divisor` (2 = current behaviour, 8 = proposed).
+* `transit_growth`: `rate-ceiling` (current) or `rate-plateau`, which steps
+  x1.5 while each step still raises the inbound rate and holds at the
+  plateau. With divisor 8 it lands near 1.4 x BDP instead of 2.2, returning
+  ~40 ms of latency at 60 ms for the same throughput.
+
+Not shipped: a delay-gated rule (grow while loaded RTT ≈ clean RTT). Built
+and measured - it is direction-blind. A round trip includes both sides'
+queues, so a side that sends heavily reads an inflated loaded RTT that says
+nothing about the direction its window governs, and in the echo workload it
+froze exactly the side that needed to grow.
+
+What rammux is not: broken. `rammux/` was unchanged since its last emulator
+A/B, and on real CUBIC with a real bottleneck queue it beats h2 9x on latency
+with more throughput. The emulator was not favouring h2 either - the reverse:
+its Reno-without-SACK loss model collapses TCP ~40x harder than real CUBIC
+at 0.5% loss, which made everything but rammux look catastrophic on lossy
+profiles. It is directionally right on delay and bloat (cross-validated).
+
+Still open: QUIC's socket buffers (fixed, needs the cluster run) and the
+rammux connection deaths, whose cause the restored log capture will show.
+
 ## Open questions on the current matrix
 
 Design decisions taken deliberately, but worth revisiting before the results

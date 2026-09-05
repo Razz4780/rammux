@@ -111,9 +111,15 @@ where
                     transit_send: (config.remote_transit_window > 0).then_some(TransitSend {
                         credit: config.remote_transit_window,
                     }),
-                    transit_recv: NonZeroU32::new(config.local_transit_window)
-                        .map(|initial| TransitRecv::new(initial, config.transit_window_max)),
+                    transit_recv: NonZeroU32::new(config.local_transit_window).map(|initial| {
+                        TransitRecv::new(
+                            initial,
+                            config.transit_window_max,
+                            config.transit_update_divisor,
+                        )
+                    }),
                     dirty_rtt: None,
+                    growth: config.transit_growth,
                     transit_blocked: false,
                     stalled_since: None,
                     stalled_total: Duration::ZERO,

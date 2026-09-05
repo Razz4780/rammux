@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::Context as _;
 use hyper::header::HeaderName;
-use rammux::config::RammuxConfig;
+use rammux::config::{RammuxConfig, TransitGrowth};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -102,6 +102,10 @@ pub struct ClientConfig {
     pub await_endpoint: Option<String>,
 }
 
+fn default_transit_update_divisor() -> NonZeroU32 {
+    NonZeroU32::new(2).unwrap()
+}
+
 fn non_zero_min() -> NonZeroUsize {
     NonZeroUsize::MIN
 }
@@ -150,6 +154,14 @@ pub struct RammuxMuxerConfig {
     pub transit_window: u32,
     /// Autotune limit of the transit window, in bytes.
     pub transit_window_max: u32,
+    /// How the transit window grows towards the size of the path.
+    #[serde(default)]
+    pub transit_growth: TransitGrowthConfig,
+    /// In how many pieces the transit window is re-granted. `2` is rammux's
+    /// default and needs 2 x BDP of window for full rate; `8` needs about
+    /// 1.25 x BDP.
+    #[serde(default = "default_transit_update_divisor")]
+    pub transit_update_divisor: NonZeroU32,
     /// Interval of the link-clearing probe, in seconds. Also its timeout.
     pub probe_interval: NonZeroU64,
     /// Interval of the plain ping, in seconds. Also its timeout.
@@ -171,6 +183,11 @@ impl RammuxMuxerConfig {
         config.local_transit_window = self.transit_window;
         config.remote_transit_window = self.transit_window;
         config.transit_window_max = self.transit_window_max;
+        config.transit_update_divisor = self.transit_update_divisor;
+        config.transit_growth = match self.transit_growth {
+            TransitGrowthConfig::RateCeiling => TransitGrowth::RateCeiling,
+            TransitGrowthConfig::RatePlateau => TransitGrowth::RatePlateau,
+        };
         config.max_inbound_streams = 100;
         config.max_outbound_streams = 100;
         config
@@ -185,6 +202,21 @@ impl RammuxMuxerConfig {
     pub fn ping_interval(&self) -> Duration {
         Duration::from_secs(self.ping_interval.get())
     }
+}
+
+/// How rammux's transit window grows. Mirrors [`TransitGrowth`], which the
+/// library does not serialize.
+#[derive(Deserialize, Serialize, JsonSchema, PartialEq, Eq, Debug, Default, Clone, Copy)]
+#[serde(rename_all = "kebab-case")]
+pub enum TransitGrowthConfig {
+    /// Doubles while window-limited, ceilinged at 2 x clean RTT x the
+    /// measured arrival rate - which the window itself limits, so in
+    /// practice the window crawls.
+    #[default]
+    RateCeiling,
+    /// Doubles while each doubling still raises the inbound rate by a
+    /// quarter; direction-correct and needs no ping.
+    RatePlateau,
 }
 
 /// yamux configuration. Both sides use the same values.

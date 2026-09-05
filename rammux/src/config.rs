@@ -107,6 +107,50 @@ pub struct RammuxConfig {
     ///
     /// This value is a local knob and does not have to be negotiated.
     pub transit_window_max: u32,
+    /// How the local transit window grows towards the size of the path.
+    ///
+    /// This value is a local knob and does not have to be negotiated.
+    pub transit_growth: TransitGrowth,
+    /// In how many pieces the local transit window is re-granted.
+    ///
+    /// Credit freed by received `DATA` goes back to the peer in a
+    /// `SESSION_WINDOW_UPDATE` once a `1/divisor` share of the window has
+    /// been freed. The share sets how much window the peer needs to keep the
+    /// path full: a re-grant of half the window cannot reach the peer before
+    /// it has emptied a window smaller than twice the bandwidth-delay
+    /// product, so at `2` the peer stalls below that size and needs 2 x BDP
+    /// of window for full rate, with the standing queue that implies. At `8`
+    /// the same rate needs about 1.25 x BDP, at a cost of one 8-byte frame
+    /// per eighth of a window.
+    ///
+    /// This value is a local knob and does not have to be negotiated.
+    pub transit_update_divisor: NonZeroU32,
+}
+
+/// How the transit window a side grants grows towards the size of the path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransitGrowth {
+    /// Doubles while credit turns over within two round trips, ceilinged at
+    /// twice the clean RTT times the measured arrival rate.
+    ///
+    /// The arrival rate is limited by the very window being sized, so the
+    /// ceiling sits just above the current window and each step lands on
+    /// it: 5-20% per update rather than a doubling, and tens of seconds to
+    /// reach the size of a wide-area path from a small start.
+    #[default]
+    RateCeiling,
+    /// Doubles while each doubling still raises the inbound arrival rate by
+    /// at least a quarter, and stops at the plateau.
+    ///
+    /// The one signal measured on the direction the window governs. A
+    /// round-trip time is inflated by *both* sides' queues, so a side that
+    /// is itself sending heavily reads a loaded RTT that says nothing about
+    /// its inbound direction, and a delay gate blocks exactly the side that
+    /// needs to grow; the inbound rate has no such blind spot. It also needs
+    /// no ping: the rate is measured continuously. Overshoots the knee by at
+    /// most one doubling, since the doubling that finds the plateau is the
+    /// one past it.
+    RatePlateau,
 }
 
 impl RammuxConfig {
@@ -122,6 +166,8 @@ impl RammuxConfig {
     /// 4. [`Self::global_recv_window`] - 4mb
     /// 5. [`Self::local_transit_window`] and [`Self::remote_transit_window`] - 128kb
     /// 6. [`Self::transit_window_max`] - 4mb
+    /// 7. [`Self::transit_growth`] - [`TransitGrowth::RateCeiling`]
+    /// 8. [`Self::transit_update_divisor`] - 2
     pub const fn new() -> Self {
         Self {
             frame_limit: NonZeroU32::new(16 * 1024).unwrap(),
@@ -133,6 +179,8 @@ impl RammuxConfig {
             local_transit_window: 128 * 1024,
             remote_transit_window: 128 * 1024,
             transit_window_max: 4 * 1024 * 1024,
+            transit_growth: TransitGrowth::RateCeiling,
+            transit_update_divisor: NonZeroU32::new(2).unwrap(),
         }
     }
 }

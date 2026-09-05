@@ -1,0 +1,21 @@
+{
+  "image": "img",
+  "archetype": "wan",
+  "muxer_config": {
+    "protocol": "rammux",
+    "probe_interval": 10,
+    "transit_growth": "rate-plateau",
+    "transit_window": 65536,
+    "transit_window_max": 16777216,
+    "stream_recv_window": 262144,
+    "global_recv_window": 23855104,
+    "ping_interval": 5
+  },
+  "iterations": 10,
+  "bulk_streams": 8,
+  "bulk_stream_data": 8,
+  "ping_pong_size": 1024,
+  "tls": true,
+  "timeout_secs": 900,
+  "log_path": "results/logs/wan__rammux__transit-1x-probe-10s-rate-plateau.log"
+}

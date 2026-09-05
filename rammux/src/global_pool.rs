@@ -4,7 +4,10 @@ use std::{num::NonZeroU32, ops::Not, time::Duration};
 
 use tokio::time::Instant;
 
-use crate::{config::RammuxRole, probe::Probe};
+use crate::{
+    config::{RammuxRole, TransitGrowth},
+    probe::Probe,
+};
 
 /// Global state shared by all rammux streams within a single rammux connection.
 ///
@@ -30,6 +33,8 @@ pub struct GlobalPool {
     /// Stream receive windows size from this, because a stream's credit
     /// loop runs through those queues.
     pub dirty_rtt: Option<Duration>,
+    /// How the transit window we grant grows.
+    pub growth: TransitGrowth,
     /// Set by a stream whose outbound poll was held back solely by an
     /// exhausted transit window.
     ///
@@ -55,6 +60,7 @@ impl Default for GlobalPool {
             transit_send: None,
             transit_recv: None,
             dirty_rtt: None,
+            growth: TransitGrowth::default(),
             transit_blocked: false,
             stalled_since: None,
             stalled_total: Duration::ZERO,
@@ -103,6 +109,13 @@ impl GlobalPool {
             // max(2 x RTT, 10ms) - rates sampled over shorter horizons
             // are burst artifacts, not throughput.
             recv.rate_bucket_bytes += u64::from(len);
+            // The first round trip after a grant still runs on the old
+            // window - the grant has to reach the sender and its data has
+            // to come back - so it would dilute the new size's rate with
+            // the old one's. Left out of the measurement.
+            if rtt.is_none_or(|rtt| recv.grew_at.elapsed() >= rtt) {
+                recv.bytes_since_growth += u64::from(len);
+            }
             let bucket =
                 (2 * rtt.unwrap_or(Duration::from_millis(5))).max(Duration::from_millis(10));
             let elapsed = recv.rate_bucket_start.elapsed();
@@ -139,16 +152,51 @@ impl GlobalPool {
         // the loaded RTT runs away: a bigger window queues more, which
         // raises the loaded RTT, which raises the ceiling again.
         let elapsed = recv.last_update.elapsed();
-        let optimal = match self.rtt {
-            Some(rtt) if recv.rate_ema > 0.0 && elapsed < 2 * rtt => {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let ceiling = (2.0 * rtt.as_secs_f64() * recv.rate_ema) as u32;
-                recv.current
-                    .saturating_mul(2)
-                    .min(ceiling)
-                    .max(recv.current)
+        let optimal = match self.growth {
+            TransitGrowth::RateCeiling => match self.rtt {
+                Some(rtt) if recv.rate_ema > 0.0 && elapsed < 2 * rtt => {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let ceiling = (2.0 * rtt.as_secs_f64() * recv.rate_ema) as u32;
+                    recv.current
+                        .saturating_mul(2)
+                        .min(ceiling)
+                        .max(recv.current)
+                },
+                _ => recv.current,
             },
-            _ => recv.current,
+            // No "is the sender consuming" gate here, unlike the other two:
+            // a starved sender on a long path also produces slow updates,
+            // and the plateau test already refuses an idle one, since more
+            // window buys it no more rate.
+            TransitGrowth::RatePlateau => match self.rtt {
+                Some(rtt) if recv.grew_at.elapsed() >= 4 * rtt => {
+                    // Three round trips of clean measurement: the first is
+                    // excluded above.
+                    let measured = recv.grew_at.elapsed().saturating_sub(rtt);
+                    let sustained = recv.bytes_since_growth as f64 / measured.as_secs_f64();
+                    recv.bytes_since_growth = 0;
+                    recv.grew_at = Instant::now();
+                    if sustained >= TRANSIT_PLATEAU_GAIN * recv.baseline_rate {
+                        // This size bought more than the last one did: the
+                        // window is still what limits the sender. Step up,
+                        // and measure the new size from here.
+                        recv.baseline_rate = sustained;
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let stepped = (f64::from(recv.current) * TRANSIT_PLATEAU_STEP) as u32;
+                        stepped.max(recv.current.saturating_add(1))
+                    } else {
+                        // No gain over the last size. Hold, and measure again
+                        // against the same baseline: a single four-round-trip
+                        // average carries the sender's stall cadence and the
+                        // path's jitter, and a step back on one reading was
+                        // tried and stopped connections at a fifth of the
+                        // pipe. A real plateau keeps failing this; a noisy one
+                        // passes next time. Grow-only, like the other rules.
+                        recv.current
+                    }
+                },
+                _ => recv.current,
+            },
         };
         let clamped = optimal.min(recv.max);
 
@@ -186,11 +234,42 @@ pub struct TransitRecv {
     pub rate_bucket_bytes: u64,
     /// Time of the last produced window update.
     pub last_update: Instant,
+    /// In how many pieces the window is re-granted; see
+    /// [`RammuxConfig::transit_update_divisor`](crate::config::RammuxConfig::transit_update_divisor).
+    pub update_divisor: NonZeroU32,
+    /// Inbound rate the previous window size sustained, bytes per second, for
+    /// [`TransitGrowth::RatePlateau`]. Zero until the first decision.
+    pub baseline_rate: f64,
+    /// Payload bytes received since the window last grew.
+    pub bytes_since_growth: u64,
+    /// When the window last grew (or was created). Together with
+    /// `bytes_since_growth` this gives the rate the current size actually
+    /// sustained, as an exact interval average rather than the smoothed EMA,
+    /// which is still half way to the new rate when a decision falls due.
+    pub grew_at: Instant,
 }
 
+/// How much a growth step has to raise the inbound rate for the next one to
+/// be allowed, under [`TransitGrowth::RatePlateau`].
+///
+/// A window-limited connection gains the full step ratio; a link-limited one
+/// gains nothing. A quarter sits between the two with room for the noise of
+/// a four-round-trip average.
+pub const TRANSIT_PLATEAU_GAIN: f64 = 1.25;
+
+/// The growth step under [`TransitGrowth::RatePlateau`].
+///
+/// Not a doubling. The step that discovers the plateau is the one past it,
+/// so the window ends up one step above the first size that reached the
+/// link; with a doubling that is up to twice the pipe's worth of standing
+/// queue, with this it is at most half again. Nine steps from 128 KiB to
+/// 3 MiB rather than five, at four round trips each.
+pub const TRANSIT_PLATEAU_STEP: f64 = 1.5;
+
 impl TransitRecv {
-    pub fn new(initial: NonZeroU32, max: u32) -> Self {
+    pub fn new(initial: NonZeroU32, max: u32, update_divisor: NonZeroU32) -> Self {
         Self {
+            update_divisor,
             current: initial.get(),
             freed: 0,
             max: max.max(initial.get()),
@@ -198,11 +277,14 @@ impl TransitRecv {
             rate_bucket_start: Instant::now(),
             rate_bucket_bytes: 0,
             last_update: Instant::now(),
+            baseline_rate: 0.0,
+            bytes_since_growth: 0,
+            grew_at: Instant::now(),
         }
     }
 
     /// Whether a `SESSION_WINDOW_UPDATE` is due.
     fn can_update(&self) -> bool {
-        self.freed >= self.current / 2
+        self.freed >= self.current / self.update_divisor
     }
 }

@@ -1,0 +1,17 @@
+{
+  "image": "img",
+  "archetype": "wan",
+  "muxer_config": {
+    "protocol": "h2",
+    "adaptive_window": false,
+    "stream_recv_window": 262144,
+    "global_recv_window": 26214400
+  },
+  "iterations": 10,
+  "bulk_streams": 8,
+  "bulk_stream_data": 8,
+  "ping_pong_size": 1024,
+  "tls": true,
+  "timeout_secs": 900,
+  "log_path": "results/logs/wan__h2__fixed-256kb.log"
+}

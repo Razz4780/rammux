@@ -57,7 +57,10 @@ ITERATIONS = 10
 TLS = True
 TIMEOUT_SECS = 900
 
-PROBE_INTERVALS = [10, 30]
+PROBE_INTERVAL = 10
+# The two knobs the first campaign turned out to be about. See rammux_ladder.
+TRANSIT_GROWTH = ["rate-ceiling", "rate-plateau"]
+TRANSIT_UPDATE_DIVISOR = [2, 8]
 PING_INTERVAL = 5
 
 
@@ -66,20 +69,41 @@ def rammux_ladder():
     """
     points = []
     for transit_mult in (1, 2, 4, 8):
-            points.append((f"transit-{transit_mult}x", {
-                # Initial and cap equal: a fixed window, so the point measures the
-                # size rather than autotune's path to it.
-                "transit_window": transit_mult * 64 * KIB,
-                "transit_window_max": 16 * MIB,
-                "stream_recv_window": 256 * KIB,
-                "global_recv_window": 25 * MIB - 256 * KIB * 9,
-                "ping_interval": PING_INTERVAL,
-            }))
+        points.append((f"transit-{transit_mult}x", {
+            "transit_window": transit_mult * 64 * KIB,
+            "transit_window_max": 16 * MIB,
+            "stream_recv_window": 256 * KIB,
+            "global_recv_window": 25 * MIB - 256 * KIB * 9,
+            "ping_interval": PING_INTERVAL,
+        }))
 
+    # Two axes, from what the first campaign's rammux numbers turned out to
+    # be about.
+    #
+    # `transit_update_divisor` is the root cause. The receiver re-grants
+    # transit credit once 1/divisor of the window has been freed, and at the
+    # default of 2 a re-grant cannot reach the sender before it has emptied
+    # any window smaller than twice the BDP - so the sender stalls, the
+    # design has to target 2 x BDP with the full round trip of standing
+    # queue that implies, and the growth rule crawls because it sizes from a
+    # rate the stalls depress. At 8, on the emulator at 60 ms, the same
+    # start went from 41 to 198 Mbit/s under the unchanged growth rule.
+    #
+    # `transit_growth` decides where growth stops. `rate-ceiling` is the
+    # existing rule; `rate-plateau` steps x1.5 while each step still raises
+    # the inbound rate and holds at the plateau, which at divisor 8 lands
+    # near 1.4 x BDP instead of 2.2 and returned 40 ms of latency at 60 ms.
+    #
+    # The probe interval is no longer an axis: across the first campaign the
+    # 10 s and 30 s points were within the anchors' spread on every link.
     ladder = []
-    for probe in PROBE_INTERVALS:
-        for name, fields in points:
-            ladder.append((f"{name}-probe-{probe}s", dict(protocol="rammux", probe_interval=probe, **fields)))
+    for growth in TRANSIT_GROWTH:
+        for div in TRANSIT_UPDATE_DIVISOR:
+            for name, fields in points:
+                ladder.append((f"{name}-{growth}-div{div}",
+                               dict(protocol="rammux", probe_interval=PROBE_INTERVAL,
+                                    transit_growth=growth, transit_update_divisor=div,
+                                    **fields)))
     return ladder
 
 
@@ -143,7 +167,7 @@ LADDERS = {
 # others.
 SMOKE = [
     ("none", "rammux", "smoke", {
-        "protocol": "rammux", "probe_interval": PROBE_INTERVALS[0],
+        "protocol": "rammux", "probe_interval": PROBE_INTERVAL,
         "ping_interval": PING_INTERVAL, "transit_window": 256 * KIB,
         "transit_window_max": 256 * KIB, "stream_recv_window": 256 * KIB,
         "global_recv_window": 4 * MIB,
@@ -164,7 +188,7 @@ SMOKE = [
 # should be identical, and how far apart they land is the resolution of every
 # other difference in it. Must name a real ladder point - `matrix` refuses to
 # build if it does not.
-ANCHOR = ("rammux", "transit-2x-probe-10s")
+ANCHOR = ("rammux", "transit-2x-rate-plateau-div8")
 
 
 def matrix(links, protocols):

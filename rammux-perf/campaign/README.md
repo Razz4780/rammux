@@ -29,12 +29,12 @@ land apart is the resolution of every other difference in it.
 
 | protocol | points per link |
 |---|---|
-| rammux | `transit-1x/2x/4x/8x`, each at `probe-10s` and `probe-30s` |
+| rammux | `transit-1x/2x/4x/8x`, each under `rate-ceiling`/`rate-plateau` growth and credit re-granted in halves (`div2`) or eighths (`div8`) |
 | h2 | `adaptive`, `fixed-256kb` |
 | quic | `fixed-1x/2x/4x/8x` |
 | yamux | `global-25mib` |
 
-17 runs a link, 85 over the five impaired links.
+25 runs a link, 125 over the five impaired links.
 
 Every protocol gets the same memory ceiling: 25 MiB of receive buffer across
 the connection, which is yamux's floor (256 KiB x 100 streams) and so the
@@ -47,12 +47,11 @@ rammux's transit window is always on: the ladder asks how big it should be,
 not whether it should exist. Flow control that works the other way round -
 receive windows alone - is what yamux, h2 and QUIC are in the matrix for.
 
-rammux's probe interval is the second axis, swept on the autotuning point
-because that is where the probe is both the cost and the value: it stalls the
-connection on both sides, which lands in the latency tail, and it is what
-produces the clean round trip the transit window sizes itself from. The ping
-interval is not swept - it stays at 5 s, below the probe interval, which the
-schedule assumes (a refused probe backs off by one ping interval).
+rammux's two axes are the growth rule and the credit-return cadence - see
+`HANDOVER.md` for why those two. The probe interval is held at 10 s: the first
+campaign's 10 s and 30 s points were within the anchors' spread on every link.
+The ping interval stays at 5 s, below the probe interval, which the schedule
+assumes (a refused probe backs off by one ping interval).
 
 Held constant, and so not answered here: 8 bulk streams, a 1 KiB ping pong
 message, TLS everywhere, and a 5 s ping interval.
