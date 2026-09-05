@@ -176,7 +176,14 @@ impl GlobalPool {
                     let sustained = recv.bytes_since_growth as f64 / measured.as_secs_f64();
                     recv.bytes_since_growth = 0;
                     recv.grew_at = Instant::now();
-                    if sustained >= TRANSIT_PLATEAU_GAIN * recv.baseline_rate {
+                    if recv.warmup {
+                        // The ramp, not the window. Discarded, so the next
+                        // interval measures the initial size at rate and
+                        // becomes the baseline the first step is judged
+                        // against.
+                        recv.warmup = false;
+                        recv.current
+                    } else if sustained >= TRANSIT_PLATEAU_GAIN * recv.baseline_rate {
                         // This size bought more than the last one did: the
                         // window is still what limits the sender. Step up,
                         // and measure the new size from here.
@@ -240,6 +247,16 @@ pub struct TransitRecv {
     /// Inbound rate the previous window size sustained, bytes per second, for
     /// [`TransitGrowth::RatePlateau`]. Zero until the first decision.
     pub baseline_rate: f64,
+    /// Whether the first measurement interval is still to be discarded.
+    ///
+    /// That interval starts when the connection does, so it catches the
+    /// transport's own ramp rather than what the window sustains: the rate it
+    /// reports is low, the next interval beats it whatever the window did,
+    /// and the rule takes a step it has no evidence for. On a link whose
+    /// bandwidth-delay product is below the initial window that step is the
+    /// entire error - measured at 10 Mbit/s over 40 ms, discarding it is
+    /// worth 158 ms of echo latency.
+    pub warmup: bool,
     /// Payload bytes received since the window last grew.
     pub bytes_since_growth: u64,
     /// When the window last grew (or was created). Together with
@@ -278,6 +295,7 @@ impl TransitRecv {
             rate_bucket_bytes: 0,
             last_update: Instant::now(),
             baseline_rate: 0.0,
+            warmup: true,
             bytes_since_growth: 0,
             grew_at: Instant::now(),
         }
