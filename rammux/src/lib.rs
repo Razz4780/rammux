@@ -51,6 +51,7 @@ mod error;
 mod global_pool;
 mod header;
 mod probe;
+mod rate;
 pub mod stream;
 mod stream_id;
 

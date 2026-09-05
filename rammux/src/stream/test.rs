@@ -138,16 +138,29 @@ async fn local_receive_window_is_autotuned() {
         current_window = update.window_update;
     }
 
+    // Every borrowed byte comes back when the reader slows down. Not on the
+    // first update, though, and that is deliberate: the window is sized from
+    // a rate smoothed over a few round trips, so one slow interval is a
+    // sample rather than a verdict. What has to hold is that a reader that
+    // stays slow gets the window back down to its initial size, and the
+    // pool gets its loan back.
+    let peak = current_window;
+    let mut rounds = 0;
     while selector.strategy().available < CONFIG.local_recv_window.get() as usize * 4 {
+        rounds += 1;
+        assert!(rounds < 50, "the window never returned what it borrowed");
         tokio::time::advance(Duration::from_secs(5)).await;
         let data = std::iter::repeat_n(b'a', current_window as usize).collect::<Vec<_>>();
         let data = Data::copy_from_slice(&data);
         handle.received_data(data, false, false).unwrap();
         duplex.next().await.unwrap();
         let (update, ..) = selector.next().await.unwrap();
-        assert!(update.window_update < current_window);
         current_window = update.window_update;
     }
+    assert!(
+        current_window < peak,
+        "window did not shrink: {current_window} vs a {peak} peak",
+    );
 }
 
 #[tokio::test]

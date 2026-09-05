@@ -7,6 +7,7 @@ use tokio::time::Instant;
 use crate::{
     config::{RammuxRole, TransitGrowth},
     probe::Probe,
+    rate::{RateEstimate, rate_tau},
 };
 
 /// Global state shared by all rammux streams within a single rammux connection.
@@ -105,10 +106,6 @@ impl GlobalPool {
         if let Some(recv) = self.transit_recv.as_mut() {
             let len = u32::try_from(len).unwrap_or(u32::MAX);
             recv.freed = recv.freed.saturating_add(len);
-            // Measure the arrival rate over buckets of at least
-            // max(2 x RTT, 10ms) - rates sampled over shorter horizons
-            // are burst artifacts, not throughput.
-            recv.rate_bucket_bytes += u64::from(len);
             // The first round trip after a grant still runs on the old
             // window - the grant has to reach the sender and its data has
             // to come back - so it would dilute the new size's rate with
@@ -116,19 +113,7 @@ impl GlobalPool {
             if rtt.is_none_or(|rtt| recv.grew_at.elapsed() >= rtt) {
                 recv.bytes_since_growth += u64::from(len);
             }
-            let bucket =
-                (2 * rtt.unwrap_or(Duration::from_millis(5))).max(Duration::from_millis(10));
-            let elapsed = recv.rate_bucket_start.elapsed();
-            if elapsed >= bucket {
-                let rate = recv.rate_bucket_bytes as f64 / elapsed.as_secs_f64();
-                recv.rate_ema = if recv.rate_ema == 0.0 {
-                    rate
-                } else {
-                    0.5 * recv.rate_ema + 0.5 * rate
-                };
-                recv.rate_bucket_bytes = 0;
-                recv.rate_bucket_start = Instant::now();
-            }
+            recv.rate.observe(u64::from(len), rate_tau(rtt));
         }
     }
 
@@ -154,9 +139,9 @@ impl GlobalPool {
         let elapsed = recv.last_update.elapsed();
         let optimal = match self.growth {
             TransitGrowth::RateCeiling => match self.rtt {
-                Some(rtt) if recv.rate_ema > 0.0 && elapsed < 2 * rtt => {
+                Some(rtt) if recv.rate.get() > 0.0 && elapsed < 2 * rtt => {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    let ceiling = (2.0 * rtt.as_secs_f64() * recv.rate_ema) as u32;
+                    let ceiling = (2.0 * rtt.as_secs_f64() * recv.rate.get()) as u32;
                     recv.current
                         .saturating_mul(2)
                         .min(ceiling)
@@ -233,12 +218,8 @@ pub struct TransitRecv {
     pub freed: u32,
     /// Autotune growth limit.
     pub max: u32,
-    /// Smoothed arrival rate, bytes per second.
-    pub rate_ema: f64,
-    /// Start of the current rate-measurement bucket.
-    pub rate_bucket_start: Instant,
-    /// Payload bytes received in the current rate-measurement bucket.
-    pub rate_bucket_bytes: u64,
+    /// Smoothed arrival rate on the connection.
+    pub rate: RateEstimate,
     /// Time of the last produced window update.
     pub last_update: Instant,
     /// How much freed credit is re-granted at once; see
@@ -290,9 +271,7 @@ impl TransitRecv {
             current: initial.get(),
             freed: 0,
             max: max.max(initial.get()),
-            rate_ema: 0.0,
-            rate_bucket_start: Instant::now(),
-            rate_bucket_bytes: 0,
+            rate: RateEstimate::default(),
             last_update: Instant::now(),
             baseline_rate: 0.0,
             warmup: true,

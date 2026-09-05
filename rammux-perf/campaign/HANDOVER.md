@@ -182,6 +182,24 @@ its Reno-without-SACK loss model collapses TCP ~40x harder than real CUBIC
 at 0.5% loss, which made everything but rammux look catastrophic on lossy
 profiles. It is directionally right on delay and bloat (cross-validated).
 
+**EWMA rate estimates: implemented, measured, no effect.** Both autotunes
+size themselves from a throughput. The transit window already smoothed its
+one; a stream's receive window took the raw rate over the last update
+interval, whose length is set by the reader's cadence rather than by the
+path. `rate.rs` now holds one estimator for both, weighted by elapsed time
+(`alpha = 1 - exp(-dt/tau)`, `tau = max(4 x RTT, 20 ms)`) so the memory does
+not change with how often the caller samples.
+
+It is a null result on this workload: four links x two growth rules, three
+runs each, every cell within noise on throughput, p50 and final window. An
+apparent p99 regression was a bimodal-median artifact - six runs each showed
+the same two clusters under both. The reason is that the benchmark is
+steady state: eight bulk streams saturating for twenty seconds give the
+smoothing nothing to smooth. Where it would matter is a rate that *changes* -
+competing traffic arriving, a mobile handover, a shaper kicking in - which
+this harness cannot produce. Kept for correctness rather than for a number;
+cheap to revert if it is not wanted.
+
 Still open: QUIC's socket buffers (fixed, needs the cluster run) and the
 rammux connection deaths, whose cause the restored log capture will show.
 
