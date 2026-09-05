@@ -234,9 +234,9 @@ pub struct TransitRecv {
     pub rate_bucket_bytes: u64,
     /// Time of the last produced window update.
     pub last_update: Instant,
-    /// In how many pieces the window is re-granted; see
-    /// [`RammuxConfig::transit_update_divisor`](crate::config::RammuxConfig::transit_update_divisor).
-    pub update_divisor: NonZeroU32,
+    /// How much freed credit is re-granted at once; see
+    /// [`RammuxConfig::transit_update_threshold`](crate::config::RammuxConfig::transit_update_threshold).
+    pub update_threshold: NonZeroU32,
     /// Inbound rate the previous window size sustained, bytes per second, for
     /// [`TransitGrowth::RatePlateau`]. Zero until the first decision.
     pub baseline_rate: f64,
@@ -267,9 +267,9 @@ pub const TRANSIT_PLATEAU_GAIN: f64 = 1.25;
 pub const TRANSIT_PLATEAU_STEP: f64 = 1.5;
 
 impl TransitRecv {
-    pub fn new(initial: NonZeroU32, max: u32, update_divisor: NonZeroU32) -> Self {
+    pub fn new(initial: NonZeroU32, max: u32, update_threshold: NonZeroU32) -> Self {
         Self {
-            update_divisor,
+            update_threshold,
             current: initial.get(),
             freed: 0,
             max: max.max(initial.get()),
@@ -285,6 +285,6 @@ impl TransitRecv {
 
     /// Whether a `SESSION_WINDOW_UPDATE` is due.
     fn can_update(&self) -> bool {
-        self.freed >= self.current / self.update_divisor
+        self.freed >= self.update_threshold.get().min(self.current / 2)
     }
 }

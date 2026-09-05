@@ -24,7 +24,7 @@ const CONFIG: RammuxConfig = RammuxConfig {
     remote_transit_window: 0,
     transit_window_max: 4 * 1024 * 1024,
     transit_growth: TransitGrowth::RateCeiling,
-    transit_update_divisor: NonZeroU32::new(2).unwrap(),
+    transit_update_threshold: NonZeroU32::new(64 * 1024).unwrap(),
 };
 
 fn new_stream(

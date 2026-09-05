@@ -29,7 +29,7 @@ land apart is the resolution of every other difference in it.
 
 | protocol | points per link |
 |---|---|
-| rammux | `transit-1x/2x/4x/8x`, each under `rate-ceiling`/`rate-plateau` growth and credit re-granted in halves (`div2`) or eighths (`div8`) |
+| rammux | `transit-1x/2x/4x/8x`, each under `rate-ceiling`/`rate-plateau` growth and credit re-granted in halves (`half`) or every 64 KiB (`64k`) |
 | h2 | `adaptive`, `fixed-256kb` |
 | quic | `fixed-1x/2x/4x/8x` |
 | yamux | `global-25mib` |

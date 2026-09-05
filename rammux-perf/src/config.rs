@@ -102,8 +102,8 @@ pub struct ClientConfig {
     pub await_endpoint: Option<String>,
 }
 
-fn default_transit_update_divisor() -> NonZeroU32 {
-    NonZeroU32::new(2).unwrap()
+fn default_transit_update_threshold() -> NonZeroU32 {
+    NonZeroU32::new(64 * 1024).unwrap()
 }
 
 fn non_zero_min() -> NonZeroUsize {
@@ -157,11 +157,11 @@ pub struct RammuxMuxerConfig {
     /// How the transit window grows towards the size of the path.
     #[serde(default)]
     pub transit_growth: TransitGrowthConfig,
-    /// In how many pieces the transit window is re-granted. `2` is rammux's
-    /// default and needs 2 x BDP of window for full rate; `8` needs about
-    /// 1.25 x BDP.
-    #[serde(default = "default_transit_update_divisor")]
-    pub transit_update_divisor: NonZeroU32,
+    /// How much freed transit credit is re-granted at once, in bytes, or half
+    /// the window if that is smaller. `4294967295` reproduces the old
+    /// half-window behaviour on any window.
+    #[serde(default = "default_transit_update_threshold")]
+    pub transit_update_threshold: NonZeroU32,
     /// Interval of the link-clearing probe, in seconds. Also its timeout.
     pub probe_interval: NonZeroU64,
     /// Interval of the plain ping, in seconds. Also its timeout.
@@ -183,7 +183,7 @@ impl RammuxMuxerConfig {
         config.local_transit_window = self.transit_window;
         config.remote_transit_window = self.transit_window;
         config.transit_window_max = self.transit_window_max;
-        config.transit_update_divisor = self.transit_update_divisor;
+        config.transit_update_threshold = self.transit_update_threshold;
         config.transit_growth = match self.transit_growth {
             TransitGrowthConfig::RateCeiling => TransitGrowth::RateCeiling,
             TransitGrowthConfig::RatePlateau => TransitGrowth::RatePlateau,

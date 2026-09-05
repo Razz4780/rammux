@@ -111,20 +111,24 @@ pub struct RammuxConfig {
     ///
     /// This value is a local knob and does not have to be negotiated.
     pub transit_growth: TransitGrowth,
-    /// In how many pieces the local transit window is re-granted.
+    /// How much freed transit credit is re-granted at once, in bytes.
     ///
     /// Credit freed by received `DATA` goes back to the peer in a
-    /// `SESSION_WINDOW_UPDATE` once a `1/divisor` share of the window has
-    /// been freed. The share sets how much window the peer needs to keep the
-    /// path full: a re-grant of half the window cannot reach the peer before
-    /// it has emptied a window smaller than twice the bandwidth-delay
-    /// product, so at `2` the peer stalls below that size and needs 2 x BDP
-    /// of window for full rate, with the standing queue that implies. At `8`
-    /// the same rate needs about 1.25 x BDP, at a cost of one 8-byte frame
-    /// per eighth of a window.
+    /// `SESSION_WINDOW_UPDATE` once this much has accumulated - or half the
+    /// window, whichever is smaller, so a window below twice this size keeps
+    /// re-granting in halves rather than waiting for all of it.
+    ///
+    /// An absolute threshold rather than a share of the window, because the
+    /// share was the problem. Re-granting in halves means the peer cannot
+    /// receive the first re-grant before it has emptied any window smaller
+    /// than twice the bandwidth-delay product, so below that size it idles
+    /// with an empty pipe, and above it a stream that needs a few bytes waits
+    /// up to half a window for the next grant. At 64 KiB the grant interval
+    /// is 64 KiB at link rate - a few milliseconds - whatever the window, for
+    /// one 8-byte frame per 64 KiB of payload.
     ///
     /// This value is a local knob and does not have to be negotiated.
-    pub transit_update_divisor: NonZeroU32,
+    pub transit_update_threshold: NonZeroU32,
 }
 
 /// How the transit window a side grants grows towards the size of the path.
@@ -167,7 +171,7 @@ impl RammuxConfig {
     /// 5. [`Self::local_transit_window`] and [`Self::remote_transit_window`] - 128kb
     /// 6. [`Self::transit_window_max`] - 4mb
     /// 7. [`Self::transit_growth`] - [`TransitGrowth::RateCeiling`]
-    /// 8. [`Self::transit_update_divisor`] - 2
+    /// 8. [`Self::transit_update_threshold`] - 64kb
     pub const fn new() -> Self {
         Self {
             frame_limit: NonZeroU32::new(16 * 1024).unwrap(),
@@ -180,7 +184,7 @@ impl RammuxConfig {
             remote_transit_window: 128 * 1024,
             transit_window_max: 4 * 1024 * 1024,
             transit_growth: TransitGrowth::RateCeiling,
-            transit_update_divisor: NonZeroU32::new(2).unwrap(),
+            transit_update_threshold: NonZeroU32::new(64 * 1024).unwrap(),
         }
     }
 }

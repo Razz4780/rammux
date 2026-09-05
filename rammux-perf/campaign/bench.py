@@ -60,7 +60,12 @@ TIMEOUT_SECS = 900
 PROBE_INTERVAL = 10
 # The two knobs the first campaign turned out to be about. See rammux_ladder.
 TRANSIT_GROWTH = ["rate-ceiling", "rate-plateau"]
-TRANSIT_UPDATE_DIVISOR = [2, 8]
+# The credit re-grant threshold. `half` is the old rule - re-grant once half
+# the window is freed, so the grant interval scales with the window and a
+# sender below 2 x BDP idles between grants. `64k` re-grants every 64 KiB
+# whatever the window (never more than half of it). Encoded as the u32
+# maximum, which the `min` with half the window turns back into the old rule.
+TRANSIT_UPDATE_THRESHOLDS = [("half", 4294967295), ("64k", 65536)]
 PING_INTERVAL = 5
 
 
@@ -80,14 +85,16 @@ def rammux_ladder():
     # Two axes, from what the first campaign's rammux numbers turned out to
     # be about.
     #
-    # `transit_update_divisor` is the root cause. The receiver re-grants
-    # transit credit once 1/divisor of the window has been freed, and at the
-    # default of 2 a re-grant cannot reach the sender before it has emptied
-    # any window smaller than twice the BDP - so the sender stalls, the
-    # design has to target 2 x BDP with the full round trip of standing
-    # queue that implies, and the growth rule crawls because it sizes from a
-    # rate the stalls depress. At 8, on the emulator at 60 ms, the same
-    # start went from 41 to 198 Mbit/s under the unchanged growth rule.
+    # `transit_update_threshold` is the root cause. The receiver used to
+    # re-grant transit credit once half the window had been freed, and a
+    # re-grant cannot reach the sender before it has emptied any window
+    # smaller than twice the BDP - so the sender stalled, the design had to
+    # target 2 x BDP with the full round trip of standing queue that implies,
+    # and the growth rule crawled because it sizes from a rate the stalls
+    # depress. Re-granting every 64 KiB whatever the window takes a fixed
+    # 1 x BDP window on the emulator at 60 ms from 104 to 171 Mbit/s and
+    # from 96 to 74 ms - below h2's 77 - and a cold 128 KiB start under the
+    # unchanged growth rule from 41 to 198 Mbit/s.
     #
     # `transit_growth` decides where growth stops. `rate-ceiling` is the
     # existing rule; `rate-plateau` steps x1.5 while each step still raises
@@ -98,11 +105,11 @@ def rammux_ladder():
     # 10 s and 30 s points were within the anchors' spread on every link.
     ladder = []
     for growth in TRANSIT_GROWTH:
-        for div in TRANSIT_UPDATE_DIVISOR:
+        for tname, threshold in TRANSIT_UPDATE_THRESHOLDS:
             for name, fields in points:
-                ladder.append((f"{name}-{growth}-div{div}",
+                ladder.append((f"{name}-{growth}-{tname}",
                                dict(protocol="rammux", probe_interval=PROBE_INTERVAL,
-                                    transit_growth=growth, transit_update_divisor=div,
+                                    transit_growth=growth, transit_update_threshold=threshold,
                                     **fields)))
     return ladder
 
@@ -188,7 +195,7 @@ SMOKE = [
 # should be identical, and how far apart they land is the resolution of every
 # other difference in it. Must name a real ladder point - `matrix` refuses to
 # build if it does not.
-ANCHOR = ("rammux", "transit-2x-rate-plateau-div8")
+ANCHOR = ("rammux", "transit-2x-rate-plateau-64k")
 
 
 def matrix(links, protocols):

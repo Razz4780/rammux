@@ -139,20 +139,35 @@ and h2, whose credit comes back fine-grained, fills the link with 1.3 x BDP
 at RTT + 17 ms.
 
 Measured on the emulator (fixed windows, 60 ms / 200 Mbit, h2 = 199 Mb at
-77 ms): re-granting in eighths instead of halves takes 1 x BDP from 98 to
-160 Mb and 1.5 x BDP from 146 to 198 Mb, at lower latency in both cases. From
-a cold 128 KiB start with autotune, it takes the *unchanged* growth rule from
-41 to 198 Mb at 60 ms and from 6 to 44 Mb at 200 ms. The bloat regime (real
+77 ms): re-granting every 64 KiB instead of every half window takes 1 x BDP
+from 104 to 171 Mb and 96 to 74 ms - below h2's latency - and 1.5 x BDP from
+140 to 198 Mb. From a cold 128 KiB start with autotune it takes the
+*unchanged* growth rule from 41 to 198 Mb at 60 ms and from 5 to 45 Mb at
+200 ms.
+
+It also moves the throughput knee from 2 x BDP to about 1 x BDP, and both
+growth rules were built for the old knee, so autotuned *latency* is worse
+with the finer cadence until the target comes down with it. The rate-ceiling
+rule cannot: its one constant sets growth speed and target together (c = 2
+lands at 2.25 x BDP, 139 ms at 60 ms; c = 1.25 crawls to a halt at 200 ms;
+c = 1.5 is the compromise at 102 ms). The plateau rule with x1.5 steps lands
+at 1.4-2.1 x BDP: 198 Mb at 90 ms at 60 ms, 43 Mb at 355 ms at 200 ms, one
+step past the knee, and a x1.25 step sticks because a x1.25 gain is exactly
+the threshold. So the combination that is good on both axes is 64 KiB +
+`rate-plateau`; the current defaults (64 KiB + `rate-ceiling`) trade autotuned
+WAN latency for throughput. The campaign runs all four. The bloat regime (real
 kernel CUBIC, tbf queue, no propagation delay) is unaffected - rammux keeps
 its 9x latency win there.
 
 Two knobs now exist, defaults unchanged so the cluster decides:
 
-* `transit_update_divisor` (2 = current behaviour, 8 = proposed).
+* `transit_update_threshold`: how much freed credit is re-granted at once,
+  or half the window if that is smaller. 64 KiB is the default now; `u32::MAX`
+  reproduces the old half-window rule on any window.
 * `transit_growth`: `rate-ceiling` (current) or `rate-plateau`, which steps
   x1.5 while each step still raises the inbound rate and holds at the
-  plateau. With divisor 8 it lands near 1.4 x BDP instead of 2.2, returning
-  ~40 ms of latency at 60 ms for the same throughput.
+  plateau. With the 64 KiB cadence it lands one x1.5 step
+  past the knee, at 1.4-2.1 x BDP.
 
 Not shipped: a delay-gated rule (grow while loaded RTT ≈ clean RTT). Built
 and measured - it is direction-blind. A round trip includes both sides'

@@ -115,7 +115,7 @@ where
                         TransitRecv::new(
                             initial,
                             config.transit_window_max,
-                            config.transit_update_divisor,
+                            config.transit_update_threshold,
                         )
                     }),
                     dirty_rtt: None,
