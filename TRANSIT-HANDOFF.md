@@ -133,11 +133,14 @@ throughput: on wan, rammux 90 ms against yamux 244 ms and h2-adaptive 367 ms.
 
 ## Dead ends - do not retry
 
-* **Delay-gated growth** ("grow while loaded RTT is within X% of clean RTT").
-  Direction-blind: a round trip includes *both* sides' queues, so a heavy
-  sender reads an inflated loaded RTT that says nothing about the direction
-  its own window governs. In an echo workload it froze exactly the side that
-  needed to grow. Built, measured, reverted.
+* **Delay-gated growth off the *round-trip* delay** ("grow while loaded RTT
+  is within X% of clean RTT"). Direction-blind: a round trip includes *both*
+  sides' queues, so a heavy sender reads an inflated loaded RTT that says
+  nothing about the direction its own window governs. In an echo workload it
+  froze exactly the side that needed to grow. Built, measured, reverted.
+  **This does not condemn delay-based control** - only round-trip delay as
+  the signal. One-way delay fixes the direction problem outright; see
+  "Estimating bandwidth" below.
 * **Stepping the window back** after finding a plateau. Tried with a credit
   "debt" mechanism; stopped connections at a fifth of the pipe. Both rules
   are grow-only for this reason.
@@ -202,27 +205,109 @@ Add these:
   drain its UDP socket fast enough - which pinned its congestion window at
   236 KiB. Over TCP the analogue is `SO_SNDBUF`/`SO_RCVBUF`; check them.
 
+## Estimating bandwidth, and the loop that makes it hard
+
+The measured rate is limited by the window, and the window is set from the
+measured rate. That circularity is the reason the ceiling rule crawls, and
+the first thing to fix.
+
+**The rate error is one-sided.** While `W < BDP` the connection is
+window-limited and `rate = W / RTT` - an *under*estimate. While `W > BDP` it
+is link-limited and the sample is correct. Nothing can ever *over*estimate
+the bottleneck. So the right statistic is the **maximum**, not the mean, and
+any averaging filter - the EWMA included - mixes underestimates into the
+answer and drags it below truth. `rate_ema` is simply the wrong statistic for
+this quantity, whatever its parameters.
+
+Four ways forward, roughly in order of cost:
+
+**1. Max-filter, as BBR does.** `BtlBw = max(delivery_rate)` over a sliding
+window of about 10 round trips; `RTprop = min(RTT)` over a longer one;
+`BDP = BtlBw x RTprop`. The max selects the samples that were not
+window-limited; the sliding window still lets a bandwidth that has genuinely
+gone away be forgotten. Flag **app-limited** samples - taken when the sender
+had credit spare and did not fill it - and let them raise the max but never
+lower it, or one idle moment poisons the estimate. Cheapest real fix
+available.
+
+**2. Read the drain you already pay for.** A link-clearing probe *is* a
+bandwidth measurement. At the pause, `B` bytes are outstanding, and
+`CLEAR_LINK` sits behind them in the ordered stream, so the peer cannot
+acknowledge it until all `B` have landed:
+
+```
+receipt_time = B / bandwidth + RTT_prop
+bandwidth    = B / (receipt_time - RTT_prop)
+```
+
+`RTT_prop` comes from the clean ping immediately after. No circularity: `B`
+is set by the window, but the *ratio* is the bottleneck rate whatever `B` is,
+provided it is more than a packet or two. Infrequent but clean - use it to
+seed and correct the max filter rather than as the only source.
+
+**3. Skip bandwidth entirely - control on queue.** Vegas computes queued
+bytes from delay alone, `queued ~ W x (loadedRTT - baseRTT) / loadedRTT`, and
+targets a small constant queue. Both RTTs are already available. It inherits
+the direction-blindness above, though.
+
+**4. One-way delay, which fixes that** - LEDBAT, RFC 6817. Sender timestamps
+each frame; receiver computes `owd = arrival - timestamp`, which carries an
+unknown constant clock offset; receiver tracks `base = min(owd)` over a long
+window; `queuing_delay = owd - base` and **the offset cancels**, no clock
+sync needed. That is a per-direction queue signal, and it measures the exact
+quantity the benchmark reports. Watch for clock *drift* corrupting `base`
+over a long connection - LEDBAT rolls the base over minutes.
+
+**Not available here: packet-pair and packet-train** (pathchar, TOPP). They
+read the bottleneck from inter-arrival spacing, and over TCP this protocol
+sees a byte stream with no visibility into or control over segment
+boundaries. Rule it out early.
+
+**The plateau rule was BBR's ProbeBW, slowly.** "Raise the window, see
+whether the rate actually rises" is the only way to break the loop by
+experiment rather than by statistics, and it is what BBR does by cycling
+`pacing_gain` through `[1.25, 0.75, 1, 1, 1, 1, 1, 1]` over eight round
+trips. Two differences matter: BBR **paces** rather than opening a window, so
+the excess does not arrive as a burst, and it **drains on the next round
+trip**, so a failed probe costs one round trip of queue rather than a
+permanent step. That is why 25% probes are safe where our 50% window steps
+were not.
+
 ## Suggested starting point
 
-Framing: `DATA` and `WINDOW_UPDATE` at minimum; a `PING`/`PONG` pair if the
-growth rule needs an RTT. rammux's link-clearing probe (pauses data on both
-sides, drains, then times a ping) gives a *clean* RTT that a queue cannot
-inflate - worth copying if the rule uses `c x RTT x rate`, and worth skipping
-if it does not, because the pause is expensive.
+Framing: `DATA` and `WINDOW_UPDATE` at minimum. Add a `PING`/`PONG` pair if
+the rule needs a round trip, and a per-frame timestamp if it uses one-way
+delay. rammux's link-clearing probe gives a *clean* RTT that no queue can
+inflate, and doubles as the bandwidth meter in (2) above - but it pauses both
+sides, so it earns its place only if the rule actually uses it.
 
-Defaults to start from, all measured:
+Measure at the **receiver**. It knows exactly when bytes arrived, with no
+ACK-clock inference, and it is already sending `WINDOW_UPDATE` frames that an
+estimate can ride along on.
+
+Defaults to start from. The first two are measured and solid; the growth rule
+is the open question, and the form below is the *old* one with its constant
+corrected - it is a fallback, not a recommendation, because a mean rate is
+the thing this section says is broken:
 
 | | value |
 |---|---|
 | initial window | 128 KiB |
 | re-grant threshold | `min(64 KiB, W/2)` |
-| growth | `W <- min(2W, 1.5 x cleanRTT x rate)`, grow-only |
 | window cap | 4-16 MiB |
+| growth, fallback | `W <- min(2W, 1.5 x cleanRTT x max-filtered rate)`, grow-only |
+
+Two branches worth trying before settling: **BBR-shaped** - max-filtered
+`BtlBw`, `min` RTT, pace at `BtlBw`, window about `2 x BDP` for headroom -
+and **LEDBAT-shaped**, targeting a few milliseconds of one-way queuing delay
+with no bandwidth estimate at all. Given that the goal is latency first, and
+that the delay branch is the one we never explored properly, try that one
+first.
 
 The first experiment worth running is the one we could not: **the same sweep
 under real `netem` loss**. Every loss result above is from a model known to be
-wrong. Whether `c = 1.5` still holds, and whether the plateau rule's search
-survives a lossy path at all, are both open.
+wrong. Whether any of these rules survives a lossy path is open, and loss is
+where a delay-based controller and a rate-based one diverge most.
 
 ## Reference points in this repo
 
