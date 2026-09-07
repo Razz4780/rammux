@@ -29,12 +29,12 @@ land apart is the resolution of every other difference in it.
 
 | protocol | points per link |
 |---|---|
-| rammux | `transit-1x/2x/4x/8x`, each under `rate-ceiling`/`rate-plateau` growth and credit re-granted in halves (`half`) or every 64 KiB (`64k`) |
+| rammux | `transit-default`, `transit-queue-0.20`, `transit-queue-5ms` - the transit layer's tuned default, and its two latency-leaning targets |
 | h2 | `adaptive`, `fixed-256kb` |
 | quic | `fixed-1x/2x/4x/8x` |
 | yamux | `global-25mib` |
 
-25 runs a link, 125 over the five impaired links.
+12 runs a link, 60 over the five impaired links.
 
 Every protocol gets the same memory ceiling: 25 MiB of receive buffer across
 the connection, which is yamux's floor (256 KiB x 100 streams) and so the
@@ -43,15 +43,20 @@ the workload's 9 streams - 9 x 256 KiB of stream window plus a pool of
 25 MiB minus that - because its global window is a pool on top of the
 per-stream windows rather than a cap over them.
 
-rammux's transit window is always on: the ladder asks how big it should be,
-not whether it should exist. Flow control that works the other way round -
-receive windows alone - is what yamux, h2 and QUIC are in the matrix for.
+rammux's transit window is always on, and no longer rammux's own: rammux runs
+over the `transit` crate, which steers the window from the one-way queuing
+delay it observes rather than sizing it from a rate, so there is no window size
+or growth rule left to ladder. What it exposes is where it holds the queue, as
+a fraction of the clean round trip, and the three rammux points are the tuned
+default (0.30), the throughput-for-latency trade the transit tuning measured
+(0.20), and a flat 5 ms as the latency-first end. Every other transit knob is
+the crate's default. Flow control that works the other way round - receive
+windows alone - is what yamux, h2 and QUIC are in the matrix for.
 
-rammux's two axes are the growth rule and the credit-return cadence - see
-`HANDOVER.md` for why those two. The probe interval is held at 10 s: the first
-campaign's 10 s and 30 s points were within the anchors' spread on every link.
-The ping interval stays at 5 s, below the probe interval, which the schedule
-assumes (a refused probe backs off by one ping interval).
+The link-clearing probe is the transit layer's now, on its own schedule: a
+fixed multiple of how long the last exchange took, which settles at 6 to 16 s.
+rammux's own ping stays at 5 s and is the connection's liveness check - a
+ping unanswered for 10 s fails the run.
 
 Held constant, and so not answered here: 8 bulk streams, a 1 KiB ping pong
 message, TLS everywhere, and a 5 s ping interval.

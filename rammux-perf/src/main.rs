@@ -8,7 +8,7 @@ mod client;
 mod config;
 mod cpu;
 mod k8s;
-mod rammux_rtt;
+mod rammux_ping;
 mod server;
 mod signal;
 mod stream_util;

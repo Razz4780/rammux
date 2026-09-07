@@ -293,12 +293,12 @@ impl RecvWindow {
 
         // The yardstick is the loaded RTT: a stream's window governs how
         // often credit has to be exchanged while data is flowing, and those
-        // updates travel through the queues that are standing, not over the
-        // drained link the clean sample measures. Before the first probe
-        // completes there is no loaded sample, and the clean one stands in.
+        // updates travel through the queues that are standing - the transit
+        // layer's credit wait included - not over the drained link the
+        // transit probe measures. Until the first ping is answered there is
+        // no sample, and the window holds its size.
         let optimal = global
-            .dirty_rtt
-            .or(global.rtt)
+            .rtt
             .map(|rtt| Self::get_optimal(self.freed, self.last_update.elapsed(), rtt))
             .unwrap_or(self.current);
         let clamped = optimal

@@ -9,11 +9,12 @@ restarted without losing what it already has.
 The matrix is one axis, in one unit. Every protocol here controls the same
 thing - how many bytes may be in flight on the connection - and each spells it
 differently: yamux has a single number, h2 and QUIC have a per-stream and a
-per-connection window, rammux has both plus a transit window that bounds what
-is actually on the wire. A ladder of absolute byte values would compare
-sizings; a ladder of multiples of the link's bandwidth-delay product compares
-the protocols at the same budget, and its answer carries over to links that
-are not in the list.
+per-connection window, rammux has stream windows plus the transit layer it
+runs over, which steers a bound on what is actually on the wire. A ladder of
+absolute byte values would compare sizings; a ladder of multiples of the link's
+bandwidth-delay product compares the protocols at the same budget, and its
+answer carries over to links that are not in the list. rammux's ladder is the
+exception - see `rammux_ladder` for why it is a ladder of latency targets.
 
 Each run yields both metrics at once. The ping pong stream runs for as long as
 the bulk streams do and sends one message at a time, so a run is a throughput
@@ -57,46 +58,36 @@ ITERATIONS = 10
 TLS = True
 TIMEOUT_SECS = 900
 
-PROBE_INTERVAL = 10
-# The two knobs the first campaign turned out to be about. See rammux_ladder.
-TRANSIT_GROWTH = ["rate-ceiling", "rate-plateau"]
-# The credit re-grant threshold. `half` is the old rule - re-grant once half
-# the window is freed, so the grant interval scales with the window and a
-# sender below 2 x BDP idles between grants. `64k` re-grants every 64 KiB
-# whatever the window (never more than half of it). Encoded as the u32
-# maximum, which the `min` with half the window turns back into the old rule.
-TRANSIT_UPDATE_THRESHOLDS = [("half", 4294967295), ("64k", 65536)]
 PING_INTERVAL = 5
 
 
 def rammux_ladder():
-    """rammux: the transit window and the probe interval are the axis.
-    """
-    points = []
-    for transit_mult in (1, 2, 4, 8):
-        points.append((f"transit-{transit_mult}x", {
-            "transit_window": transit_mult * 64 * KIB,
-            "transit_window_max": 16 * MIB,
-            "stream_recv_window": 256 * KIB,
-            "global_recv_window": 25 * MIB - 256 * KIB * 9,
-            "ping_interval": PING_INTERVAL,
-        }))
+    """rammux: where the transit layer holds the queue is the axis.
 
-    # `transit_growth` is what the finer cadence exposes. It moves the
-    # throughput knee from 2 x BDP to about 1 x BDP, and `rate-ceiling` was
-    # built for the old knee - its one constant sets growth speed and target
-    # together, so it lands at 2.25 x BDP with the standing queue that
-    # implies. `rate-plateau` steps x1.5 while each step still raises the
-    # inbound rate and holds at the plateau, landing at 1.4-2.1 x BDP.
-    ladder = []
-    for growth in TRANSIT_GROWTH:
-        for tname, threshold in TRANSIT_UPDATE_THRESHOLDS:
-            for name, fields in points:
-                ladder.append((f"{name}-{growth}-{tname}",
-                               dict(protocol="rammux", probe_interval=PROBE_INTERVAL,
-                                    transit_growth=growth, transit_update_threshold=threshold,
-                                    **fields)))
-    return ladder
+    rammux runs over the `transit` crate, whose window is steered rather than
+    configured - from the one-way queuing delay it observes, after LEDBAT - so
+    a ladder of window sizes would measure the same steering four times over.
+    What the delay rule does expose is its target: how much standing queue it
+    holds, as a fraction of the clean round trip. The transit tuning put the
+    knee where more queue stops buying throughput at 0.30 of the round trip on
+    every link tried; 0.20 gave back about 1.5 points of link for about 30 ms
+    across four links; and a flat 5 ms is the latency-first end at about 91%
+    of link. Those three are the points. Everything else in the transit layer
+    is left at the crate's tuned default.
+    """
+    base = {
+        "stream_recv_window": 256 * KIB,
+        "global_recv_window": 25 * MIB - 256 * KIB * 9,
+        "ping_interval": PING_INTERVAL,
+    }
+    return [
+        ("transit-default", dict(protocol="rammux", **base)),
+        ("transit-queue-0.20", dict(protocol="rammux",
+                                    transit={"target_queue_rtts": 0.20}, **base)),
+        ("transit-queue-5ms", dict(protocol="rammux",
+                                   transit={"target_queue_rtts": 0.0,
+                                            "target_queue_ms": 5.0}, **base)),
+    ]
 
 
 def yamux_ladder():
@@ -159,10 +150,8 @@ LADDERS = {
 # others.
 SMOKE = [
     ("none", "rammux", "smoke", {
-        "protocol": "rammux", "probe_interval": PROBE_INTERVAL,
-        "ping_interval": PING_INTERVAL, "transit_window": 256 * KIB,
-        "transit_window_max": 256 * KIB, "stream_recv_window": 256 * KIB,
-        "global_recv_window": 4 * MIB,
+        "protocol": "rammux", "ping_interval": PING_INTERVAL,
+        "stream_recv_window": 256 * KIB, "global_recv_window": 4 * MIB,
     }),
     ("datacenter", "h2", "smoke", {
         "protocol": "h2", "adaptive_window": True,
@@ -180,7 +169,7 @@ SMOKE = [
 # should be identical, and how far apart they land is the resolution of every
 # other difference in it. Must name a real ladder point - `matrix` refuses to
 # build if it does not.
-ANCHOR = ("rammux", "transit-2x-rate-plateau-64k")
+ANCHOR = ("rammux", "transit-default")
 
 
 def matrix(links, protocols):

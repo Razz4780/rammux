@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::Context as _;
 use hyper::header::HeaderName;
-use rammux::config::{RammuxConfig, TransitGrowth};
+use rammux::{config::RammuxConfig, transit};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -102,8 +102,8 @@ pub struct ClientConfig {
     pub await_endpoint: Option<String>,
 }
 
-fn default_transit_update_threshold() -> NonZeroU32 {
-    NonZeroU32::new(64 * 1024).unwrap()
+fn default_ping_timeout() -> NonZeroU64 {
+    NonZeroU64::new(10).unwrap()
 }
 
 fn non_zero_min() -> NonZeroUsize {
@@ -150,22 +150,24 @@ pub struct RammuxMuxerConfig {
     pub stream_recv_window: NonZeroU32,
     /// Global receive window pool that streams borrow from, in bytes.
     pub global_recv_window: usize,
-    /// Initial transit window, in bytes. `0` disables it.
-    pub transit_window: u32,
-    /// Autotune limit of the transit window, in bytes.
-    pub transit_window_max: u32,
-    /// How the transit window grows towards the size of the path.
+    /// The transit layer under the connection: how the window that bounds
+    /// the data in flight is sized.
+    ///
+    /// Every field defaults to the `transit` crate's tuned value, so a config
+    /// that says nothing here runs the defaults, and one that names a single
+    /// knob changes only that.
     #[serde(default)]
-    pub transit_growth: TransitGrowthConfig,
-    /// How much freed transit credit is re-granted at once, in bytes, or half
-    /// the window if that is smaller. `4294967295` reproduces the old
-    /// half-window behaviour on any window.
-    #[serde(default = "default_transit_update_threshold")]
-    pub transit_update_threshold: NonZeroU32,
-    /// Interval of the link-clearing probe, in seconds. Also its timeout.
-    pub probe_interval: NonZeroU64,
-    /// Interval of the plain ping, in seconds. Also its timeout.
+    pub transit: TransitConfig,
+    /// Interval of the loaded-RTT ping, in seconds.
     pub ping_interval: NonZeroU64,
+    /// How long a ping may go unanswered before the connection is declared
+    /// dead, in seconds.
+    ///
+    /// The connection's one liveness check: rammux gives up on nothing by
+    /// itself, and the transit layer's probe degrades rather than fails when
+    /// the peer stops answering.
+    #[serde(default = "default_ping_timeout")]
+    pub ping_timeout: NonZeroU64,
 }
 
 impl RammuxMuxerConfig {
@@ -180,43 +182,138 @@ impl RammuxMuxerConfig {
         config.local_recv_window = self.stream_recv_window;
         config.remote_recv_window = self.stream_recv_window.get();
         config.global_recv_window = self.global_recv_window;
-        config.local_transit_window = self.transit_window;
-        config.remote_transit_window = self.transit_window;
-        config.transit_window_max = self.transit_window_max;
-        config.transit_update_threshold = self.transit_update_threshold;
-        config.transit_growth = match self.transit_growth {
-            TransitGrowthConfig::RateCeiling => TransitGrowth::RateCeiling,
-            TransitGrowthConfig::RatePlateau => TransitGrowth::RatePlateau,
-        };
+        config.transit_sizing = self.transit.sizing();
+        config.transit_probe_spacing = self.transit.probe_spacing;
         config.max_inbound_streams = 100;
         config.max_outbound_streams = 100;
         config
     }
 
-    /// The probe schedule both sides run with.
-    pub fn probe_interval(&self) -> Duration {
-        Duration::from_secs(self.probe_interval.get())
-    }
-
-    /// The plain ping schedule both sides run with.
+    /// The ping schedule both sides run with.
     pub fn ping_interval(&self) -> Duration {
         Duration::from_secs(self.ping_interval.get())
     }
+
+    /// How long a ping may go unanswered.
+    pub fn ping_timeout(&self) -> Duration {
+        Duration::from_secs(self.ping_timeout.get())
+    }
 }
 
-/// How rammux's transit window grows. Mirrors [`TransitGrowth`], which the
-/// library does not serialize.
-#[derive(Deserialize, Serialize, JsonSchema, PartialEq, Eq, Debug, Default, Clone, Copy)]
-#[serde(rename_all = "kebab-case")]
-pub enum TransitGrowthConfig {
-    /// Doubles while window-limited, ceilinged at 2 x clean RTT x the
-    /// measured arrival rate - which the window itself limits, so in
-    /// practice the window crawls.
-    #[default]
-    RateCeiling,
-    /// Doubles while each doubling still raises the inbound rate by a
-    /// quarter; direction-correct and needs no ping.
-    RatePlateau,
+/// The transit layer's knobs.
+///
+/// Named as the `transit` crate's own command line names them, so a setting
+/// found with that tool's harness carries over verbatim. Defaults are read
+/// from the crate rather than repeated, so the two cannot drift.
+#[derive(Deserialize, Serialize, JsonSchema, PartialEq, Debug, Clone, Copy)]
+#[serde(default)]
+pub struct TransitConfig {
+    /// Window granted before anything is measured, in bytes.
+    pub window: u32,
+    /// Growth limit, in bytes.
+    pub max_window: u32,
+    /// Freed credit that triggers a re-grant, in bytes. Capped at half the
+    /// window.
+    pub re_grant: u32,
+    /// How many re-grants to fit into a round trip, or `0` for a flat
+    /// `re_grant` threshold on every link.
+    pub re_grants_per_rtt: u32,
+    /// How many control intervals the delay signal's median is taken over.
+    pub delay_filter: usize,
+    /// One-way queuing delay the delay rule holds, as a fraction of the
+    /// clean round trip. Takes precedence over `target_queue_ms` when
+    /// non-zero.
+    ///
+    /// The transit tuning found 0.30 to be the knee where more queue stops
+    /// buying throughput; 0.20 trades about 1.5 points of link for about
+    /// 30 ms of latency across four links.
+    pub target_queue_rtts: f64,
+    /// The same target in milliseconds, used when `target_queue_rtts` is
+    /// zero. `0` here with `5` there is the latency-first end, at about 91%
+    /// of link.
+    pub target_queue_ms: f64,
+    /// Fraction of the window a full-scale delay error moves it by, per round
+    /// trip.
+    pub ledbat_gain: f64,
+    /// How many of the last probe's durations to wait before the next one.
+    pub probe_spacing: f64,
+}
+
+impl Default for TransitConfig {
+    fn default() -> Self {
+        let sizing = transit::Sizing::default();
+        let transit::Growth::Ledbat {
+            target_rtts,
+            target,
+            gain,
+        } = sizing.growth;
+        Self {
+            window: sizing.initial,
+            max_window: sizing.max,
+            re_grant: sizing.re_grant,
+            re_grants_per_rtt: sizing.re_grants_per_rtt,
+            delay_filter: sizing.delay_filter,
+            target_queue_rtts: target_rtts,
+            target_queue_ms: target.as_secs_f64() * 1000.0,
+            ledbat_gain: gain,
+            probe_spacing: transit::DEFAULT_PROBE_SPACING,
+        }
+    }
+}
+
+impl TransitConfig {
+    /// The [`transit::Sizing`] these knobs spell.
+    pub fn sizing(&self) -> transit::Sizing {
+        transit::Sizing {
+            initial: self.window,
+            max: self.max_window.max(self.window),
+            re_grant: self.re_grant.max(1),
+            re_grants_per_rtt: self.re_grants_per_rtt,
+            delay_filter: self.delay_filter.max(1),
+            growth: transit::Growth::Ledbat {
+                target_rtts: self.target_queue_rtts,
+                target: Duration::from_micros((self.target_queue_ms * 1000.0).round() as u64),
+                gain: self.ledbat_gain,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// A config that says nothing about the transit layer runs the crate's
+    /// tuned configuration - and the round trip through milliseconds and
+    /// back does not disturb it.
+    #[test]
+    fn the_transit_defaults_are_the_crates() {
+        let config = TransitConfig::default();
+        assert_eq!(config.sizing(), transit::Sizing::default());
+        assert_eq!(config.probe_spacing, transit::DEFAULT_PROBE_SPACING);
+    }
+
+    /// One knob named, the rest defaulted, and the knob reaches the sizing.
+    #[test]
+    fn a_single_transit_knob_can_be_set() {
+        let config: RammuxMuxerConfig = serde_json::from_str(
+            r#"{ "stream_recv_window": 65536, "global_recv_window": 1048576,
+                 "ping_interval": 5, "transit": { "target_queue_rtts": 0.2 } }"#,
+        )
+        .unwrap();
+        let sizing = config.transit.sizing();
+        let transit::Growth::Ledbat { target, gain, .. } = transit::Sizing::default().growth;
+        assert_eq!(
+            sizing.growth,
+            transit::Growth::Ledbat {
+                target_rtts: 0.2,
+                target,
+                gain,
+            }
+        );
+        assert_eq!(sizing.initial, transit::Sizing::default().initial);
+        assert_eq!(config.ping_timeout(), Duration::from_secs(10));
+    }
 }
 
 /// yamux configuration. Both sides use the same values.

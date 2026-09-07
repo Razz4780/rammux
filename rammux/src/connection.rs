@@ -4,8 +4,6 @@ use std::{
     collections::hash_map::Entry,
     convert::Infallible,
     io,
-    num::NonZeroU32,
-    ops::Not,
     task::{Context, Poll},
     time::Duration,
 };
@@ -13,6 +11,7 @@ use std::{
 use async_selector::selector::Selector;
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
+use transit::Transit;
 
 use crate::{
     codec::{
@@ -23,13 +22,13 @@ use crate::{
     config::{RammuxConfig, RammuxRole},
     connection::state::{Active, ConnState},
     error::{ErrorKind, RammuxError},
-    global_pool::{GlobalPool, TransitRecv, TransitSend},
-    probe::{Probe, ProbeDone, ProbeFrame},
+    global_pool::GlobalPool,
+    ping::{Ping, PingFrame},
     stream::RammuxDuplex,
     stream_id::StreamId,
 };
 
-pub use crate::{connection::downgrade::Downgraded, probe::ProbeEvent};
+pub use crate::{connection::downgrade::Downgraded, ping::PingEvent};
 
 mod downgrade;
 mod state;
@@ -48,37 +47,52 @@ mod state;
 ///    [`RammuxProgress::Inbound`],
 /// 4. surface remotely initiated downgrade handshake as
 ///    [`RammuxProgress::Downgraded`], and
-/// 5. surface RTT-measurement transitions as [`RammuxProgress::Probe`].
+/// 5. surface `PING` transitions as [`RammuxProgress::Ping`].
 ///
 /// If the connection stops being polled, stream IO stalls, flow-control updates
 /// stop, and closed stream IDs are not reclaimed.
 ///
+/// # Transit window
+///
+/// rammux does not write to the IO transport directly. The transport is
+/// wrapped in a [`transit::Transit`], which bounds how much data is in flight
+/// between the peers and steers that bound from the queuing delay it
+/// observes, so that a bulk stream cannot fill the path and delay everything
+/// sharing it. Both peers do this - `Transit` is a framed protocol of its
+/// own, not a transparent shim - and it is not optional. Its settings are
+/// [`RammuxConfig::transit_sizing`] and [`RammuxConfig::transit_probe_spacing`];
+/// the [`RammuxRole::Client`] is the transit
+/// [`Initiator`](transit::Role::Initiator), which pays for the link-clearing
+/// probe both ends size from. What that layer is doing is reported in
+/// [`RammuxStats::transit`].
+///
+/// Two settings on the transport itself matter to that layer and are the
+/// application's to get right: `TCP_NODELAY` on both ends, and a send
+/// buffer that can grow past the transit window. See
+/// [`transit::connection`].
+///
 /// # RTT measurement
 ///
 /// A connection runs no timers of its own. Nothing here sleeps, and the
-/// only thing that ever wakes the connection's task is the transport.
-/// The two `PING` mechanisms are therefore started by your code:
+/// only thing that ever wakes the connection's task is the transport. The
+/// `PING` mechanism is therefore started by your code:
+/// [`RammuxConnection::send_ping`] measures the *loaded* RTT with a `PING`
+/// that travels inline with data, and stream receive windows are sized
+/// from it. Nothing in this crate gives up on it. Every transition is
+/// reported as a [`RammuxProgress::Ping`], which is what lets your code
+/// impose the schedule and the deadline it wants, and
+/// [`RammuxConnection::abandon_ping`] is how it enforces one.
 ///
-/// - [`RammuxConnection::send_ping`] measures the *loaded* RTT with a
-///   `PING` that travels inline with data. Stream receive windows are
-///   sized from it.
-/// - [`RammuxConnection::start_probe`] measures the *clean* RTT: it
-///   pauses data output on both sides, drains the link, and times a
-///   `PING` over it. The session-level transit window is sized from it,
-///   so a connection that never probes never autotunes.
-///
-/// Neither is given up on. Every transition is reported as a
-/// [`RammuxProgress::Probe`], which is what lets your code impose the
-/// schedule and the deadlines it wants - including the deadline on
-/// [`ProbeEvent::ProbeStarted`] that detects a dead peer, since an
-/// unfinished probe pauses data output indefinitely.
+/// The *clean* RTT, over a drained link, is measured by the transit layer
+/// on its own schedule and needs no driving.
 ///
 /// # Downgrade
 ///
 /// To stop using rammux and recover the wrapped transport, call
 /// [`RammuxConnection::downgrade`] and await the returned [`Downgraded`].
 /// That future sends the final `TERM` frame, waits for the peer's `TERM`,
-/// and yields a clean transport with no unread rammux bytes left in it.
+/// and yields the transit layer over the original transport, with no
+/// unread rammux bytes left in it.
 ///
 /// Note that the other side might start the downgrade first.
 /// In this case, [`RammuxConnection::progress`]/[`RammuxConnection::poll_progress`]
@@ -99,31 +113,21 @@ where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
     /// Creates a new rammux connection with clean state.
+    ///
+    /// # Panics
+    ///
+    /// Must be called from within a Tokio runtime context: the transit layer
+    /// arms a timer for its probe schedule here.
     pub fn new(role: RammuxRole, io: IO, config: RammuxConfig) -> Self {
+        let transit = Transit::new(io, config.transit_config(role));
         Self {
             state: ConnState::Active(Active {
-                codec: RammuxCodec::new(io, config.frame_limit),
+                codec: RammuxCodec::new(transit, config.frame_limit),
                 streams: Default::default(),
                 selector: Selector::new(GlobalPool {
                     rtt: None,
                     available: config.global_recv_window,
-                    probe: Probe::new(role),
-                    transit_send: (config.remote_transit_window > 0).then_some(TransitSend {
-                        credit: config.remote_transit_window,
-                    }),
-                    transit_recv: NonZeroU32::new(config.local_transit_window).map(|initial| {
-                        TransitRecv::new(
-                            initial,
-                            config.transit_window_max,
-                            config.transit_update_threshold,
-                        )
-                    }),
-                    dirty_rtt: None,
-                    growth: config.transit_growth,
-                    transit_blocked: false,
-                    stalled_since: None,
-                    stalled_total: Duration::ZERO,
-                    stalled_events: 0,
+                    ping: Ping::new(),
                 }),
             }),
             config,
@@ -150,79 +154,18 @@ where
             .ok_or(io::ErrorKind::UnexpectedEof)
             .map_err(io::Error::from)??;
 
-        match &frame {
-            // Past the peer's CLEAR_LINK its direction is drained: only
-            // probe frames (and a downgrade) may arrive until the probe
-            // runs its course on the peer's side.
-            DecodedFrame::Stream { .. } | DecodedFrame::SessionWindowUpdate { .. }
-                if active.selector.strategy().probe.peer_must_be_silent() =>
-            {
-                return Poll::Ready(Err(ErrorKind::Probe(
-                    "received a non-probe frame while the link is being cleared",
-                )));
-            },
-            DecodedFrame::Stream {
-                payload: StreamPayload::Data(data),
-                ..
-            } => {
-                // Transit credit is freed as soon as the data is stored in this muxer.
-                active
-                    .selector
-                    .strategy_mut()
-                    .transit_recv_freed(data.as_ref().len());
-            },
-            _ => {},
-        }
-
         let progress = match frame {
-            DecodedFrame::ClearLink { syn } => {
-                active.selector.strategy_mut().probe.on_clear_link(syn)?;
-                RammuxProgress::Empty
-            },
-
-            DecodedFrame::SessionWindowUpdate { update } => {
-                let global = active.selector.strategy_mut();
-                let transit = global
-                    .transit_send
-                    .as_mut()
-                    .ok_or(ErrorKind::Transit("transit window is not enabled"))?;
-                transit.credit = transit
-                    .credit
-                    .checked_add(update)
-                    .ok_or(ErrorKind::Transit("transit window overflow"))?;
-                if update > 0 {
-                    // The grant is what the sender was stalled on, so the
-                    // stall ends here rather than on the next outbound pass.
-                    global.transit_blocked = false;
-                    global.note_outbound_pass(false);
-                    // Streams gated on transit credit returned Pending without
-                    // a stream-level wakeup source, so wake all of them.
-                    active.selector.wake_all();
-                }
-                RammuxProgress::Empty
-            },
-
             DecodedFrame::Ping {
                 payload,
                 is_response,
             } => {
-                let done = if is_response {
-                    active.selector.strategy_mut().probe.on_pong(payload)?
-                } else {
-                    active.selector.strategy_mut().probe.on_ping(payload)?
-                };
                 let global = active.selector.strategy_mut();
-                // Loaded-RTT samples come from the plain ping and from the
-                // probe's own CLEAR_LINK leg, so they are drained here
-                // rather than carried on probe completion.
-                if let Some(dirty_rtt) = global.probe.take_dirty_rtt() {
-                    global.dirty_rtt = Some(dirty_rtt);
-                }
-                if let Some(ProbeDone { rtt, resume }) = done {
-                    global.rtt = Some(rtt);
-                    if resume {
-                        active.selector.wake_all();
+                if is_response {
+                    if let Some(rtt) = global.ping.on_pong(payload)? {
+                        global.rtt = Some(rtt);
                     }
+                } else {
+                    global.ping.on_ping(payload);
                 }
                 RammuxProgress::Empty
             },
@@ -342,51 +285,21 @@ where
         let active = self.state.active_mut()?;
 
         loop {
-            match active.codec.poll_ready_unpin(cx) {
-                // The transport itself is backed up: whatever the sender is
-                // waiting on, it is not a transit credit grant.
-                Poll::Pending => {
-                    active.selector.strategy_mut().note_outbound_pass(false);
-                    return Poll::Pending;
-                },
-                Poll::Ready(result) => result?,
-            }
+            std::task::ready!(active.codec.poll_ready_unpin(cx))?;
 
-            if let Some((frame, resume)) = active.selector.strategy_mut().probe.next_frame() {
+            // Pings first: the peer is timing the pongs, and our own ping
+            // is timing the queue it has to wait in, so neither should
+            // wait behind a round of stream frames.
+            if let Some(frame) = active.selector.strategy_mut().ping.next_frame() {
                 let item = match frame {
-                    ProbeFrame::Clear(syn) => EncoderItem::new_clear_link(syn),
-                    ProbeFrame::Ping(payload) => EncoderItem::new_ping(payload, false),
-                    ProbeFrame::Pong(payload) => EncoderItem::new_ping(payload, true),
+                    PingFrame::Ping(payload) => EncoderItem::new_ping(payload, false),
+                    PingFrame::Pong(payload) => EncoderItem::new_ping(payload, true),
                 };
                 active.codec.start_send_unpin(item)?;
-                if resume {
-                    active.selector.wake_all();
-                }
-                continue;
-            }
-
-            if active.selector.strategy().probe_paused() {
-                // Only probe and ping frames may travel while clearing the
-                // link; flush and wait. The probe pause is its own cost and
-                // must not be charged to the transit window.
-                active.selector.strategy_mut().note_outbound_pass(false);
-                let _ = active.codec.poll_flush_unpin(cx)?;
-                break Poll::Pending;
-            }
-
-            if let Some(update) = active.selector.strategy_mut().transit_recv_update() {
-                active
-                    .codec
-                    .start_send_unpin(EncoderItem::new_session_window_update(update))?;
                 continue;
             }
 
             if let Poll::Ready(Some((update, fin_state))) = active.selector.poll_next_unpin(cx) {
-                if update.data.is_empty().not() {
-                    let global = active.selector.strategy_mut();
-                    global.transit_blocked = false;
-                    global.note_outbound_pass(false);
-                }
                 let id = update.id;
                 let item = EncoderItem::from(update);
                 active.codec.start_send_unpin(item)?;
@@ -400,11 +313,6 @@ where
                 }
                 continue;
             } else {
-                // Every stream came back pending. If at least one of them had
-                // payload ready and only the spent transit window held it
-                // back, the sender is stalled on a credit grant.
-                let blocked = active.selector.strategy().transit_blocked;
-                active.selector.strategy_mut().note_outbound_pass(blocked);
                 let _ = active.codec.poll_flush_unpin(cx)?;
                 break Poll::Pending;
             }
@@ -436,7 +344,7 @@ where
             return inbound.map(Ok);
         }
         let _ = self.make_outbound_progress(cx)?;
-        // Both halves of the pass produce probe transitions - an inbound
+        // Both halves of the pass produce ping transitions - an inbound
         // pong completes an exchange, an outbound frame starts one - so
         // they are drained once, at the end. A new stream outranks them:
         // it is reported now, and the events keep until the next poll.
@@ -448,10 +356,10 @@ where
             .active_mut()?
             .selector
             .strategy_mut()
-            .probe
+            .ping
             .next_event()
         {
-            Some(event) => Poll::Ready(Ok(RammuxProgress::Probe(event))),
+            Some(event) => Poll::Ready(Ok(RammuxProgress::Ping(event))),
             None => inbound.map(Ok),
         }
     }
@@ -465,7 +373,7 @@ where
     ) -> Poll<Result<RammuxProgress<IO>, RammuxError>> {
         let result = std::task::ready!(self.poll_progress_inner(cx));
         match &result {
-            Ok(RammuxProgress::Empty | RammuxProgress::Inbound(..) | RammuxProgress::Probe(..)) => {
+            Ok(RammuxProgress::Empty | RammuxProgress::Inbound(..) | RammuxProgress::Ping(..)) => {
             },
             Ok(RammuxProgress::Downgraded(..)) => {},
             Err(ErrorKind::AlreadyDowngraded | ErrorKind::Poisoned) => {},
@@ -485,61 +393,27 @@ where
         futures::future::poll_fn(|cx| self.poll_progress(cx)).await
     }
 
-    /// Initiates a link-clearing probe, measuring the clean RTT.
-    ///
-    /// Both sides pause data output, drain the link with a `CLEAR_LINK`
-    /// exchange, and time a `PING` over it. The sample is the path's own
-    /// cost, which this connection's standing queues cannot inflate; the
-    /// session-level transit window is sized from it.
-    ///
-    /// Returns whether the probe was started. It is refused (`false`)
-    /// while another probe is running - including one the peer initiated -
-    /// and while a plain [`Self::send_ping`] is unanswered, because that
-    /// ping's pong would be indistinguishable from the probe's own. Either
-    /// retry later or give the ping up with [`Self::abandon_ping`].
-    ///
-    /// The `CLEAR_LINK` is encoded on the next poll, not here. Nothing in
-    /// this crate gives up on the probe: data output stays paused until it
-    /// completes, so an application that wants a liveness check must put
-    /// its own deadline on the [`ProbeEvent::ProbeStarted`] that this
-    /// produces.
-    pub fn start_probe(&mut self) -> Result<bool, RammuxError> {
-        Ok(self
-            .state
-            .active_mut()?
-            .selector
-            .strategy_mut()
-            .probe
-            .start())
-    }
-
-    /// Sends a plain `PING`, measuring the loaded RTT.
+    /// Sends a `PING`, measuring the loaded RTT.
     ///
     /// The ping travels inline with data, so it times the round trip
-    /// through the queues that are actually standing. Per-stream receive
-    /// windows are sized from it, because a stream's credit loop runs
-    /// through those same queues.
+    /// through the queues that are actually standing - the transit layer's
+    /// credit wait included. Per-stream receive windows are sized from it,
+    /// because a stream's credit loop runs through those same queues.
     ///
     /// Returns whether the ping was queued. It is refused (`false`) while
-    /// a probe is running, since a `PING` there belongs to the dance, and
-    /// while another plain ping is still outstanding.
+    /// another ping is still outstanding: only one is ever in flight, so
+    /// its pong is unambiguous.
     ///
     /// The frame is encoded on the next poll, not here, and nothing in
     /// this crate gives up on it: an application that wants a deadline
-    /// must put it on the [`ProbeEvent::PingSent`] that this produces, and
+    /// must put it on the [`PingEvent::Sent`] that this produces, and
     /// call [`Self::abandon_ping`] when it expires.
     pub fn send_ping(&mut self) -> Result<bool, RammuxError> {
-        Ok(self
-            .state
-            .active_mut()?
-            .selector
-            .strategy_mut()
-            .probe
-            .send_ping())
+        Ok(self.state.active_mut()?.selector.strategy_mut().ping.send())
     }
 
-    /// Gives up on the outstanding plain `PING`, freeing
-    /// [`Self::start_probe`] to run.
+    /// Gives up on the outstanding `PING`, freeing [`Self::send_ping`] to
+    /// run again.
     ///
     /// Returns whether one was in flight. A `PONG` that arrives for it
     /// afterwards is ignored rather than failing the connection.
@@ -549,8 +423,8 @@ where
             .active_mut()?
             .selector
             .strategy_mut()
-            .probe
-            .abandon_ping())
+            .ping
+            .abandon())
     }
 
     /// Attempts to start a new outbound stream.
@@ -585,60 +459,20 @@ where
 
     /// Returns current statistics of this connection.
     pub fn stats(&self) -> RammuxStats {
-        let (inbound_streams, outbound_streams, rtt, available_global_recv_window) = self
-            .state
-            .active()
-            .map(|active| {
-                let global = active.selector.strategy();
-                (
-                    u32::try_from(active.streams.inbound.len())
-                        .expect("we can't have more than u32 inbound streams"),
-                    u32::try_from(active.streams.outbound.len())
-                        .expect("we can't have more than u32 outbound streams"),
-                    global.rtt,
-                    global.available,
-                )
-            })
-            .unwrap_or_default();
-        let (transit_starved, transit_starved_events) = self
-            .state
-            .active()
-            .map(|active| {
-                let global = active.selector.strategy();
-                let pending = global
-                    .stalled_since
-                    .map(|at| at.elapsed())
-                    .unwrap_or_default();
-                (global.stalled_total + pending, global.stalled_events)
-            })
-            .unwrap_or_default();
-        let dirty_rtt = self
-            .state
-            .active()
-            .ok()
-            .and_then(|active| active.selector.strategy().dirty_rtt);
-        let (transit_send_credit, transit_recv_window) = self
-            .state
-            .active()
-            .map(|active| {
-                let global = active.selector.strategy();
-                (
-                    global.transit_send.as_ref().map(|transit| transit.credit),
-                    global.transit_recv.as_ref().map(|recv| recv.current),
-                )
-            })
-            .unwrap_or_default();
-
+        let active = self.state.active().ok();
+        let global = active.map(|active| active.selector.strategy());
         RammuxStats {
-            inbound_streams,
-            outbound_streams,
-            rtt,
-            available_global_recv_window,
-            transit_send_credit,
-            transit_recv_window,
-            transit_starved,
-            transit_starved_events,
-            dirty_rtt,
+            inbound_streams: active.map_or(0, |active| {
+                u32::try_from(active.streams.inbound.len())
+                    .expect("we can't have more than u32 inbound streams")
+            }),
+            outbound_streams: active.map_or(0, |active| {
+                u32::try_from(active.streams.outbound.len())
+                    .expect("we can't have more than u32 outbound streams")
+            }),
+            rtt: global.and_then(|global| global.rtt),
+            available_global_recv_window: global.map_or(0, |global| global.available),
+            transit: active.map(|active| active.codec.io().stats()),
         }
     }
 }
@@ -651,12 +485,11 @@ pub enum RammuxProgress<IO> {
     Downgraded(Downgraded<IO>),
     /// A new inbound stream was started by the other side.
     Inbound(RammuxDuplex),
-    /// The RTT-measurement state machine changed state.
+    /// The connection's `PING` exchange changed state.
     ///
-    /// See [`ProbeEvent`] doc for more info. An application that does not
-    /// schedule pings or probes, and does not want a liveness check, can
-    /// ignore this variant entirely.
-    Probe(ProbeEvent),
+    /// See [`PingEvent`] doc for more info. An application that does not
+    /// send pings can ignore this variant entirely.
+    Ping(PingEvent),
     /// Some progress was made, but nothing meaningful to report.
     ///
     /// This variant exists only to make [`RammuxConnection::poll_progress`] reliably return control to the caller.
@@ -671,29 +504,20 @@ pub struct RammuxStats {
     pub inbound_streams: u32,
     /// Count of currently active outbound streams.
     pub outbound_streams: u32,
-    /// Most recent clean round trip time, measured by the link-clearing
-    /// probe over the drained link.
+    /// Most recent loaded round trip time: the path plus both sides'
+    /// standing queues, sampled by [`RammuxConnection::send_ping`].
     ///
-    /// Empty until the first probe completes. Probes are started with
-    /// [`RammuxConnection::start_probe`], so a connection that never
-    /// probes never fills this in.
+    /// Empty until the first pong arrives. Pings are started by the
+    /// application, so a connection that never pings never fills this in.
     pub rtt: Option<Duration>,
     /// Bytes available in the global receive window pool.
     pub available_global_recv_window: usize,
-    /// Most recent loaded round trip time: the path plus both sides'
-    /// standing queues, sampled by [`RammuxConnection::send_ping`] and by
-    /// the probe's own `CLEAR_LINK` leg.
-    pub dirty_rtt: Option<Duration>,
-    /// Remaining in-flight credit granted to us by the peer, if the transit window is enabled.
-    pub transit_send_credit: Option<u32>,
-    /// Current size of the transit window we grant to the peer, if enabled.
-    pub transit_recv_window: Option<u32>,
-    /// Total time the sender spent stalled on a transit credit grant: the
-    /// transport was writable and stream payload was ready, but the transit
-    /// window was spent.
-    pub transit_starved: Duration,
-    /// How many such stalls the sender entered.
-    pub transit_starved_events: u64,
+    /// What the transit layer says about itself: the window it grants the
+    /// peer, the credit the peer grants us, the clean round trip its probe
+    /// measured, and how often the sender ran out of credit.
+    ///
+    /// Empty once the connection is downgraded or poisoned.
+    pub transit: Option<transit::Stats>,
 }
 
 #[cfg(test)]
@@ -704,10 +528,11 @@ mod test {
     use futures::{FutureExt, SinkExt, StreamExt, stream::FuturesUnordered};
     use rstest::rstest;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use transit::Transit;
 
     use crate::{
         config::{RammuxConfig, RammuxRole},
-        connection::{ProbeEvent, RammuxConnection, RammuxProgress},
+        connection::{PingEvent, RammuxConnection, RammuxProgress},
         stream::RammuxDuplex,
     };
 
@@ -731,18 +556,17 @@ mod test {
         );
     }
 
-    /// Runs a connection with the RTT schedule an application is expected
-    /// to impose on it: probes and plain pings alongside the stream IO.
+    /// Runs a connection with the ping schedule an application is expected
+    /// to impose on it, alongside the stream IO.
     async fn run_rammux(
         mut conn: RammuxConnection<DuplexStream>,
         streams: u32,
         data_in_stream: usize,
-    ) -> DuplexStream {
+    ) -> Transit<DuplexStream> {
         let mut remaining_inbound = streams;
         let mut remaining_outbound = streams;
         let mut remaining_finished = streams * 2;
         let mut futs = FuturesUnordered::new();
-        let mut probes = tokio::time::interval(Duration::from_millis(25));
         let mut pings = tokio::time::interval(Duration::from_millis(7));
 
         let downgraded = loop {
@@ -762,14 +586,6 @@ mod test {
                         continue;
                     }
                 }
-                _ = probes.tick() => {
-                    // An unanswered ping blocks the probe; give it up so
-                    // the next tick can go through.
-                    if !conn.start_probe().unwrap() {
-                        conn.abandon_ping().unwrap();
-                    }
-                    continue;
-                }
                 _ = pings.tick() => {
                     conn.send_ping().unwrap();
                     continue;
@@ -777,7 +593,7 @@ mod test {
                 progress = conn.progress() => progress,
             };
             match progress.unwrap() {
-                RammuxProgress::Empty | RammuxProgress::Probe(..) => {},
+                RammuxProgress::Empty | RammuxProgress::Ping(..) => {},
                 RammuxProgress::Downgraded(downgraded) => break downgraded,
                 RammuxProgress::Inbound(stream) => {
                     remaining_inbound = remaining_inbound.checked_sub(1).unwrap();
@@ -825,13 +641,13 @@ mod test {
         a: &mut RammuxConnection<DuplexStream>,
         b: &mut RammuxConnection<DuplexStream>,
         want: usize,
-    ) -> Vec<ProbeEvent> {
+    ) -> Vec<PingEvent> {
         let collect = async {
             let mut events = Vec::new();
             while events.len() < want {
                 tokio::select! {
                     progress = a.progress() => {
-                        if let RammuxProgress::Probe(event) = progress.unwrap() {
+                        if let RammuxProgress::Ping(event) = progress.unwrap() {
                             events.push(event);
                         }
                     }
@@ -847,10 +663,10 @@ mod test {
             .expect("the exchange never completed")
     }
 
-    /// Neither `PING` mechanism runs on its own, and each reports the
-    /// transitions an application needs to time it out.
+    /// The ping does not run on its own, and it reports the transitions an
+    /// application needs to time it out.
     #[tokio::test]
-    async fn ping_and_probe_are_caller_driven() {
+    async fn the_ping_is_caller_driven() {
         let (io_1, io_2) = tokio::io::duplex(4096);
         let config = RammuxConfig::new();
         let mut client = RammuxConnection::new(RammuxRole::Client, io_1, config.clone());
@@ -858,46 +674,57 @@ mod test {
 
         // An idle connection measures nothing: no clock, no samples.
         assert!(client.stats().rtt.is_none());
-        assert!(client.stats().dirty_rtt.is_none());
 
-        // A plain ping, in and out, yields the loaded sample.
         assert!(client.send_ping().unwrap());
         assert!(!client.send_ping().unwrap(), "only one is outstanding");
         let events = exchange(&mut client, &mut server, 2).await;
-        assert_eq!(events[0], ProbeEvent::PingSent);
-        assert!(matches!(events[1], ProbeEvent::PingAnswered { .. }));
-        assert!(client.stats().dirty_rtt.is_some());
-        assert!(
-            client.stats().rtt.is_none(),
-            "a plain ping is not a clean sample"
-        );
-
-        // A probe yields the clean sample the transit autotune sizes from.
-        assert!(client.start_probe().unwrap());
-        assert!(!client.start_probe().unwrap(), "one probe at a time");
-        let events = exchange(&mut client, &mut server, 2).await;
-        assert_eq!(events[0], ProbeEvent::ProbeStarted { initiated: true });
-        assert!(matches!(events[1], ProbeEvent::ProbeCompleted { .. }));
+        assert_eq!(events[0], PingEvent::Sent);
+        assert!(matches!(events[1], PingEvent::Answered { .. }));
         assert!(client.stats().rtt.is_some());
+        assert!(client.send_ping().unwrap(), "the next one is free to go");
     }
 
-    /// The peer's probe is announced too: it pauses this side's data, so
-    /// an application watching for a stuck connection has to see it.
+    /// The transit layer underneath is real: its probe runs on the client's
+    /// schedule without anything driving it, and what it measures is
+    /// reported through the connection's statistics.
     #[tokio::test]
-    async fn a_peer_probe_is_reported() {
+    async fn the_transit_layer_probes_and_reports() {
         let (io_1, io_2) = tokio::io::duplex(4096);
         let config = RammuxConfig::new();
         let mut client = RammuxConnection::new(RammuxRole::Client, io_1, config.clone());
         let mut server = RammuxConnection::new(RammuxRole::Server, io_2, config);
 
-        assert!(client.start_probe().unwrap());
-        let events = exchange(&mut server, &mut client, 2).await;
-        assert_eq!(events[0], ProbeEvent::ProbeStarted { initiated: false });
-        assert!(matches!(events[1], ProbeEvent::ProbeCompleted { .. }));
-        assert!(server.stats().rtt.is_some());
+        let before = client
+            .stats()
+            .transit
+            .expect("an active connection has a transit layer");
+        assert_eq!(before.window, client.config().transit_sizing.initial);
+        assert_eq!(before.probes, 0);
+
+        // The client's first probe is due at once - once the timer wheel
+        // agrees, which over an in-memory pipe is later than the whole
+        // exchange below takes. Its `CLEAR_LINK` then pauses the client's
+        // output until the probe completes, so a ping cannot have come back
+        // before the probe did.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(client.send_ping().unwrap());
+        exchange(&mut client, &mut server, 2).await;
+
+        let client_transit = client.stats().transit.unwrap();
+        assert!(client_transit.probes > 0, "no probe completed");
+        assert!(client_transit.clean_rtt.is_some(), "no clean round trip");
+        let server_transit = server.stats().transit.unwrap();
+        assert_eq!(
+            server_transit.probes, 0,
+            "the server is the responder and initiates nothing"
+        );
+        assert!(
+            server_transit.clean_rtt.is_some(),
+            "the initiator's measurement never reached the responder"
+        );
     }
 
-    async fn verify_io_clean(io: DuplexStream) {
+    async fn verify_io_clean(io: Transit<DuplexStream>) {
         let (mut read, mut write) = tokio::io::split(io);
         tokio::join!(
             async {

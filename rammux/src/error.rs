@@ -45,11 +45,9 @@ impl RammuxError {
     /// Returns whether this error originates from a protocol violation by the other side of the connection.
     pub fn is_protocol_violation(&self) -> bool {
         match &self.0 {
-            ErrorKind::Decode(..)
-            | ErrorKind::UnexpectedPing(..)
-            | ErrorKind::Stream { .. }
-            | ErrorKind::Transit(..)
-            | ErrorKind::Probe(..) => true,
+            ErrorKind::Decode(..) | ErrorKind::UnexpectedPing(..) | ErrorKind::Stream { .. } => {
+                true
+            },
             ErrorKind::Io(..) | ErrorKind::AlreadyDowngraded | ErrorKind::Poisoned => false,
         }
     }
@@ -82,15 +80,9 @@ pub enum ErrorKind {
         #[source]
         error: StreamError,
     },
-    /// Received a `PING` frame that no `PING` mechanism can account for.
+    /// Received a `PONG` that answers nothing we sent.
     #[error("received an unexpected ping {0}")]
     UnexpectedPing(PingPayload),
-    /// rammux protocol was violated on the session-level transit window.
-    #[error("peer violated the transit window protocol: {0}")]
-    Transit(&'static str),
-    /// rammux protocol was violated on the link-clearing probe.
-    #[error("peer violated the link-clearing probe protocol: {0}")]
-    Probe(&'static str),
     /// rammux connection was downgraded and is no longer valid.
     #[error("connection already downgraded")]
     AlreadyDowngraded,

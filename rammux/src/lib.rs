@@ -13,6 +13,16 @@
 //! control, measures round trip times on demand, and performs graceful downgrade
 //! back to the underlying transport when rammux is finished.
 //!
+//! # Transit window
+//!
+//! rammux does not write to the transport it is given directly. It wraps it in a
+//! [`transit::Transit`]: a protocol that bounds how much data is in flight between
+//! the peers and steers that bound from the queuing delay it observes, so that a
+//! bulk stream cannot fill the path and delay everything sharing it. Both peers do
+//! this, and the layer's settings live in [`RammuxConfig`](config::RammuxConfig).
+//! The `transit` crate is re-exported here so those settings can be spelled
+//! without depending on it separately.
+//!
 //! # Configuration and negotiation
 //!
 //! rammux does not define an in-band handshake for transport parameters. Before
@@ -50,12 +60,13 @@ pub mod connection;
 mod error;
 mod global_pool;
 mod header;
-mod probe;
-mod rate;
+mod ping;
 pub mod stream;
 mod stream_id;
 
 pub use crate::{error::RammuxError, stream_id::StreamId};
+/// The protocol every rammux connection runs over; see the crate docs.
+pub use transit;
 
 static_assertions::const_assert!(std::mem::size_of::<u32>() <= std::mem::size_of::<usize>());
 

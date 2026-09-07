@@ -16,6 +16,7 @@ use rammux::{
     config::{RammuxConfig, RammuxRole},
     connection::{RammuxConnection, RammuxProgress},
     stream::RammuxDuplex,
+    transit::Transit,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf},
@@ -71,6 +72,22 @@ enum TransportKind {
     Memory,
 }
 
+/// A connected pair of TCP sockets over loopback.
+///
+/// `TCP_NODELAY` on both, which the transit layer under rammux requires: its
+/// credit returns are 8 byte frames on the latency path, and Nagle would hold
+/// every one of them behind the data already in flight.
+async fn tcp_pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let io_1 = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let io_2 = listener.accept().await.unwrap().0;
+    io_1.set_nodelay(true).unwrap();
+    io_2.set_nodelay(true).unwrap();
+    (io_1, io_2)
+}
+
 /// This example presents rammux implementation performance.
 ///
 /// See `--help` output for more info.
@@ -79,20 +96,12 @@ async fn main() {
     let args = Args::parse();
     match (args.transport, args.read_buffer) {
         (TransportKind::Tcp, None) => {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let io_1 = TcpStream::connect(listener.local_addr().unwrap())
-                .await
-                .unwrap();
-            let io_2 = listener.accept().await.unwrap().0;
+            let (io_1, io_2) = tcp_pair().await;
             handle_command_with_io(Transport::from(io_1), Transport::from(io_2), args).await;
         },
         (TransportKind::Tcp, Some(cap)) => {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let io_1 = TcpStream::connect(listener.local_addr().unwrap())
-                .await
-                .unwrap();
+            let (io_1, io_2) = tcp_pair().await;
             let io_1 = BufReader::with_capacity(cap, Transport::from(io_1));
-            let io_2 = listener.accept().await.unwrap().0;
             let io_2 = BufReader::with_capacity(cap, Transport::from(io_2));
             handle_command_with_io(io_1, io_2, args).await;
         },
@@ -122,7 +131,7 @@ async fn main() {
 async fn handle_command_with_io<IO>(io_1: IO, io_2: IO, args: Args)
 where
     IO: AsyncRead + AsyncWrite + Unpin,
-    TransportStats: From<IO>,
+    TransportStats: for<'a> From<&'a IO>,
 {
     let chunk = Bytes::from(vec![0_u8; args.chunk_size]);
 
@@ -141,8 +150,19 @@ where
             );
             let elapsed = started_at.elapsed();
             println!("Finished after {elapsed:?}");
-            println!("Client transport: {:?}", TransportStats::from(client));
-            println!("Server transport: {:?}", TransportStats::from(server));
+            // The downgrade hands back the transit layer, not the transport
+            // itself; the transport is borrowed through it. The transit
+            // stats say what the window did underneath rammux.
+            println!(
+                "Client transport: {:?}",
+                TransportStats::from(client.get_ref())
+            );
+            println!("Client transit: {:?}", client.stats());
+            println!(
+                "Server transport: {:?}",
+                TransportStats::from(server.get_ref())
+            );
+            println!("Server transit: {:?}", server.stats());
         },
         Command::Raw { num_bytes } => {
             let started_at = Instant::now();
@@ -152,8 +172,8 @@ where
             );
             let elapsed = started_at.elapsed();
             println!("Finished after {elapsed:?}");
-            println!("Client transport: {:?}", TransportStats::from(client));
-            println!("Server transport: {:?}", TransportStats::from(server));
+            println!("Client transport: {:?}", TransportStats::from(&client));
+            println!("Server transport: {:?}", TransportStats::from(&server));
         },
     }
 }
@@ -163,7 +183,7 @@ async fn handle_rammux_conn<IO>(
     streams: usize,
     stream_data: usize,
     chunk: Bytes,
-) -> IO
+) -> Transit<IO>
 where
     IO: AsyncWrite + AsyncRead + Unpin,
 {
@@ -209,7 +229,7 @@ where
                 ));
             },
             RammuxProgress::Downgraded(downgraded) => break Some(downgraded),
-            RammuxProgress::Empty | RammuxProgress::Probe(..) => {},
+            RammuxProgress::Empty | RammuxProgress::Ping(..) => {},
         }
     };
 
@@ -405,7 +425,7 @@ where
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct TransportStats {
     writes: usize,
     reads: usize,
@@ -435,17 +455,17 @@ impl fmt::Debug for TransportStats {
     }
 }
 
-impl<IO> From<Transport<IO>> for TransportStats {
-    fn from(value: Transport<IO>) -> Self {
+impl<IO> From<&Transport<IO>> for TransportStats {
+    fn from(value: &Transport<IO>) -> Self {
         value.stats
     }
 }
 
-impl<IO> From<BufReader<Transport<IO>>> for TransportStats
+impl<IO> From<&BufReader<Transport<IO>>> for TransportStats
 where
     IO: AsyncRead + Unpin,
 {
-    fn from(value: BufReader<Transport<IO>>) -> Self {
-        value.into_inner().into()
+    fn from(value: &BufReader<Transport<IO>>) -> Self {
+        value.get_ref().into()
     }
 }

@@ -20,7 +20,7 @@ use rammux::{
 
 use crate::{
     config::RammuxMuxerConfig,
-    rammux_rtt::RttSchedule,
+    rammux_ping::PingSchedule,
     server::{EchoImpl, pipe::PipeBytes},
     stream_util::RammuxIo,
 };
@@ -43,9 +43,9 @@ impl EchoImpl for RammuxEcho {
             TokioIo::new(conn),
             config.to_rammux_config(),
         );
-        let mut selector: Selector<RammuxTask, RttSchedule> = Selector::new(RttSchedule::new(
-            config.probe_interval(),
+        let mut selector: Selector<RammuxTask, PingSchedule> = Selector::new(PingSchedule::new(
             config.ping_interval(),
+            config.ping_timeout(),
         ));
         selector.push(RammuxTask::Connection(Box::new(connection)));
         let downgraded = loop {
@@ -68,29 +68,29 @@ enum RammuxTask {
     Stream(PipeBytes<RammuxIo>),
 }
 
-impl Task<RttSchedule> for RammuxTask {
+impl Task<PingSchedule> for RammuxTask {
     type Cont = RammuxDuplex;
     type Break = anyhow::Result<Option<Downgraded<Transport>>>;
     type Output = ControlFlow<anyhow::Result<Downgraded<Transport>>, RammuxDuplex>;
 
     fn poll_progress(
         self: Pin<&mut Self>,
-        schedule: &mut RttSchedule,
+        schedule: &mut PingSchedule,
         cx: &mut Context<'_>,
     ) -> Poll<ControlFlow<Self::Break, Self::Cont>> {
         match self.get_mut() {
             Self::Connection(connection) => {
                 loop {
-                    match schedule.poll_next(cx) {
-                        Poll::Ready(Ok(due)) => {
-                            if let Err(error) = schedule.apply(due, connection) {
+                    match schedule.poll_due(cx) {
+                        Poll::Ready(Ok(())) => {
+                            if let Err(error) = schedule.ping(connection) {
                                 return Poll::Ready(ControlFlow::Break(Err(anyhow::Error::new(
                                     error,
                                 ))));
                             }
                         },
-                        // An unfinished probe pauses data output on both sides,
-                        // so this is the connection's liveness check.
+                        // An unanswered ping is the connection's liveness
+                        // check: nothing else here gives up on a dead peer.
                         Poll::Ready(Err(timeout)) => {
                             return Poll::Ready(ControlFlow::Break(Err(anyhow::Error::new(
                                 timeout,
@@ -105,7 +105,7 @@ impl Task<RttSchedule> for RammuxTask {
                         Ok(RammuxProgress::Inbound(duplex)) => {
                             break Poll::Ready(ControlFlow::Continue(duplex));
                         },
-                        Ok(RammuxProgress::Probe(event)) => schedule.observe(event),
+                        Ok(RammuxProgress::Ping(event)) => schedule.observe(event),
                         Ok(RammuxProgress::Empty) => {},
                         Ok(RammuxProgress::Downgraded(downgraded)) => {
                             break Poll::Ready(ControlFlow::Break(Ok(Some(downgraded))));
@@ -126,7 +126,7 @@ impl Task<RttSchedule> for RammuxTask {
 
     fn transform_cont(
         _: BorrowedMut<'_, Self>,
-        _: &mut RttSchedule,
+        _: &mut PingSchedule,
         value: Self::Cont,
     ) -> Option<Self::Output> {
         Some(ControlFlow::Continue(value))
@@ -134,7 +134,7 @@ impl Task<RttSchedule> for RammuxTask {
 
     fn transform_break(
         _: Removed<Self>,
-        _: &mut RttSchedule,
+        _: &mut PingSchedule,
         value: Self::Break,
     ) -> Option<Self::Output> {
         match value {

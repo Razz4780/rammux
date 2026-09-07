@@ -8,6 +8,7 @@ use std::{
 
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
+use transit::Transit;
 
 use crate::{
     codec::{RammuxCodec, decoder::DecodedFrame, encoder::EncoderItem},
@@ -16,14 +17,23 @@ use crate::{
 
 /// [`Future`] that handles the rammux connection downgrade.
 ///
-/// Resolves to the IO transport originally passed to the [`RammuxConnection`](super::RammuxConnection).
-/// Returned transport is clean, meaning that it has no unread rammux protocol bytes.
+/// Resolves to the transit layer over the IO transport originally passed to the
+/// [`RammuxConnection`](super::RammuxConnection). The returned transport is
+/// clean, meaning that it has no unread rammux protocol bytes: both peers can
+/// keep talking through it as a plain byte stream. The transit framing itself
+/// stays, since the peer keeps speaking it and it has no termination handshake
+/// of its own; the original transport can be borrowed through
+/// [`Transit::get_ref`] but not taken back.
 ///
 /// This future should be polled to completion in order to avoid errors on the other side.
 #[must_use = "downgrade should be polled to unblock the rammux peer"]
 pub struct Downgraded<IO> {
     /// Recovered from [`Active::codec`](super::state::Active::codec).
-    codec: Option<RammuxCodec<IO>>,
+    ///
+    /// Boxed: with the transit layer inside it the codec is about a
+    /// kilobyte, and this future travels inside
+    /// [`RammuxProgress`](super::RammuxProgress), which every poll returns.
+    codec: Option<Box<RammuxCodec<Transit<IO>>>>,
     /// Whether we've received the `TERM` frame.
     term_received: bool,
     /// Describes the state of our `TERM` frame.
@@ -33,9 +43,9 @@ pub struct Downgraded<IO> {
 }
 
 impl<IO> Downgraded<IO> {
-    pub(super) fn new(codec: RammuxCodec<IO>, term_received: bool) -> Self {
+    pub(super) fn new(codec: RammuxCodec<Transit<IO>>, term_received: bool) -> Self {
         Self {
-            codec: Some(codec),
+            codec: Some(Box::new(codec)),
             term_received,
             term_sent: TermSendState::Init,
             with_shutdown: false,
@@ -120,18 +130,15 @@ impl<IO> Future for Downgraded<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
-    type Output = Result<IO, RammuxError>;
+    type Output = Result<Transit<IO>, RammuxError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let read_ready = this.poll_recover_reader(cx)?.is_ready();
         let write_ready = this.poll_recover_writer(cx)?.is_ready();
         if read_ready && write_ready {
-            Poll::Ready(Ok(this
-                .codec
-                .take()
-                .expect("future polled after completion")
-                .into_inner()))
+            let codec = this.codec.take().expect("future polled after completion");
+            Poll::Ready(Ok((*codec).into_inner()))
         } else {
             Poll::Pending
         }

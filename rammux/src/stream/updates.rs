@@ -44,13 +44,6 @@ impl Task<GlobalPool> for StreamUpdates {
         cx: &mut Context<'_>,
     ) -> Poll<ControlFlow<Self::Break, Self::Cont>> {
         let this = self.get_mut();
-        if global.probe_paused() {
-            // A link-clearing probe is in progress: no stream frames may
-            // travel until it completes.
-            let mut guard = this.state.lock().unwrap();
-            guard.updates_poller.register(cx.waker());
-            return Poll::Pending;
-        }
         let mut update = StreamUpdate {
             id: this.id,
             window_update: 0,
@@ -65,21 +58,12 @@ impl Task<GlobalPool> for StreamUpdates {
             update.flags.fin_read = fin_read;
             is_pending = false;
         }
-        let mut transit_blocked = false;
-        let transit_credit = global
-            .transit_send
-            .as_mut()
-            .map(|transit| &mut transit.credit);
-        if let Poll::Ready((data, fin_write)) = guard
-            .outbound
-            .poll_update(transit_credit, &mut transit_blocked)
-        {
+        if let Poll::Ready((data, fin_write)) = guard.outbound.poll_update() {
             update.data = data;
             update.flags.fin_write = fin_write;
             is_pending = false;
         }
         if is_pending {
-            global.transit_blocked |= transit_blocked;
             guard.updates_poller.register(cx.waker());
             return Poll::Pending;
         }

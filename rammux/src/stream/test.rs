@@ -7,25 +7,25 @@ use futures::{FutureExt, SinkExt, StreamExt};
 use crate::{
     StreamId,
     buffer::Data,
-    config::{RammuxConfig, TransitGrowth},
+    config::RammuxConfig,
     global_pool::GlobalPool,
     header::ControlFlags,
     stream::{FinState, RammuxDuplex, handle::StreamHandle, updates::StreamUpdates},
 };
 
-const CONFIG: RammuxConfig = RammuxConfig {
-    frame_limit: NonZeroU32::new(8).unwrap(),
-    max_inbound_streams: 4,
-    max_outbound_streams: 4,
-    local_recv_window: NonZeroU32::new(12).unwrap(),
-    remote_recv_window: 14,
-    global_recv_window: 32,
-    local_transit_window: 0,
-    remote_transit_window: 0,
-    transit_window_max: 4 * 1024 * 1024,
-    transit_growth: TransitGrowth::RateCeiling,
-    transit_update_threshold: NonZeroU32::new(64 * 1024).unwrap(),
-};
+const LOCAL_RECV_WINDOW: NonZeroU32 = NonZeroU32::new(12).unwrap();
+const REMOTE_RECV_WINDOW: u32 = 14;
+
+fn config() -> RammuxConfig {
+    let mut config = RammuxConfig::new();
+    config.frame_limit = NonZeroU32::new(8).unwrap();
+    config.max_inbound_streams = 4;
+    config.max_outbound_streams = 4;
+    config.local_recv_window = LOCAL_RECV_WINDOW;
+    config.remote_recv_window = REMOTE_RECV_WINDOW;
+    config.global_recv_window = 32;
+    config
+}
 
 fn new_stream(
     global: GlobalPool,
@@ -34,7 +34,7 @@ fn new_stream(
     Selector<StreamUpdates, GlobalPool>,
     RammuxDuplex,
 ) {
-    let (handle, updates, duplex) = super::new(StreamId::from_be_bytes([0, 0, 0]), true, &CONFIG);
+    let (handle, updates, duplex) = super::new(StreamId::from_be_bytes([0, 0, 0]), true, &config());
     let mut selector = Selector::new(global);
     selector.push(updates);
     (handle, selector, duplex)
@@ -110,22 +110,21 @@ async fn rammux_stream_drop_closes_reading() {
 async fn local_receive_window_is_autotuned() {
     let (mut handle, mut selector, mut duplex) = new_stream(GlobalPool {
         rtt: None,
-        available: CONFIG.local_recv_window.get() as usize * 4,
+        available: LOCAL_RECV_WINDOW.get() as usize * 4,
         ..Default::default()
     });
 
     for _ in 0..5 {
-        let data =
-            std::iter::repeat_n(b'a', CONFIG.local_recv_window.get() as usize).collect::<Vec<_>>();
+        let data = std::iter::repeat_n(b'a', LOCAL_RECV_WINDOW.get() as usize).collect::<Vec<_>>();
         let data = Data::copy_from_slice(&data);
         handle.received_data(data, false, false).unwrap();
         duplex.next().await.unwrap();
         let (update, ..) = selector.next().await.unwrap();
-        assert_eq!(update.window_update, CONFIG.local_recv_window.get());
+        assert_eq!(update.window_update, LOCAL_RECV_WINDOW.get());
     }
 
     selector.strategy_mut().rtt = Some(Duration::from_secs(1));
-    let mut current_window = CONFIG.local_recv_window.get();
+    let mut current_window = LOCAL_RECV_WINDOW.get();
 
     while selector.strategy().available > 0 {
         tokio::time::advance(Duration::from_millis(100)).await;
@@ -146,7 +145,7 @@ async fn local_receive_window_is_autotuned() {
     // pool gets its loan back.
     let peak = current_window;
     let mut rounds = 0;
-    while selector.strategy().available < CONFIG.local_recv_window.get() as usize * 4 {
+    while selector.strategy().available < LOCAL_RECV_WINDOW.get() as usize * 4 {
         rounds += 1;
         assert!(rounds < 50, "the window never returned what it borrowed");
         tokio::time::advance(Duration::from_secs(5)).await;
@@ -166,7 +165,7 @@ async fn local_receive_window_is_autotuned() {
 #[tokio::test]
 async fn local_receive_window_is_respected() {
     let (mut handle, _selector, _duplex) = new_stream(GlobalPool::default());
-    for _ in 0..CONFIG.local_recv_window.get() {
+    for _ in 0..LOCAL_RECV_WINDOW.get() {
         handle
             .received_data(Data::copy_from_slice(b"a"), false, false)
             .unwrap();
@@ -179,7 +178,7 @@ async fn local_receive_window_is_respected() {
 #[tokio::test]
 async fn remote_receive_window_is_respected() {
     let (mut handle, mut selector, mut duplex) = new_stream(GlobalPool::default());
-    for _ in 0..CONFIG.remote_recv_window {
+    for _ in 0..REMOTE_RECV_WINDOW {
         duplex.feed(Bytes::from_static(b"a")).await.unwrap();
         assert!(duplex.flush().now_or_never().is_none());
         let (update, fin_state) = selector.next().await.unwrap();

@@ -7,6 +7,14 @@ then `README.md` for how to run it and `bench.py` for the design.
 Branch: `research/transit-window`. **No cluster results exist yet** - the
 tooling is built and verified locally, nothing has been run on GKE.
 
+**Since this was written, the transit window moved out of rammux.** rammux now
+runs over the `transit` crate in this workspace, which steers its window from
+one-way queuing delay; the growth rules, the re-grant threshold, the probe
+interval and every `transit_*` knob discussed below are gone from rammux and
+from `bench.py`, whose rammux ladder is now three latency targets. Read the
+sections on the transit window as the record of what was measured and why the
+design moved on, not as a description of the current code.
+
 ---
 
 ## The split of work

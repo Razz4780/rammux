@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use async_selector::selector::Selector;
 use slab::Slab;
+use transit::Transit;
 
 use crate::{
     StreamId,
@@ -56,8 +57,8 @@ impl<IO> ConnState<IO> {
 
 /// Everything a live connection owns.
 pub struct Active<IO> {
-    /// Framing over the IO transport.
-    pub codec: RammuxCodec<IO>,
+    /// Framing over the transit layer, which runs over the IO transport.
+    pub codec: RammuxCodec<Transit<IO>>,
     /// Streams this connection is serving.
     pub streams: ActiveStreams,
     /// Round-robin over the streams that have something to send, with the

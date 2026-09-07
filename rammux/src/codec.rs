@@ -64,6 +64,11 @@ impl<IO> RammuxCodec<IO> {
     pub fn into_inner(self) -> IO {
         self.io
     }
+
+    /// The IO transport this codec frames over.
+    pub fn io(&self) -> &IO {
+        &self.io
+    }
 }
 
 impl<IO> Stream for RammuxCodec<IO>
@@ -146,16 +151,6 @@ where
                                     payload: StreamPayload::Data(Default::default()),
                                 })));
                             },
-                        },
-                        Header::SessionWindowUpdate { update } => {
-                            this.decoder = Default::default();
-                            break Poll::Ready(Some(Ok(DecodedFrame::SessionWindowUpdate {
-                                update,
-                            })));
-                        },
-                        Header::ClearLink { syn } => {
-                            this.decoder = Default::default();
-                            break Poll::Ready(Some(Ok(DecodedFrame::ClearLink { syn })));
                         },
                         Header::Term => {
                             this.decoder = Default::default();
@@ -345,9 +340,6 @@ mod tests {
                 },
                 payload: StreamPayload::Data(Default::default()),
             },
-            DecodedFrame::SessionWindowUpdate { update: 4096 },
-            DecodedFrame::ClearLink { syn: true },
-            DecodedFrame::ClearLink { syn: false },
             DecodedFrame::Terminate,
         ];
 
@@ -364,10 +356,6 @@ mod tests {
                             payload,
                             is_response,
                         } => EncoderItem::new_ping(*payload, *is_response),
-                        DecodedFrame::SessionWindowUpdate { update } => {
-                            EncoderItem::new_session_window_update(*update)
-                        },
-                        DecodedFrame::ClearLink { syn } => EncoderItem::new_clear_link(*syn),
                         DecodedFrame::Stream {
                             stream_id,
                             flags,

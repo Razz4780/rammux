@@ -8,6 +8,19 @@ byte stream.
 
 Inspired by [Yamux](https://github.com/hashicorp/yamux).
 
+## Layering
+
+rammux frames are not written to the transport directly. Both peers wrap the
+transport in the `transit` protocol - the `transit` crate in this repository -
+which bounds how much data is in flight between them and returns credit for it
+as it arrives. rammux is that protocol's payload, and everything below
+describes the byte stream rammux sees through it.
+
+Bounding the data in flight is therefore not rammux's concern. rammux has no
+session-level window, and no frame about the connection as a whole other than
+`TERM`. The `transit` layer's own framing, its link-clearing probe and its
+credit rules are documented in that crate.
+
 ## Session preconditions
 
 Before the first rammux frame is sent, the peers must already agree on:
@@ -16,7 +29,9 @@ Before the first rammux frame is sent, the peers must already agree on:
 - the maximum frame payload size
 - how many concurrent inbound streams each side is willing to serve
 - the initial receive window size each side grants to a new virtual stream
-- the initial transit window size each side grants the other, if any
+
+The `client` is also the `transit` layer's probe initiator. The `transit`
+window itself is announced by each side, not negotiated.
 
 ## Stream IDs
 
@@ -53,18 +68,12 @@ Control bits in `flags`:
 | --- | --- | --- |
 | `0x08` | `FIN_READ` | sender stopped reading from this stream |
 | `0x10` | `FIN_WRITE` | sender stopped writing to this stream |
-| `0x20` | `SYN` | frame starts a new stream, marks a `PING` request, or marks a spontaneous `CLEAR_LINK` |
-| `0x40` | `SESSION` | frame is session-level, not about any one stream |
+| `0x20` | `SYN` | frame starts a new stream, or marks a `PING` request |
 
-Bit `0x80` is reserved and must be zero.
+Bits `0x40` and `0x80` are reserved and must be zero.
 
-With `SESSION` clear, exactly one of `PING`, `WINDOW_UPDATE`, or `DATA` must be
-set for a normal frame; if none of them are set, the header is a `TERM` frame.
-
-With `SESSION` set, `stream_id` must be zero and only two combinations are
-valid: `SESSION | WINDOW_UPDATE` is a `SESSION_WINDOW_UPDATE`, and
-`SESSION | PING` (with or without `SYN`, and with `len = 0`) is a
-`CLEAR_LINK`. Anything else is a protocol violation.
+Exactly one of `PING`, `WINDOW_UPDATE`, or `DATA` must be set for a normal
+frame; if none of them are set, the header is a `TERM` frame.
 
 ## Frame types
 
@@ -76,65 +85,18 @@ valid: `SESSION | WINDOW_UPDATE` is a `SESSION_WINDOW_UPDATE`, and
 - `SYN = 0` means response
 - `FIN_READ` and `FIN_WRITE` are forbidden
 
-Each side sends `PING` requests and expects the peer to echo the exact payload
-back. `PING` serves two purposes, which the wire format does not distinguish:
+Each side may send `PING` requests and expects the peer to echo the exact
+payload back. A `PING` travels inline with data, so the round trip it measures
+is the *loaded* one - the path plus whatever both sides currently have queued,
+the `transit` layer's credit wait included. Stream receive windows are sized
+from it. The *clean* round trip, over a drained link, is the `transit` layer's
+to measure.
 
-- a **plain ping**, sent inline with data, measures the *loaded* round trip -
-  the path plus whatever both sides currently have queued;
-- a **probe ping**, sent inside a `CLEAR_LINK` exchange, measures the *clean*
-  round trip over a drained link.
-
-Neither side may have overlapping `PING` exchanges in flight, so a `PING`
-request may only be sent if this is the first from this side, or the response
-to the previous one has been received. That, plus the ordering of each
-transport direction, is what makes the two purposes decidable: inside a
-`CLEAR_LINK` exchange a `PING` is the probe's, and everywhere else it is the
-peer's plain one. A `PING` from a peer that provably owes a different frame is
-a protocol violation.
-
-An exchange may be abandoned: if a `CLEAR_LINK` takes the link while a plain
-ping is outstanding, that ping is forgotten and a response arriving for it
-afterwards is ignored rather than treated as a violation.
-
-### `CLEAR_LINK`
-
-`CLEAR_LINK` is `SESSION | PING`, with `stream_id = 0` and `len = 0`. It drains
-the link so that the `PING` that follows measures the path alone.
-
-- `SYN = 1` is a spontaneous initiation
-- `SYN = 0` is the responder's receipt, sent only in answer to an initiation
-
-A peer that sends `CLEAR_LINK` must stop sending `DATA` and `WINDOW_UPDATE`
-frames until the exchange completes. Since each transport direction is ordered,
-a receipt can only be produced after everything ahead of the initiation has been
-consumed - so receiving one proves both directions are drained. The exchange is:
-
-```text
-I: pause data, send CLEAR_LINK+SYN
-R: receive CLEAR_LINK+SYN -> pause data, send CLEAR_LINK receipt
-I: receive receipt (both directions drained) -> send PING
-R: receive PING (I->R is drained) -> send PONG, own PING, resume data
-I: receive PONG (clean RTT), receive R's PING -> send PONG, resume data
-R: receive PONG (clean RTT)
-```
-
-Both sides may initiate at once. Such a collision tie-breaks by role: the client
-stays initiator and the server demotes to responder, its own initiation standing
-as its pause marker. A colliding initiation is no substitute for the receipt -
-it was sent spontaneously, so it proves nothing about the other direction having
-drained, and the demoted side still owes a receipt.
-
-Receiving a `DATA` or `WINDOW_UPDATE` frame from a peer that is past its
-`CLEAR_LINK` is a protocol violation, as is a receipt without a matching
-initiation.
-
-### `SESSION_WINDOW_UPDATE`
-
-`SESSION_WINDOW_UPDATE` is `SESSION | WINDOW_UPDATE`, with `stream_id = 0`. It
-returns credit to the peer's transit window (see [Transit window](#transit-window)).
-
-- `len` is the number of bytes returned
-- `len = 0` is valid and carries nothing
+Neither side may have overlapping `PING` exchanges in flight: a request may
+only be sent if it is the first from this side, or the response to the previous
+one has been received. A side may give up on an outstanding request, in which
+case a response arriving for it afterwards is ignored rather than treated as a
+violation. A response that matches no request is a protocol violation.
 
 ### `WINDOW_UPDATE`
 
@@ -206,29 +168,10 @@ This implementation treats the following as protocol violations:
 - a `DATA` frame that would underflow the remaining receive window
 - a `WINDOW_UPDATE` that would overflow the sender-side window accounting
 
-### Transit window
-
-Beyond the per-stream windows, the session may carry one more limit: the
-*transit window*, which bounds the total `DATA` payload in flight between the
-peers regardless of which streams it belongs to. Per-stream windows govern how
-much a receiver is willing to *buffer*; the transit window governs how much may
-be *on the link*, which is what keeps a bulk stream from filling the path and
-delaying everything sharing it.
-
-Rules:
-
-1. the sender must not transmit more `DATA` payload than its remaining transit
-   credit
-2. each `DATA` payload decrements that credit
-3. each `SESSION_WINDOW_UPDATE(len)` increments it by `len`
-
-Credit is returned as soon as the payload is received and stored in the muxer,
-independently of when the application reads it - the bytes have left the link by
-then, which is the only thing this window is accounting for.
-
-A transit window of zero disables the mechanism in that direction, and a
-`SESSION_WINDOW_UPDATE` sent to a peer that has it disabled is a protocol
-violation, as is one that would overflow the sender-side accounting.
+Per-stream windows govern how much a receiver is willing to *buffer* for each
+stream. How much may be *on the link* across all of them at once is bounded
+separately, by the `transit` layer beneath rammux, and rammux frames of every
+kind count against that bound alike.
 
 ## Downgrade and transport recovery
 
@@ -238,8 +181,13 @@ The clean downgrade procedure is:
 
 1. send `TERM`
 2. continue reading rammux frames until the peer's `TERM` arrives
-4. return the underlying transport
+3. return the underlying transport
 
 `TERM` is a session-level marker, not a stream-level one. Frames already in
 flight can still arrive before the peer's final `TERM`, so a peer that starts
 downgrade must keep draining the transport until the handshake completes.
+
+What is returned is the `transit` layer over the original transport, with no
+unread rammux bytes in it. The peer keeps speaking `transit`, and that protocol
+has no termination handshake of its own, so the two sides can go on exchanging
+bytes through it; the raw transport underneath is not recovered.

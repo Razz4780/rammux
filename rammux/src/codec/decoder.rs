@@ -58,16 +58,6 @@ pub enum DecodedFrame {
         /// What the frame carries.
         payload: StreamPayload,
     },
-    /// Credit returned for the session-level transit window.
-    SessionWindowUpdate {
-        /// Bytes of credit returned.
-        update: u32,
-    },
-    /// Drain barrier of the link-clearing probe.
-    ClearLink {
-        /// Spontaneous initiation (`SYN` set) vs the responder's receipt.
-        syn: bool,
-    },
     /// The peer's end of the rammux session.
     Terminate,
 }

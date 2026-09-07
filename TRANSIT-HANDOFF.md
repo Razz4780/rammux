@@ -1,5 +1,11 @@
 # Transit window: a standalone protocol
 
+**Status: done.** The protocol this brief asked for exists as the `transit`
+crate in this workspace, and rammux now runs over it - the in-crate transit
+window, the growth rules and the link-clearing probe this document refers to
+have been removed from rammux. What follows is the brief as it was handed
+over, kept as the record of the experiments and dead ends that led here.
+
 Brief for the next agent. Read this, then `rammux/src/global_pool.rs`
 (`transit_recv_update`) for the reference implementation of what is being
 replaced.

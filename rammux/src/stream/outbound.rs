@@ -33,15 +33,7 @@ impl OutboundTraffic {
     /// Notes:
     /// 1. If `FIN_WRITE` has already been sent, this method will return `([], false)`.
     /// 2. This method is not responsible for registering [`Waker`] for updates.
-    /// 3. `transit_blocked` is set when this direction had payload ready
-    ///    and stream-level window for it, and only the exhausted transit
-    ///    window held it back.
-    pub fn poll_update(
-        &mut self,
-        transit_credit: Option<&mut u32>,
-        transit_blocked: &mut bool,
-    ) -> Poll<(Bytes, bool)> {
-        let credit_cap = transit_credit.as_deref().copied().unwrap_or(u32::MAX);
+    pub fn poll_update(&mut self) -> Poll<(Bytes, bool)> {
         match &mut self.0 {
             OutboundState::Open {
                 ready_data,
@@ -49,20 +41,14 @@ impl OutboundTraffic {
                 recv_window,
                 writer,
             } => {
-                if ready_data.is_empty() || *recv_window == 0 || credit_cap == 0 {
-                    *transit_blocked |=
-                        credit_cap == 0 && ready_data.is_empty().not() && *recv_window > 0;
+                if ready_data.is_empty() || *recv_window == 0 {
                     return Poll::Pending;
                 }
                 let chunk_len = u32::try_from(ready_data.len())
                     .unwrap_or(u32::MAX)
                     .min(*recv_window)
-                    .min(frame_limit.get())
-                    .min(credit_cap);
+                    .min(frame_limit.get());
                 *recv_window -= chunk_len;
-                if let Some(credit) = transit_credit {
-                    *credit -= chunk_len;
-                }
                 let chunk = ready_data.split_to(crate::safe_cast_usize(chunk_len));
                 if ready_data.is_empty() {
                     writer.wake();
@@ -76,20 +62,14 @@ impl OutboundTraffic {
                 recv_window,
                 writer,
             } => {
-                if *recv_window == 0 || (credit_cap == 0 && ready_data.is_empty().not()) {
-                    *transit_blocked |=
-                        credit_cap == 0 && ready_data.is_empty().not() && *recv_window > 0;
+                if *recv_window == 0 {
                     return Poll::Pending;
                 }
                 let chunk_len = u32::try_from(ready_data.len())
                     .unwrap_or(u32::MAX)
                     .min(*recv_window)
-                    .min(frame_limit.get())
-                    .min(credit_cap);
+                    .min(frame_limit.get());
                 *recv_window -= chunk_len;
-                if let Some(credit) = transit_credit {
-                    *credit -= chunk_len;
-                }
                 let chunk = ready_data.split_to(crate::safe_cast_usize(chunk_len));
                 let fin = if ready_data.is_empty() {
                     writer.wake();

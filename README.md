@@ -24,12 +24,15 @@ or QUIC.
 - `RammuxConnection<IO>`: the protocol driver that owns the transport
 - `RammuxDuplex`: a virtual bidirectional byte stream
 - per-stream flow control with local receive window autotuning
-- a session-level transit window that bounds total data in flight
-- on-demand RTT measurement, loaded and over a drained link
+- a bound on the total data in flight, through the `transit` protocol it runs over
+- on-demand loaded-RTT measurement
 - fair round-robin scheduling and data framing across ready streams
-- graceful downgrade back to the original transport
+- graceful downgrade back to the transport
 
-The crate is transport-agnostic. If the type implements async reads and writes, it can carry rammux.
+The crate is transport-agnostic. If the type implements async reads and writes,
+it can carry rammux. Two settings on a TCP transport matter to the `transit`
+layer underneath, though: `TCP_NODELAY` on both ends, and a send buffer allowed
+to grow past the transit window.
 
 ## Mental model
 
@@ -41,12 +44,13 @@ While you do that, the driver:
 1. reads inbound frames,
 2. writes outbound frames,
 3. yields new inbound streams,
-4. answers the peer's `PING`s and runs the exchanges you start.
+4. answers the peer's `PING`s and runs the ones you start.
 
 The driver runs no timers. Nothing wakes its task but the transport, so the
 schedule for RTT measurement - and every deadline on it - belongs to your
-application. `RammuxConnection` reports each transition of that state machine so
-you can impose one; see the `RTT measurement` section of its API docs.
+application. `RammuxConnection` reports each transition of the `PING` exchange so
+you can impose one; see the `RTT measurement` section of its API docs. The
+`transit` layer underneath has a clock of its own and needs no driving.
 
 Each accepted or created stream is represented as `RammuxDuplex`, which
 implements:
@@ -77,21 +81,28 @@ roughly `2 * bandwidth-delay-product`, measured against the *loaded* RTT - the
 round trip as it actually is with the connection's queues standing, which is the
 loop a stream's own window updates travel through.
 
-Beyond that, a session-level *transit window* can bound the total `DATA` payload
-in flight across all streams at once. Per-stream windows govern how much a
-receiver will buffer; the transit window governs how much may be on the link,
-which is what keeps a bulk stream from filling the path and delaying everything
-sharing it. Its credit is returned as soon as data is received, independently of
-when the application reads it, and it autotunes against the *clean* RTT measured
-over a drained link.
+Beyond that, the total data in flight across all streams at once is bounded by
+the *transit window*. Per-stream windows govern how much a receiver will buffer;
+the transit window governs how much may be on the link, which is what keeps a
+bulk stream from filling the path and delaying everything sharing it. That
+window is not rammux's own: rammux wraps the transport it is given in
+`transit::Transit`, a protocol from this repository's `transit` crate that
+limits bytes in flight and steers the limit from the one-way queuing delay it
+observes, after LEDBAT. Both peers do this, the `transit` crate is re-exported
+from rammux for configuring it, and `RammuxConnection::stats` reports what it is
+doing.
 
 Those tuning details are local behavior. On the wire, the peer only sees normal
-`WINDOW_UPDATE` and `SESSION_WINDOW_UPDATE` frames.
+`WINDOW_UPDATE` frames from rammux, and the `transit` layer's own frames beneath
+them.
 
 ## Shutdown and transport recovery
 
 rammux never shuts down the original transport.
-The protocol always ends with a downgrade handshake that allows for reclaiming the transport.
+The protocol always ends with a downgrade handshake that hands back the
+`transit` layer over the transport, with no unread rammux bytes in it. Both
+peers can keep exchanging bytes through it; the raw transport underneath stays
+wrapped, since the peer keeps speaking `transit`.
 
 ## Examples
 

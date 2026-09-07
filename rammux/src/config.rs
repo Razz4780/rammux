@@ -4,14 +4,15 @@ use std::{fmt, num::NonZeroU32};
 
 /// Role in a rammux connection.
 ///
-/// The only difference between the roles in a rammux connection
-/// is the pool of [`StreamId`](crate::StreamId)s
-/// that can be used when starting a new stream.
+/// The role decides two things: the pool of [`StreamId`](crate::StreamId)s
+/// a side can use when starting a new stream, and which side pays for the
+/// transit layer's link-clearing probe - the client does, as the transit
+/// [`Initiator`](transit::Role::Initiator).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RammuxRole {
-    /// Can initiate streams with even IDs.
+    /// Can initiate streams with even IDs. Initiates the transit probe.
     Client,
-    /// Can initiate streams with odd IDs.
+    /// Can initiate streams with odd IDs. Answers the transit probe.
     Server,
 }
 
@@ -20,6 +21,15 @@ impl fmt::Display for RammuxRole {
         match self {
             Self::Client => f.write_str("client"),
             Self::Server => f.write_str("server"),
+        }
+    }
+}
+
+impl From<RammuxRole> for transit::Role {
+    fn from(role: RammuxRole) -> Self {
+        match role {
+            RammuxRole::Client => Self::Initiator,
+            RammuxRole::Server => Self::Responder,
         }
     }
 }
@@ -34,6 +44,9 @@ impl fmt::Display for RammuxRole {
 /// - [`RammuxConfig::max_inbound_streams`]
 /// - [`RammuxConfig::remote_recv_window`]
 /// - [`RammuxConfig::local_recv_window`]
+///
+/// The transit layer's settings are not among them: each side announces the
+/// window it grants, so the two sides need not be configured alike.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct RammuxConfig {
@@ -80,81 +93,32 @@ pub struct RammuxConfig {
     ///
     /// This value is a local know and does not have to be negotiated.
     pub global_recv_window: usize,
-    /// Initial size of the session-level transit window we grant to the peer.
+    /// How the transit layer under this connection sizes the window it
+    /// grants the peer.
     ///
-    /// The transit window bounds the amount of `DATA` payload bytes that can be
-    /// in flight between the peers. Credit is returned with `SESSION_WINDOW_UPDATE`
-    /// frames as soon as data is received and stored in the muxer,
-    /// independently of when the application reads it.
+    /// rammux runs over [`transit::Transit`], which bounds how much data is
+    /// in flight between the peers and steers that bound from the queuing
+    /// delay it observes. This is that layer's [`Sizing`](transit::Sizing):
+    /// the window to start from, the most it may grow to, the cadence
+    /// credit is returned at, and the rule that sizes it. The default is
+    /// the tuned configuration; see [`transit::window`] for what each
+    /// setting was measured to do.
     ///
-    /// `0` disables the transit window in this direction.
+    /// This value is a local knob and does not have to be negotiated: the
+    /// window is announced to the peer, not assumed by it.
+    pub transit_sizing: transit::Sizing,
+    /// How many of the last probe's durations the transit layer waits
+    /// before the next one.
     ///
-    /// # Negotiation
+    /// The transit layer measures the clean round trip with a link-clearing
+    /// probe that pauses data output on both sides, and spaces the probes
+    /// by their own duration so their cost stays a bounded share of the
+    /// connection's time on any link. See
+    /// [`transit::Config::probe_spacing`].
     ///
-    /// This value has to be negotiated beforehand and
-    /// must match the peer's [`RammuxConfig::remote_transit_window`].
-    pub local_transit_window: u32,
-    /// Initial size of the transit window granted to us by the peer.
-    ///
-    /// `0` means the peer does not limit our in-flight data.
-    ///
-    /// # Negotiation
-    ///
-    /// This value has to be negotiated beforehand and
-    /// must match the peer's [`RammuxConfig::local_transit_window`].
-    pub remote_transit_window: u32,
-    /// Autotune limit for the local transit window.
-    ///
-    /// This value is a local knob and does not have to be negotiated.
-    pub transit_window_max: u32,
-    /// How the local transit window grows towards the size of the path.
-    ///
-    /// This value is a local knob and does not have to be negotiated.
-    pub transit_growth: TransitGrowth,
-    /// How much freed transit credit is re-granted at once, in bytes.
-    ///
-    /// Credit freed by received `DATA` goes back to the peer in a
-    /// `SESSION_WINDOW_UPDATE` once this much has accumulated - or half the
-    /// window, whichever is smaller, so a window below twice this size keeps
-    /// re-granting in halves rather than waiting for all of it.
-    ///
-    /// An absolute threshold rather than a share of the window, because the
-    /// share was the problem. Re-granting in halves means the peer cannot
-    /// receive the first re-grant before it has emptied any window smaller
-    /// than twice the bandwidth-delay product, so below that size it idles
-    /// with an empty pipe, and above it a stream that needs a few bytes waits
-    /// up to half a window for the next grant. At 64 KiB the grant interval
-    /// is 64 KiB at link rate - a few milliseconds - whatever the window, for
-    /// one 8-byte frame per 64 KiB of payload.
-    ///
-    /// This value is a local knob and does not have to be negotiated.
-    pub transit_update_threshold: NonZeroU32,
-}
-
-/// How the transit window a side grants grows towards the size of the path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TransitGrowth {
-    /// Doubles while credit turns over within two round trips, ceilinged at
-    /// twice the clean RTT times the measured arrival rate.
-    ///
-    /// The arrival rate is limited by the very window being sized, so the
-    /// ceiling sits just above the current window and each step lands on
-    /// it: 5-20% per update rather than a doubling, and tens of seconds to
-    /// reach the size of a wide-area path from a small start.
-    #[default]
-    RateCeiling,
-    /// Doubles while each doubling still raises the inbound arrival rate by
-    /// at least a quarter, and stops at the plateau.
-    ///
-    /// The one signal measured on the direction the window governs. A
-    /// round-trip time is inflated by *both* sides' queues, so a side that
-    /// is itself sending heavily reads a loaded RTT that says nothing about
-    /// its inbound direction, and a delay gate blocks exactly the side that
-    /// needs to grow; the inbound rate has no such blind spot. It also needs
-    /// no ping: the rate is measured continuously. Overshoots the knee by at
-    /// most one doubling, since the doubling that finds the plateau is the
-    /// one past it.
-    RatePlateau,
+    /// Only the [`RammuxRole::Client`] probes, so this value only matters
+    /// there. It is a local knob and does not have to be negotiated.
+    pub transit_probe_spacing: f64,
 }
 
 impl RammuxConfig {
@@ -168,11 +132,9 @@ impl RammuxConfig {
     /// 2. [`Self::max_inbound_streams`] and [`Self::max_outbound_streams`] - 128
     /// 3. [`Self::local_recv_window`] and [`Self::remote_recv_window`] - 64kb
     /// 4. [`Self::global_recv_window`] - 4mb
-    /// 5. [`Self::local_transit_window`] and [`Self::remote_transit_window`] - 128kb
-    /// 6. [`Self::transit_window_max`] - 4mb
-    /// 7. [`Self::transit_growth`] - [`TransitGrowth::RateCeiling`]
-    /// 8. [`Self::transit_update_threshold`] - 64kb
-    pub const fn new() -> Self {
+    /// 5. [`Self::transit_sizing`] - [`transit::Sizing::default`]
+    /// 6. [`Self::transit_probe_spacing`] - [`transit::DEFAULT_PROBE_SPACING`]
+    pub fn new() -> Self {
         Self {
             frame_limit: NonZeroU32::new(16 * 1024).unwrap(),
             max_inbound_streams: 128,
@@ -180,11 +142,17 @@ impl RammuxConfig {
             local_recv_window: NonZeroU32::new(64 * 1024).unwrap(),
             remote_recv_window: 64 * 1024,
             global_recv_window: 4 * 1024 * 1024,
-            local_transit_window: 128 * 1024,
-            remote_transit_window: 128 * 1024,
-            transit_window_max: 4 * 1024 * 1024,
-            transit_growth: TransitGrowth::RateCeiling,
-            transit_update_threshold: NonZeroU32::new(64 * 1024).unwrap(),
+            transit_sizing: transit::Sizing::default(),
+            transit_probe_spacing: transit::DEFAULT_PROBE_SPACING,
+        }
+    }
+
+    /// The transit layer's configuration for a connection in `role`.
+    pub(crate) fn transit_config(&self, role: RammuxRole) -> transit::Config {
+        transit::Config {
+            sizing: self.transit_sizing,
+            probe_spacing: self.transit_probe_spacing,
+            role: role.into(),
         }
     }
 }

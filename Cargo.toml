@@ -11,6 +11,9 @@ rust-version = "1.95.0"
 
 [workspace.dependencies]
 rammux.path = "./rammux"
+# The protocol rammux runs over. Its default features are a measurement CLI
+# that a library user has no use for.
+transit = { path = "./transit", default-features = false }
 
 async-selector = "0.4"
 async_smux = "0.3.4"

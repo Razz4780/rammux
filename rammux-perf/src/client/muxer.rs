@@ -31,7 +31,7 @@ use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
 use crate::{
     config::{H2MuxerConfig, QuicMuxerConfig, RammuxMuxerConfig, YamuxMuxerConfig},
-    rammux_rtt::RttSchedule,
+    rammux_ping::PingSchedule,
     stream_util::{ChannelBody, QuicDuplex, RammuxIo},
     tls,
 };
@@ -68,10 +68,10 @@ pub trait Muxer: Unpin {
 
 type RammuxTransport = TokioIo<Upgraded>;
 
-/// A rammux connection, with the probe and ping schedule it needs driven.
+/// A rammux connection, with the ping schedule it needs driven.
 pub struct RammuxMuxer {
     state: RammuxState,
-    schedule: RttSchedule,
+    schedule: PingSchedule,
 }
 
 enum RammuxState {
@@ -90,7 +90,7 @@ impl RammuxMuxer {
                 TokioIo::new(upgraded),
                 config.to_rammux_config(),
             ))),
-            schedule: RttSchedule::new(config.probe_interval(), config.ping_interval()),
+            schedule: PingSchedule::new(config.ping_interval(), config.ping_timeout()),
         }
     }
 }
@@ -115,23 +115,21 @@ impl Muxer for RammuxMuxer {
         loop {
             match &mut self.state {
                 RammuxState::Active(connection) => {
-                    // The schedule first: it is what starts the probes and
-                    // pings the connection then has to carry, and it is the
-                    // liveness check - an unfinished probe pauses data
-                    // output on both sides.
+                    // The schedule first: it is what starts the pings the
+                    // connection then has to carry, and their deadline is
+                    // the connection's liveness check.
                     loop {
-                        match self.schedule.poll_next(cx) {
-                            Poll::Ready(Ok(due)) => self
-                                .schedule
-                                .apply(due, connection)
-                                .context("rammux failed")?,
+                        match self.schedule.poll_due(cx) {
+                            Poll::Ready(Ok(())) => {
+                                self.schedule.ping(connection).context("rammux failed")?
+                            },
                             Poll::Ready(Err(timeout)) => return Poll::Ready(Err(timeout.into())),
                             Poll::Pending => break,
                         }
                     }
                     match std::task::ready!(connection.poll_progress(cx)) {
                         Ok(RammuxProgress::Empty) => {},
-                        Ok(RammuxProgress::Probe(event)) => self.schedule.observe(event),
+                        Ok(RammuxProgress::Ping(event)) => self.schedule.observe(event),
                         Ok(RammuxProgress::Inbound(..)) => {
                             return Poll::Ready(Err(anyhow::anyhow!("the server opened a stream")));
                         },
@@ -158,23 +156,32 @@ impl Muxer for RammuxMuxer {
             else {
                 unreachable!("checked above");
             };
-            // The transit window is a resource every stream on the connection
-            // draws from, and credit comes back from the peer in half-window
-            // bursts. A latency-sensitive stream that needs a few bytes while
-            // the bulk streams have spent the window waits for the next
-            // grant, and how long the connection spent in that state is what
-            // separates "the link is slow" from "rammux is holding its own
-            // ping pong behind its own bulk data". `transit_recv_window` is
-            // where autotune got to; against the link's BDP it says whether
-            // the window ever grew to fit the pipe.
+            // The transit layer under the connection bounds what is in
+            // flight, and its window is what a latency-sensitive stream's
+            // bytes queue behind while the bulk streams are busy. `window`
+            // is where the delay rule steered the window this side grants,
+            // `desired` where it was heading, `queued` the one-way queuing
+            // delay it last read against its target; `stalls` counts the
+            // times this side ran out of credit with data to write. The
+            // clean round trip is the probe's, over a drained link; the
+            // loaded one is rammux's own ping through the standing queues,
+            // and the gap between them is the queue.
             let stats = connection.stats();
+            let transit = stats.transit;
             tracing::info!(
-                clean_rtt_us = stats.rtt.map(|d| d.as_micros() as u64),
-                loaded_rtt_us = stats.dirty_rtt.map(|d| d.as_micros() as u64),
-                transit_recv_window = stats.transit_recv_window,
-                transit_send_credit = stats.transit_send_credit,
-                transit_starved_ms = stats.transit_starved.as_millis() as u64,
-                transit_starved_events = stats.transit_starved_events,
+                loaded_rtt_us = stats.rtt.map(|d| d.as_micros() as u64),
+                clean_rtt_us = transit
+                    .and_then(|t| t.clean_rtt)
+                    .map(|d| d.as_micros() as u64),
+                transit_window = transit.map(|t| t.window),
+                transit_desired = transit.map(|t| t.desired),
+                transit_credit = transit.map(|t| t.credit),
+                transit_queued_us = transit.and_then(|t| t.queued).map(|d| d.as_micros() as u64),
+                transit_rate_mbps = transit.map(|t| t.rate * 8.0 / 1e6),
+                transit_stalls = transit.map(|t| t.stalls),
+                transit_probes = transit.map(|t| t.probes),
+                transit_probe_timeouts = transit.map(|t| t.probe_timeouts),
+                transit_probe_interval_ms = transit.map(|t| t.probe_interval.as_millis() as u64),
                 "rammux connection stats",
             );
             let downgraded = connection.downgrade().context("rammux downgrade failed")?;

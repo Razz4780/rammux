@@ -67,29 +67,6 @@ impl RawHeader {
             });
         }
 
-        if self.flags.contains(RawFlags::SESSION) {
-            return if self.flags == RawFlags::SESSION | RawFlags::WINDOW_UPDATE
-                && u32::from(self.stream_id) == 0
-            {
-                Ok(Header::SessionWindowUpdate { update: self.len })
-            } else if (self.flags == RawFlags::SESSION | RawFlags::PING
-                || self.flags == RawFlags::SESSION | RawFlags::PING | RawFlags::SYN)
-                && u32::from(self.stream_id) == 0
-                && self.len == 0
-            {
-                // SYN marks a spontaneous link-clearing initiation;
-                // without it the frame is the responder's receipt.
-                Ok(Header::ClearLink {
-                    syn: self.flags.contains(RawFlags::SYN),
-                })
-            } else {
-                Err(DecodeError {
-                    header: self,
-                    message: "SESSION frame with dirty bits",
-                })
-            };
-        }
-
         let frame_type = self
             .flags
             .intersection(RawFlags::PING | RawFlags::WINDOW_UPDATE | RawFlags::DATA);
@@ -170,13 +147,6 @@ bitflags! {
         /// 1. `PING` requests
         /// 2. `DATA` and `WINDOW_UPDATE` frames that initiate a new stream.
         const SYN           = 0b00100000;
-        /// Marks a session-level frame: one about the connection rather
-        /// than any one stream.
-        ///
-        /// Valid in two combinations, both with `stream_id = 0`: with
-        /// [`Self::WINDOW_UPDATE`] it forms a `SESSION_WINDOW_UPDATE`,
-        /// and with [`Self::PING`] (and `len = 0`) a `CLEAR_LINK`.
-        const SESSION       = 0b01000000;
     }
 }
 
@@ -214,16 +184,6 @@ pub enum Header {
         flags: ControlFlags,
         /// Payload length in bytes.
         len: u32,
-    },
-    /// Returns credit for the session-level transit window.
-    SessionWindowUpdate {
-        /// Bytes of credit returned.
-        update: u32,
-    },
-    /// Drain barrier of the link-clearing probe.
-    ClearLink {
-        /// Spontaneous initiation (`SYN` set) vs the responder's receipt.
-        syn: bool,
     },
     /// The sender's end of the rammux session.
     Term,
@@ -403,6 +363,23 @@ mod test {
             stream_id: StreamId::from_be_bytes([0, 0, 0]),
             flags: RawFlags::TERM,
             len: 1,
+        },
+        None,
+    )]
+    // The reserved bits, one of which used to mark session-level frames.
+    #[case(
+        RawHeader {
+            stream_id: StreamId::from_be_bytes([0, 0, 0]),
+            flags: RawFlags::from_bits_retain(0b0100_0000 | RawFlags::PING.bits() | RawFlags::SYN.bits()),
+            len: 0,
+        },
+        None,
+    )]
+    #[case(
+        RawHeader {
+            stream_id: StreamId::from_be_bytes([0, 0, 0]),
+            flags: RawFlags::from_bits_retain(0b1000_0000 | RawFlags::WINDOW_UPDATE.bits()),
+            len: 0,
         },
         None,
     )]

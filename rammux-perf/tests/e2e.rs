@@ -24,8 +24,8 @@ type Addrs = (&'static str, &'static str, &'static str);
 
 const RAMMUX: &str = r#"{ "protocol": "rammux",
     "stream_recv_window": 262144, "global_recv_window": 4194304,
-    "transit_window": 262144, "transit_window_max": 4194304,
-    "probe_interval": 20, "ping_interval": 5 }"#;
+    "transit": { "window": 262144, "max_window": 4194304 },
+    "ping_interval": 5, "ping_timeout": 20 }"#;
 const YAMUX: &str = r#"{ "protocol": "yamux", "global_recv_window": 1073741824 }"#;
 const H2: &str = r#"{ "protocol": "h2", "adaptive_window": true, "global_recv_window": 1048576, "stream_recv_window": 262144 }"#;
 /// The same budget as H2, so what is compared is the protocol, not the sizing.
