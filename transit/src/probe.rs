@@ -254,6 +254,17 @@ impl Probe {
         Ok(outcome)
     }
 
+    /// Ends whatever exchange is in progress and schedules no more.
+    ///
+    /// For when the peer has closed its side: it will neither finish an
+    /// exchange it is part of nor answer one we start, and output paused for
+    /// either would stay paused until the deadline. Not counted as abandoned -
+    /// a peer that has gone is not a peer that failed to answer.
+    pub(crate) fn stop(&mut self) {
+        self.state = State::Idle;
+        self.wanted = false;
+    }
+
     /// Enters an exchange, and starts the clock it has to finish by.
     fn pause(&mut self, state: State) {
         self.state = state;

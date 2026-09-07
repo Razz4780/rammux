@@ -31,6 +31,19 @@
 //! reached the window, which also refused the `WINDOW_UPDATE` that would have
 //! unblocked it, and left `poll_write` parked with no waker anywhere. Memory is
 //! bounded by withholding the *grant* instead.
+//!
+//! # Half-close
+//!
+//! Control frames share the write direction with payload, so an end that has
+//! shut its write side down can neither return credit nor take part in a
+//! probe. Shutting down therefore ends this end's part in the protocol, not
+//! just its payload: nothing more goes on the wire, a probe is never started,
+//! and a peer that keeps sending can only spend the credit it already holds -
+//! which is what half-close means with a credit protocol underneath. The peer,
+//! on seeing the end of stream, drops out of any exchange it was in rather
+//! than waiting the deadline out for a `PING` that cannot come, and starts no
+//! more of its own. Reading past a local shutdown works as it does on a
+//! socket.
 
 use std::{
     io,
@@ -243,6 +256,9 @@ pub struct Transit<IO> {
 
     window: Window,
     probe: Probe,
+    /// Whether our write side is shut down. Nothing goes on the wire after
+    /// that; see the module docs on half-close.
+    shut_down: bool,
 
     /// Our clock's origin, which every timestamp we send counts from.
     started: Instant,
@@ -275,6 +291,7 @@ impl<IO> Transit<IO> {
             eof: false,
             window: Window::new(config.sizing),
             probe: Probe::new(config.role, config.probe_spacing, config.wants_rtt()),
+            shut_down: false,
             started: Instant::now(),
             peer_clock: SenderClock::default(),
         }
@@ -432,6 +449,9 @@ where
                 let read = buf.filled().len();
                 if read == 0 {
                     self.eof = true;
+                    // The peer will neither finish an exchange it is part
+                    // of nor answer one we start.
+                    self.probe.stop();
                 } else {
                     // SAFETY: `poll_read` filled exactly this many bytes of the
                     // spare capacity we handed it.
@@ -446,6 +466,14 @@ where
     /// Everything that has to happen between application calls: start a probe
     /// if one is due, steer the window, return credit, flush.
     fn service(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        if self.shut_down {
+            // Nothing more goes on the wire. A reply the parser staged - a
+            // `CLEAR_ACK`, a `PONG` - is dropped rather than failing the
+            // read that produced it, and no probe is started, since its
+            // frames could not be sent either.
+            self.out.clear();
+            return Ok(());
+        }
         if let Some(frame) = self.probe.poll(cx) {
             frame.encode(&mut self.out);
         }
@@ -473,6 +501,66 @@ where
         // The last pass through the parser may have freed credit or queued a
         // pong, and neither should wait for the next wake-up.
         self.service(cx)
+    }
+}
+
+impl<IO> Transit<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    /// How much of `wanted` bytes the next `DATA` frame may carry, or
+    /// `Pending` while nothing may go.
+    ///
+    /// The whole of what `poll_write` and `poll_write_vectored` share: the two
+    /// differ only in where the payload comes from.
+    fn poll_frame_room(&mut self, cx: &mut Context<'_>, wanted: usize) -> Poll<io::Result<usize>> {
+        self.poll_progress(cx)?;
+        if wanted == 0 {
+            return Poll::Ready(Ok(0));
+        }
+
+        // Each of these is undone by an inbound frame - a window update, a pong
+        // - or by the socket draining, and `poll_progress` has just registered
+        // for both.
+        if self.probe.paused() || self.credit.available == 0 || self.out.len() >= OUT_HIGH_WATER {
+            // Only a lack of credit is the window's doing; a paused probe and a
+            // full staging buffer are this connection's own cost.
+            if self.credit.available == 0 && !self.credit.starved {
+                self.credit.starved = true;
+                self.credit.unreported = Some(Instant::now());
+                self.credit.stalls += 1;
+            }
+            return Poll::Pending;
+        }
+
+        Poll::Ready(Ok(wanted
+            .min(MAX_PAYLOAD as usize)
+            .min(self.credit.available as usize)))
+    }
+
+    /// Stages the header of a `DATA` frame carrying `len` payload bytes, which
+    /// the caller appends next, and spends the credit for them.
+    fn start_frame(&mut self, len: usize) {
+        let stamp = self.started.elapsed().as_micros() as u32;
+        let starved = self
+            .credit
+            .unreported
+            .take()
+            .is_some_and(|since| since.elapsed() < STALL_REPORT_WINDOW);
+        Frame::encode_data(len as u32, starved, stamp, &mut self.out);
+        self.credit.available -= len as u64;
+    }
+
+    /// Pushes the frame just staged at the socket and reports its payload
+    /// length as written.
+    ///
+    /// Straight at the socket: anything held back here is latency added to
+    /// every byte written after it.
+    fn finish_frame(&mut self, cx: &mut Context<'_>, len: usize) -> Poll<io::Result<usize>> {
+        if let Poll::Ready(Err(error)) = self.poll_send(cx) {
+            return Poll::Ready(Err(error));
+        }
+        Poll::Ready(Ok(len))
     }
 }
 
@@ -514,44 +602,49 @@ where
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        this.poll_progress(cx)?;
-        if buf.is_empty() {
+        let take = std::task::ready!(this.poll_frame_room(cx, buf.len()))?;
+        if take == 0 {
             return Poll::Ready(Ok(0));
         }
-
-        // Each of these is undone by an inbound frame - a window update, a pong
-        // - or by the socket draining, and `poll_progress` has just registered
-        // for both.
-        if this.probe.paused() || this.credit.available == 0 || this.out.len() >= OUT_HIGH_WATER {
-            // Only a lack of credit is the window's doing; a paused probe and a
-            // full staging buffer are this connection's own cost.
-            if this.credit.available == 0 && !this.credit.starved {
-                this.credit.starved = true;
-                this.credit.unreported = Some(Instant::now());
-                this.credit.stalls += 1;
-            }
-            return Poll::Pending;
-        }
-
-        let take = buf
-            .len()
-            .min(MAX_PAYLOAD as usize)
-            .min(this.credit.available as usize);
-        let stamp = this.started.elapsed().as_micros() as u32;
-        let starved = this
-            .credit
-            .unreported
-            .take()
-            .is_some_and(|since| since.elapsed() < STALL_REPORT_WINDOW);
-        Frame::encode_data(take as u32, starved, stamp, &mut this.out);
+        this.start_frame(take);
         this.out.extend_from_slice(&buf[..take]);
-        this.credit.available -= take as u64;
-        // Straight at the socket: anything held back here is latency added to
-        // every byte written after it.
-        if let Poll::Ready(Err(error)) = this.poll_send(cx) {
-            return Poll::Ready(Err(error));
+        this.finish_frame(cx, take)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    /// One frame for the whole batch.
+    ///
+    /// The slices are coalesced into a single `DATA` frame, up to
+    /// [`MAX_PAYLOAD`] and the credit available, so a caller that writes a
+    /// batch of small pieces - a multiplexer's frame headers and payloads,
+    /// say - pays one header, one timestamp and one `write` for the batch
+    /// rather than one of each per piece. Without this the default
+    /// implementation would write the first slice alone.
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let wanted = bufs.iter().map(|buf| buf.len()).sum();
+        let take = std::task::ready!(this.poll_frame_room(cx, wanted))?;
+        if take == 0 {
+            return Poll::Ready(Ok(0));
         }
-        Poll::Ready(Ok(take))
+        this.start_frame(take);
+        let mut left = take;
+        for buf in bufs {
+            if left == 0 {
+                break;
+            }
+            let n = buf.len().min(left);
+            this.out.extend_from_slice(&buf[..n]);
+            left -= n;
+        }
+        this.finish_frame(cx, take)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -561,9 +654,14 @@ where
         Pin::new(&mut this.io).poll_flush(cx)
     }
 
+    /// Flushes what is staged and shuts the transport's write side down.
+    ///
+    /// This end takes no further part in the protocol afterwards; see the
+    /// module docs on half-close.
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         std::task::ready!(this.poll_send(cx))?;
+        this.shut_down = true;
         Pin::new(&mut this.io).poll_shutdown(cx)
     }
 }
@@ -746,6 +844,104 @@ mod test {
             "output resumed before the deadline, while the probe was still live"
         );
         assert_eq!(responder.stats().probe_timeouts, 1);
+    }
+
+    /// A batch of slices goes out as one frame. The default implementation
+    /// would write the first slice alone, and a caller that batches a
+    /// multiplexer's headers and payloads would pay a frame and a `write` for
+    /// each piece.
+    #[tokio::test]
+    async fn vectored_writes_coalesce_into_one_frame() {
+        let (near, far) = duplex(64 * 1024);
+        let mut sender = Transit::new(near, config(Role::Initiator, 32 * 1024));
+        let mut receiver = Transit::new(far, config(Role::Responder, 32 * 1024));
+        assert!(sender.is_write_vectored());
+
+        // Two tasks, because the sender has no credit until the receiver's
+        // first poll has put its initial grant on the wire.
+        const PIECES: [&[u8]; 3] = [&[1; 8], &[2; 4096], &[3; 8]];
+        let writer = tokio::spawn(async move {
+            let written = sender
+                .write_vectored(&PIECES.map(io::IoSlice::new))
+                .await
+                .unwrap();
+            sender.shutdown().await.unwrap();
+            written
+        });
+
+        let mut received = Vec::new();
+        receiver.read_to_end(&mut received).await.unwrap();
+        let written = writer.await.unwrap();
+        assert_eq!(
+            written,
+            8 + 4096 + 8,
+            "the batch was not taken in one frame"
+        );
+        assert_eq!(received, PIECES.concat(), "the batch came through mangled");
+    }
+
+    /// Shutting the write side down leaves the read side working, as it does
+    /// on a socket. The probe schedule used to keep firing after a shutdown,
+    /// and its `CLEAR_LINK` then failed the read that tried to send it.
+    #[tokio::test(start_paused = true)]
+    async fn reading_continues_after_a_local_shutdown() {
+        let (near, far) = duplex(16 * 1024);
+        let mut client = Transit::new(near, config(Role::Initiator, 32 * 1024));
+        let mut server = Transit::new(far, config(Role::Responder, 32 * 1024));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let reader = tokio::spawn(async move {
+            client.write_all(b"hello").await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut received = Vec::new();
+            client.read_to_end(&mut received).await.unwrap();
+            (received, client.stats())
+        });
+
+        let mut received = Vec::new();
+        server.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"hello");
+        // Long enough for the client's probe schedule to come due several
+        // times over, if it were still running.
+        for _ in 0..5 {
+            server.write_all(&[7; 1024]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+        server.shutdown().await.unwrap();
+
+        let (received, stats) = reader.await.unwrap();
+        assert_eq!(received, vec![7; 5 * 1024]);
+        assert_eq!(
+            stats.probe_timeouts, 0,
+            "a probe was started after the shutdown"
+        );
+    }
+
+    /// A peer that closes mid-exchange is not going to send the `PING`, and
+    /// the responder should not stay paused until the deadline waiting for
+    /// it. With time paused the runtime would jump straight to that deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_peers_eof_ends_the_exchange() {
+        let (mut raw, far) = duplex(64 * 1024);
+        let mut responder = Transit::new(far, config(Role::Responder, 32 * 1024));
+
+        let mut wire = BytesMut::new();
+        Frame::WindowUpdate(32 * 1024).encode(&mut wire);
+        Frame::ClearLink(1).encode(&mut wire);
+        raw.write_all(&wire).await.unwrap();
+        raw.shutdown().await.unwrap();
+
+        let started = Instant::now();
+        responder.write_all(b"after the eof").await.unwrap();
+        assert!(
+            started.elapsed() < crate::probe::EXCHANGE_DEADLINE,
+            "output stayed paused until the deadline"
+        );
+        assert_eq!(
+            responder.stats().probe_timeouts,
+            0,
+            "a peer closing is not a peer failing to answer"
+        );
     }
 
     /// The sender's clock is 32 bits of microseconds and wraps every 71
