@@ -1,5 +1,5 @@
 [workspace]
-members = ["rammux", "rammux-perf"]
+members = ["rammux", "rammux-perf", "transit"]
 resolver = "3"
 
 [workspace.package]

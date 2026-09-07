@@ -1,0 +1,27 @@
+[package]
+name = "transit"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["cli"]
+# The measurement client, server and network-namespace harness. The protocol
+# needs none of it, so a crate that only wants `Transit` can turn this off and
+# skip clap, socket2, and everything in tokio beyond the timer.
+cli = ["dep:clap", "dep:socket2", "tokio/full"]
+
+[dependencies]
+bytes = "1"
+tokio = { version = "1", features = ["time"] }
+clap = { version = "4", features = ["derive"], optional = true }
+socket2 = { version = "0.6.5", optional = true }
+
+[[bin]]
+name = "transit"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[dev-dependencies]
+# `start_paused` drives the control law's clock deterministically, so a test
+# can advance a round trip without sleeping for one.
+tokio = { version = "1", features = ["full", "test-util"] }
