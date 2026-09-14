@@ -5,11 +5,15 @@ use std::{
     ops::Not,
     pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use bytes::Buf;
-use futures::{Sink, Stream};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use futures::{FutureExt, Sink, Stream};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    time::{Instant, Sleep},
+};
 
 use crate::{
     buffer::Buffer,
@@ -46,15 +50,19 @@ pub struct RammuxCodec<IO> {
     encoder_queue: VecDeque<EncoderItem>,
     decoder: DecoderState,
     frame_limit: NonZeroU32,
+    inbound_frame_sleep: Pin<Box<Sleep>>,
+    inbound_frame_timeout: Duration,
 }
 
 impl<IO> RammuxCodec<IO> {
-    pub fn new(io: IO, frame_limit: NonZeroU32) -> Self {
+    pub fn new(io: IO, frame_limit: NonZeroU32, inound_frame_timeout: Duration) -> Self {
         Self {
             io,
             encoder_queue: VecDeque::with_capacity(ENCODER_QUEUE_CAPACITY),
             decoder: Default::default(),
             frame_limit,
+            inbound_frame_sleep: Box::pin(tokio::time::sleep(inound_frame_timeout)),
+            inbound_frame_timeout: inound_frame_timeout,
         }
     }
 
@@ -63,20 +71,19 @@ impl<IO> RammuxCodec<IO> {
     }
 }
 
-impl<IO> Stream for RammuxCodec<IO>
+impl<IO> RammuxCodec<IO>
 where
     IO: AsyncRead + Unpin,
 {
-    type Item = Result<DecodedFrame, ErrorKind>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-
+    fn poll_next_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<DecodedFrame, ErrorKind>>> {
         loop {
-            match &mut this.decoder {
+            match &mut self.decoder {
                 DecoderState::ReadingHeader { filled, buffer } => {
                     let mut buf = ReadBuf::new(&mut buffer[*filled..]);
-                    std::task::ready!(Pin::new(&mut this.io).poll_read(cx, &mut buf))?;
+                    std::task::ready!(Pin::new(&mut self.io).poll_read(cx, &mut buf))?;
                     match buf.filled().len() {
                         0 if *filled == 0 => break Poll::Ready(None),
                         0 => break Poll::Ready(Some(Err(io::ErrorKind::UnexpectedEof.into()))),
@@ -95,7 +102,7 @@ where
                             payload,
                             is_response,
                         } => {
-                            this.decoder = Default::default();
+                            self.decoder = Default::default();
                             break Poll::Ready(Some(Ok(DecodedFrame::Ping {
                                 payload,
                                 is_response,
@@ -106,7 +113,7 @@ where
                             flags,
                             len,
                         } => {
-                            this.decoder = Default::default();
+                            self.decoder = Default::default();
                             break Poll::Ready(Some(Ok(DecodedFrame::Stream {
                                 stream_id,
                                 flags,
@@ -118,7 +125,7 @@ where
                             flags,
                             len,
                         } => match NonZeroU32::new(len) {
-                            Some(len) if len > this.frame_limit => {
+                            Some(len) if len > self.frame_limit => {
                                 break Poll::Ready(Some(Err(ErrorKind::Stream {
                                     id: stream_id,
                                     error: "sent a DATA frame exceeding the configured size limit"
@@ -126,7 +133,7 @@ where
                                 })));
                             },
                             Some(len) => {
-                                this.decoder = DecoderState::ReadingData {
+                                self.decoder = DecoderState::ReadingData {
                                     stream_id,
                                     flags,
                                     filled: 0,
@@ -136,7 +143,7 @@ where
                                 };
                             },
                             None => {
-                                this.decoder = Default::default();
+                                self.decoder = Default::default();
                                 break Poll::Ready(Some(Ok(DecodedFrame::Stream {
                                     stream_id,
                                     flags,
@@ -145,7 +152,7 @@ where
                             },
                         },
                         Header::Term => {
-                            this.decoder = Default::default();
+                            self.decoder = Default::default();
                             break Poll::Ready(Some(Ok(DecodedFrame::Terminate)));
                         },
                     }
@@ -160,7 +167,7 @@ where
                     let unfilled = &mut buffer.as_mut_slice()[*filled..];
                     let mut read_buf = ReadBuf::uninit(unfilled);
 
-                    std::task::ready!(Pin::new(&mut this.io).poll_read(cx, &mut read_buf))?;
+                    std::task::ready!(Pin::new(&mut self.io).poll_read(cx, &mut read_buf))?;
                     let read = read_buf.filled().len();
 
                     if read == 0 {
@@ -175,11 +182,34 @@ where
                             flags: *flags,
                             payload: StreamPayload::Data(data),
                         };
-                        this.decoder = Default::default();
+                        self.decoder = Default::default();
                         break Poll::Ready(Some(Ok(output)));
                     }
                 },
             }
+        }
+    }
+}
+
+impl<IO> Stream for RammuxCodec<IO>
+where
+    IO: AsyncRead + Unpin,
+{
+    type Item = Result<DecodedFrame, ErrorKind>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.poll_next_frame(cx) {
+            Poll::Pending => {
+                std::task::ready!(this.inbound_frame_sleep.poll_unpin(cx));
+                Poll::Ready(Some(Err(ErrorKind::Io(io::ErrorKind::TimedOut.into()))))
+            },
+            Poll::Ready(result) => {
+                this.inbound_frame_sleep
+                    .as_mut()
+                    .reset(Instant::now() + this.inbound_frame_timeout);
+                Poll::Ready(result)
+            },
         }
     }
 }
@@ -282,7 +312,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
+    use std::{num::NonZeroU32, time::Duration};
 
     use bytes::Bytes;
     use futures::{SinkExt, StreamExt};
@@ -356,8 +386,8 @@ mod tests {
 
         let (io_1, io_2) = tokio::io::duplex(8);
         let frame_limit = NonZeroU32::new(11).unwrap();
-        let mut codec_1 = RammuxCodec::new(io_1, frame_limit);
-        let mut codec_2 = RammuxCodec::new(io_2, frame_limit);
+        let mut codec_1 = RammuxCodec::new(io_1, frame_limit, Duration::from_secs(1));
+        let mut codec_2 = RammuxCodec::new(io_2, frame_limit, Duration::from_secs(1));
 
         tokio::join!(
             async {
@@ -399,8 +429,8 @@ mod tests {
     async fn frame_limit() {
         let (io_1, io_2) = tokio::io::duplex(32);
         let frame_limit = NonZeroU32::new(8).unwrap();
-        let mut codec_1 = RammuxCodec::new(io_1, frame_limit);
-        let mut codec_2 = RammuxCodec::new(io_2, frame_limit);
+        let mut codec_1 = RammuxCodec::new(io_1, frame_limit, Duration::from_secs(1));
+        let mut codec_2 = RammuxCodec::new(io_2, frame_limit, Duration::from_secs(1));
 
         codec_1
             .send(EncoderItem::new_data(

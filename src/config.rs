@@ -80,14 +80,13 @@ pub struct RammuxConfig {
     ///
     /// This value is a local knob and does not have to be negotiated.
     pub ping_interval: Duration,
-    /// Timeout for finishing a `PING` exchange.
+    /// Max delay between receiving inbound frames, can be used to detect dead peers.
     ///
-    /// Note that this timeout is counted from the moment when [`RammuxConnection`](crate::connection::RammuxConnection)
-    /// is ready to send the `PING`, not when the `PING` is actually sent.
-    /// This makes `PING` timeouts resilient against saturated links.
+    /// This is safe to use even with periods of no traffic,
+    /// as rammux expects responses to `PING` frames sent on interval.
     ///
     /// This value is a local knob and does not have to be negotiated.
-    pub ping_timeout: Duration,
+    pub inbound_frame_timeout: Duration,
     /// Size of the global local receive window shared between all streams.
     ///
     /// This pool will be used for autotuning local receive windows of streams
@@ -109,7 +108,7 @@ impl RammuxConfig {
     /// 2. [`Self::max_inbound_streams`] and [`Self::max_outbound_streams`] - 128
     /// 3. [`Self::local_recv_window`] and [`Self::remote_recv_window`] - 64kb
     /// 4. [`Self::ping_interval`] - 5s
-    /// 5. [`Self::ping_timeout`] - 10s
+    /// 5. [`Self::inbound_frame_timeout`] - 10s
     /// 6. [`Self::global_recv_window`] - 4mb
     pub const fn new() -> Self {
         Self {
@@ -119,7 +118,7 @@ impl RammuxConfig {
             local_recv_window: NonZeroU32::new(64 * 1024).unwrap(),
             remote_recv_window: 64 * 1024,
             ping_interval: Duration::from_secs(5),
-            ping_timeout: Duration::from_secs(10),
+            inbound_frame_timeout: Duration::from_secs(10),
             global_recv_window: 4 * 1024 * 1024,
         }
     }

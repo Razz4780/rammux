@@ -1,6 +1,6 @@
 //! rammux errors types.
 
-use std::{io, time::Duration};
+use std::io;
 
 use thiserror::Error;
 
@@ -48,20 +48,8 @@ impl RammuxError {
             ErrorKind::Decode(..) | ErrorKind::UnexpectedPing(..) | ErrorKind::Stream { .. } => {
                 true
             },
-            ErrorKind::Io(..)
-            | ErrorKind::AlreadyDowngraded
-            | ErrorKind::PingResponseTimeout { .. }
-            | ErrorKind::PingSendTimeout { .. }
-            | ErrorKind::Poisoned => false,
+            ErrorKind::Io(..) | ErrorKind::AlreadyDowngraded | ErrorKind::Poisoned => false,
         }
-    }
-
-    /// Returns whether this error originates from a ping timeout.
-    pub fn is_ping_timeout(&self) -> bool {
-        matches!(
-            &self.0,
-            ErrorKind::PingResponseTimeout { .. } | ErrorKind::PingSendTimeout { .. }
-        )
     }
 }
 
@@ -94,20 +82,6 @@ pub enum ErrorKind {
     /// Received an unexpected `PING` frame.
     #[error("received an unexpected ping {0}")]
     UnexpectedPing(PingPayload),
-    /// Failed to receive a `PING` response within the configured timeout.
-    #[error("ping {payload} timed out after {:.02}s", elapsed.as_secs_f32())]
-    PingResponseTimeout {
-        /// Payload of the failed `PING`.
-        payload: PingPayload,
-        /// Time elapsed since the `PING` was ready to be sent.
-        elapsed: Duration,
-    },
-    /// Failed to send a `PING` within the configured timeout.
-    #[error("failed to send ping within {:.02}s", elapsed.as_secs_f32())]
-    PingSendTimeout {
-        /// Time elapsed since the `PING` was ready to be sent.
-        elapsed: Duration,
-    },
     /// rammux connection was downgraded and is no longer valid.
     #[error("connection already downgraded")]
     AlreadyDowngraded,

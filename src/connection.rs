@@ -82,13 +82,13 @@ where
     pub fn new(role: RammuxRole, io: IO, config: RammuxConfig) -> Self {
         Self {
             state: ConnState::Active(Active {
-                codec: RammuxCodec::new(io, config.frame_limit),
+                codec: RammuxCodec::new(io, config.frame_limit, config.inbound_frame_timeout),
                 streams: Default::default(),
                 selector: Selector::new(GlobalPool {
                     rtt: None,
                     available: config.global_recv_window,
                 }),
-                out_pings: OutboundPings::new(config.ping_interval, config.ping_timeout),
+                out_pings: OutboundPings::new(config.ping_interval),
                 in_ping: None,
             }),
             config,
@@ -252,7 +252,7 @@ where
         loop {
             std::task::ready!(active.codec.poll_ready_unpin(cx))?;
 
-            if let Some(payload) = active.out_pings.take_ready() {
+            if let Poll::Ready(payload) = active.out_pings.poll_next(cx) {
                 active
                     .codec
                     .start_send_priority(EncoderItem::new_ping(payload, false));
@@ -290,11 +290,6 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<RammuxProgress<IO>, ErrorKind>> {
-        let _ = self
-            .state
-            .active_mut()
-            .map(|active| active.out_pings.poll_progress(cx))
-            .unwrap_or(Poll::Pending)?;
         let mut inbound = Poll::Pending;
         // Drain up to one encoder batch of inbound frames first.
         // In particular, processing multiple WINDOW_UPDATEs can make several
