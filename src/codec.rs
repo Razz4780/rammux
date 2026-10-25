@@ -1,8 +1,6 @@
 use std::{
-    collections::VecDeque,
     io,
     num::NonZeroU32,
-    ops::Not,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -28,9 +26,6 @@ use crate::{
 pub mod decoder;
 pub mod encoder;
 
-/// How many [`EncoderItem`]s can be stored in a [`RammuxCodec`] before data has to be written into the IO transport.
-pub const ENCODER_QUEUE_CAPACITY: usize = 16;
-
 /// rammux frame codec applied to an IO transport.
 ///
 /// Implements [`Stream`] and [`Sink`].
@@ -41,13 +36,14 @@ pub const ENCODER_QUEUE_CAPACITY: usize = 16;
 /// Yielded [`DecodedFrame`]s can have arbitrary values, except that [`StreamPayload::Data`]
 /// is never larger than the configured frame limit.
 ///
-/// # Encoder queue
+/// # Encoder
 ///
-/// This codes queues [`EncoderItem`]s to leverage vectored writes for better performance.
-/// At most [`ENCODER_QUEUE_CAPACITY`] items can be queued before data has to be written into the IO transport.
+/// This codec holds at most one [`EncoderItem`]. It is written to the IO transport completely
+/// (as a single vectored write of the header and the payload, when the transport allows)
+/// before the next item can be sent. There is no queue, so the caller decides what goes next.
 pub struct RammuxCodec<IO> {
     io: IO,
-    encoder_queue: VecDeque<EncoderItem>,
+    pending: Option<EncoderItem>,
     decoder: DecoderState,
     frame_limit: NonZeroU32,
     inbound_frame_sleep: Pin<Box<Sleep>>,
@@ -58,7 +54,7 @@ impl<IO> RammuxCodec<IO> {
     pub fn new(io: IO, frame_limit: NonZeroU32, inound_frame_timeout: Duration) -> Self {
         Self {
             io,
-            encoder_queue: VecDeque::with_capacity(ENCODER_QUEUE_CAPACITY),
+            pending: None,
             decoder: Default::default(),
             frame_limit,
             inbound_frame_sleep: Box::pin(tokio::time::sleep(inound_frame_timeout)),
@@ -218,55 +214,22 @@ impl<IO> RammuxCodec<IO>
 where
     IO: AsyncWrite + Unpin,
 {
-    /// Enqueues the given [`EncoderItem`] for transfer.
-    ///
-    /// In contrast to [`Sink::start_send`], this puts the new item
-    /// as close to the head of the queue as possible.
-    ///
-    /// This is used to handle `PING` frames as quickly as possible.
-    pub fn start_send_priority(&mut self, item: EncoderItem) {
-        if self.encoder_queue_full() {
-            panic!("frame encoder is busy");
-        }
-        let head = self
-            .encoder_queue
-            .pop_front_if(|head| head.has_partially_read_chunk());
-        self.encoder_queue.push_front(item);
-        if let Some(head) = head {
-            self.encoder_queue.push_front(head);
-        }
-    }
-
-    fn encoder_queue_full(&self) -> bool {
-        self.encoder_queue.len() >= ENCODER_QUEUE_CAPACITY
-    }
-
-    fn poll_encode_while<F>(
-        &mut self,
-        cx: &mut Context<'_>,
-        mut pred: F,
-    ) -> Poll<Result<(), ErrorKind>>
-    where
-        F: FnMut(&Self) -> bool,
-    {
-        while pred(self) {
-            let mut io_vecs = [io::IoSlice::new(&[]); ENCODER_QUEUE_CAPACITY * 2];
-            let mut n_vecs = 0;
-            for item in &self.encoder_queue {
-                n_vecs += item.chunks_vectored(&mut io_vecs[n_vecs..]);
+    /// Writes the pending item (if any) to the transport completely.
+    fn poll_write_pending(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ErrorKind>> {
+        while let Some(item) = &mut self.pending {
+            if !item.has_remaining() {
+                self.pending = None;
+                break;
             }
-            let mut written = std::task::ready!(
+            let mut io_vecs = [io::IoSlice::new(&[]); 2];
+            let n_vecs = item.chunks_vectored(&mut io_vecs);
+            let written = std::task::ready!(
                 Pin::new(&mut self.io).poll_write_vectored(cx, &io_vecs[..n_vecs])
             )?;
-
-            while written > 0 {
-                self.encoder_queue.pop_front_if(|item| {
-                    let advance = written.min(item.remaining());
-                    written -= advance;
-                    item.advance(advance);
-                    item.has_remaining().not()
-                });
+            if written == 0 {
+                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
             }
+            item.advance(written);
         }
 
         Poll::Ready(Ok(()))
@@ -280,22 +243,21 @@ where
     type Error = ErrorKind;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.get_mut()
-            .poll_encode_while(cx, Self::encoder_queue_full)
+        self.get_mut().poll_write_pending(cx)
     }
 
     fn start_send(self: Pin<&mut Self>, item: EncoderItem) -> Result<(), Self::Error> {
         let this = self.get_mut();
-        if this.encoder_queue_full() {
+        if this.pending.is_some() {
             panic!("frame encoder is busy");
         }
-        this.encoder_queue.push_back(item);
+        this.pending = Some(item);
         Ok(())
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
-        std::task::ready!(this.poll_encode_while(cx, |this| this.encoder_queue.is_empty().not()))?;
+        std::task::ready!(this.poll_write_pending(cx))?;
         Pin::new(&mut this.io)
             .poll_flush(cx)
             .map_err(ErrorKind::from)
@@ -303,7 +265,7 @@ where
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
-        std::task::ready!(this.poll_encode_while(cx, |this| this.encoder_queue.is_empty().not()))?;
+        std::task::ready!(this.poll_write_pending(cx))?;
         Pin::new(&mut this.io)
             .poll_shutdown(cx)
             .map_err(ErrorKind::from)

@@ -14,7 +14,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{
     codec::{
-        self, RammuxCodec,
+        RammuxCodec,
         decoder::{DecodedFrame, StreamPayload},
         encoder::EncoderItem,
     },
@@ -34,6 +34,9 @@ pub use crate::connection::downgrade::Downgraded;
 mod downgrade;
 mod pings;
 mod state;
+
+/// How many inbound frames are processed in a row before outbound frames get a turn.
+const INBOUND_BATCH: usize = 16;
 
 /// State machine of a single rammux connection.
 ///
@@ -255,14 +258,14 @@ where
             if let Poll::Ready(payload) = active.out_pings.poll_next(cx) {
                 active
                     .codec
-                    .start_send_priority(EncoderItem::new_ping(payload, false));
+                    .start_send_unpin(EncoderItem::new_ping(payload, false))?;
                 continue;
             }
 
             if let Some(payload) = active.in_ping.take() {
                 active
                     .codec
-                    .start_send_priority(EncoderItem::new_ping(payload, true));
+                    .start_send_unpin(EncoderItem::new_ping(payload, true))?;
                 continue;
             }
 
@@ -291,11 +294,10 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<RammuxProgress<IO>, ErrorKind>> {
         let mut inbound = Poll::Pending;
-        // Drain up to one encoder batch of inbound frames first.
-        // In particular, processing multiple WINDOW_UPDATEs can make several
-        // outbound streams writable, allowing their frames to be coalesced into
-        // a vectored write. Keep the work bounded so ready reads cannot starve writes.
-        for _ in 0..codec::ENCODER_QUEUE_CAPACITY {
+        // Drain a bounded batch of inbound frames first.
+        // Processing window updates can make several outbound streams writable.
+        // Keep the work bounded so ready reads cannot starve writes.
+        for _ in 0..INBOUND_BATCH {
             match self.poll_inbound_progress(cx)? {
                 Poll::Pending => break,
                 Poll::Ready(RammuxProgress::Empty) => {
