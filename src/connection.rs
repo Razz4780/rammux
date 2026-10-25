@@ -161,8 +161,11 @@ where
         if let Some(pong) = header.pong {
             // A PONG is welcome even if we have no idea what it answers.
             // If it seems to come from the future, it does not make sense, and we ignore it.
-            if let Some(rtt) = clock::elapsed(now, pong.t_echo) {
-                global.rtt = Some(rtt);
+            // And if it took longer than the peer may stay silent, it is stale: the peer would be dead.
+            if let Some(rtt) = clock::elapsed(now, pong.t_echo)
+                && rtt <= self.config.inbound_frame_timeout
+            {
+                global.observe_rtt(rtt);
             }
         }
         if let Some(t_ping) = header.ping {
@@ -423,7 +426,7 @@ where
 
     /// Returns current statistics of this connection.
     pub fn stats(&self) -> RammuxStats {
-        let (inbound_streams, outbound_streams, rtt, pool_rx_used) = self
+        let (inbound_streams, outbound_streams, srtt, pool_rx_used) = self
             .state
             .active()
             .map(|active| {
@@ -433,7 +436,7 @@ where
                         .expect("we can't have more than u32 inbound streams"),
                     u32::try_from(active.streams.outbound.len())
                         .expect("we can't have more than u32 outbound streams"),
-                    global.rtt,
+                    global.srtt,
                     global.rx_used,
                 )
             })
@@ -442,7 +445,7 @@ where
         RammuxStats {
             inbound_streams,
             outbound_streams,
-            rtt,
+            srtt,
             pool_rx_used,
         }
     }
@@ -470,10 +473,11 @@ pub struct RammuxStats {
     pub inbound_streams: u32,
     /// Count of currently active outbound streams.
     pub outbound_streams: u32,
-    /// Most recent round trip time, measured with a `PING` exchange.
+    /// Smoothed round trip time, measured with `PING`/`PONG` exchanges.
     ///
-    /// Empty if no `PING` response has been received yet.
-    pub rtt: Option<Duration>,
+    /// It includes the queues on the path in both directions, and the delay in the peer's muxer.
+    /// Empty if no `PONG` has been received yet.
+    pub srtt: Option<Duration>,
     /// Bytes of the receive pool used by the inbound streams of the peer.
     ///
     /// The sum over the inbound streams of the bytes received and not credited back,

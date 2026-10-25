@@ -225,7 +225,7 @@ async fn rx_bytes_counts_data_the_reader_never_sees() {
 async fn pong_gives_the_round_trip_time() {
     let mut rig = rig(RammuxRole::Server, config());
     rig.frames();
-    assert_eq!(rig.conn.stats().rtt, None);
+    assert_eq!(rig.conn.stats().srtt, None);
 
     tokio::time::advance(Duration::from_millis(50)).await;
     let t_echo = rig.now_micros() - 5000;
@@ -239,7 +239,7 @@ async fn pong_gives_the_round_trip_time() {
     };
     // A PONG is welcome although we have no PING in flight.
     rig.write(raw(header, b"")).await;
-    assert_eq!(rig.conn.stats().rtt, Some(Duration::from_millis(5)));
+    assert_eq!(rig.conn.stats().srtt, Some(Duration::from_millis(5)));
 
     // A PONG from the future is ignored.
     let header = Header {
@@ -251,7 +251,38 @@ async fn pong_gives_the_round_trip_time() {
         ..Default::default()
     };
     rig.write(raw(header, b"")).await;
-    assert_eq!(rig.conn.stats().rtt, Some(Duration::from_millis(5)));
+    assert_eq!(rig.conn.stats().srtt, Some(Duration::from_millis(5)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_round_trip_longer_than_the_frame_timeout_is_not_a_sample() {
+    // No PONG can come back later than the peer is allowed to stay silent: a sample that large comes
+    // from a stale or forged t_echo, and would push the smoothed round trip time to minutes.
+    let mut config = config();
+    config.inbound_frame_timeout = Duration::from_secs(10);
+    let mut rig = rig(RammuxRole::Server, config);
+    rig.frames();
+    let pong = |t_echo| Header {
+        pong: Some(Pong {
+            t_echo,
+            t_read: 0,
+            rx_bytes: 0,
+        }),
+        ..Default::default()
+    };
+    tokio::time::advance(Duration::from_millis(50)).await;
+    rig.write(raw(pong(rig.now_micros() - 5000), b"")).await;
+    assert_eq!(rig.conn.stats().srtt, Some(Duration::from_millis(5)));
+
+    // The frame is already there when the time passes.
+    let t_echo = rig.now_micros();
+    rig.peer_out
+        .write_all(&raw(pong(t_echo), b""))
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(10) + Duration::from_millis(1)).await;
+    rig.settle();
+    assert_eq!(rig.conn.stats().srtt, Some(Duration::from_millis(5)));
 }
 
 #[tokio::test(start_paused = true)]
