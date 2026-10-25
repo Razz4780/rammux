@@ -43,7 +43,15 @@ pub mod encoder;
 /// (as one `poll_write_vectored` of the header and the payload) before the next frame can be sent.
 /// There is no queue, so the caller decides what goes next.
 ///
-/// The `PING` timestamp is taken when the frame is handed over.
+/// The header is encoded when the transport is first asked to write the frame,
+/// and encoded again if the transport accepts nothing, so that the `PING` timestamp
+/// is the time of the first accepted byte.
+///
+/// A transport without native vectored writes (`is_write_vectored()` is false) gets tokio's default
+/// `poll_write_vectored`, which writes the header, and the payload with the next call: two writes per frame.
+/// Such a transport is best wrapped in a buffered writer (e.g. `tokio::io::BufWriter`), which this codec flushes
+/// after the last frame it has ready. A buffered reader is fine: what it has buffered stays in the transport
+/// returned by the downgrade.
 pub struct RammuxCodec<IO> {
     io: IO,
     pending: Option<EncoderItem>,
@@ -217,6 +225,12 @@ where
                 break;
             }
 
+            // Until the transport accepts a byte of the frame, the timestamp is whatever the time is now.
+            let stamp = (item.has_ping() && !item.is_started()).then(|| {
+                let stamp = self.ping_stamps.next(self.clock.micros(Instant::now()));
+                item.stamp(stamp);
+                stamp
+            });
             // The header and the payload go to the transport together. A transport without
             // vectored writes gets them one after another, which is the best it can do.
             let (slices, n_slices) = item.slices();
@@ -225,6 +239,9 @@ where
             )?;
             if written == 0 {
                 return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            }
+            if let Some(stamp) = stamp {
+                self.ping_stamps.commit(stamp);
             }
             item.advance(written);
         }
@@ -249,13 +266,7 @@ where
             panic!("frame encoder is busy");
         }
         assert!(!frame.is_empty(), "empty frame");
-        let mut item = EncoderItem::new(frame);
-        if item.has_ping() {
-            let stamp = this.ping_stamps.next(this.clock.micros(Instant::now()));
-            item.stamp(stamp);
-            this.ping_stamps.commit(stamp);
-        }
-        this.pending = Some(item);
+        this.pending = Some(EncoderItem::new(frame));
         Ok(())
     }
 
@@ -657,6 +668,30 @@ mod tests {
         // flags, stream_id, credit, len, then t_ping.
         assert_eq!(bytes[..2], [0x00, 0x39]);
         u32::from_be_bytes(bytes[10..14].try_into().unwrap())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ping_is_stamped_at_the_first_accepted_byte() {
+        let (io, writes, refuse) = MockIo::new(true);
+        let mut codec = codec(io);
+        // The clock of the codec started at 0.
+        tokio::time::advance(Duration::from_micros(1000)).await;
+
+        *refuse.lock().unwrap() = true;
+        let frame = OutFrame {
+            ping: true,
+            ..stream_frame(7, syn(), 100, b"payload")
+        };
+        let mut send = Box::pin(codec.send(frame));
+        assert!(send.as_mut().now_or_never().is_none());
+        assert!(writes.lock().unwrap().is_empty());
+
+        // The transport becomes writable later; the stamp is the later time.
+        tokio::time::advance(Duration::from_micros(2500)).await;
+        send.await.unwrap();
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(t_ping_of(&writes[0]), 3500);
     }
 
     #[tokio::test(start_paused = true)]
