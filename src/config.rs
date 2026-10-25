@@ -40,6 +40,8 @@ impl fmt::Display for RammuxRole {
 /// - [`RammuxConfig::max_inbound_streams`]
 /// - [`RammuxConfig::remote_recv_window`]
 /// - [`RammuxConfig::local_recv_window`]
+/// - [`RammuxConfig::remote_recv_pool`]
+/// - [`RammuxConfig::local_recv_pool`]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct RammuxConfig {
@@ -64,20 +66,48 @@ pub struct RammuxConfig {
     /// This limit has to be negotiated beforehand and
     /// not exceed the peer's [`RammuxConfig::max_inbound_streams`].
     pub max_outbound_streams: u32,
-    /// Initial size of the local receive window for every stream.
+    /// Base receive window of every stream, `B` in `TRANSIT_CONTROL.md`.
+    ///
+    /// Every stream can have this many bytes of its inbound data unread by the application,
+    /// no matter what the other streams do. It is fixed for the life of the connection,
+    /// the receiver does not tune it. On top of it, streams share [`Self::local_recv_pool`].
     ///
     /// # Negotiation
     ///
     /// This value has to be negotiated beforehand and
     /// must match the peer's [`RammuxConfig::remote_recv_window`].
     pub local_recv_window: NonZeroU32,
-    /// Initial size of the remote receive window for every stream.
+    /// Base receive window the peer grants to every stream.
     ///
     /// # Negotiation
     ///
     /// This value has to be negotiated beforehand and
     /// must match the peer's [`RammuxConfig::local_recv_window`].
-    pub remote_recv_window: u32,
+    pub remote_recv_window: NonZeroU32,
+    /// Size of the pool of receive window shared by all inbound streams.
+    ///
+    /// The unread inbound data of all streams can exceed their base windows
+    /// by this many bytes at most. The memory used for inbound data is therefore at most
+    /// `streams * local_recv_window + local_recv_pool`.
+    ///
+    /// The pool is the responsibility of the user, rammux uses the configured value as it is.
+    /// Any size works, 0 included (streams run on their base windows). A pool or a window smaller than
+    /// [`Self::frame_limit`] is used with smaller frames.
+    /// The pool bounds the queue that the connection can build on the path, at about
+    /// `(streams * window + pool) / bandwidth`.
+    ///
+    /// # Negotiation
+    ///
+    /// This value has to be negotiated beforehand and
+    /// must match the peer's [`RammuxConfig::remote_recv_pool`].
+    pub local_recv_pool: u32,
+    /// Size of the pool of receive window shared by the inbound streams of the peer.
+    ///
+    /// # Negotiation
+    ///
+    /// This value has to be negotiated beforehand and
+    /// must match the peer's [`RammuxConfig::local_recv_pool`].
+    pub remote_recv_pool: u32,
     /// A `PING` is sent when this much `DATA` was written since the last one.
     ///
     /// Every `PING` is answered with a `PONG`, which gives the peer a round trip time sample.
@@ -123,13 +153,16 @@ impl RammuxConfig {
     /// 5. [`Self::ping_interval`] - 5s
     /// 6. [`Self::inbound_frame_timeout`] - 10s
     /// 7. [`Self::global_recv_window`] - 4mb
+    /// 8. [`Self::local_recv_pool`] and [`Self::remote_recv_pool`] - 4mb
     pub const fn new() -> Self {
         Self {
             frame_limit: NonZeroU16::new(16 * 1024).unwrap(),
             max_inbound_streams: 128,
             max_outbound_streams: 128,
             local_recv_window: NonZeroU32::new(64 * 1024).unwrap(),
-            remote_recv_window: 64 * 1024,
+            remote_recv_window: NonZeroU32::new(64 * 1024).unwrap(),
+            local_recv_pool: 4 * 1024 * 1024,
+            remote_recv_pool: 4 * 1024 * 1024,
             ping_bytes: NonZeroU32::new(32 * 1024).unwrap(),
             ping_interval: Duration::from_secs(5),
             inbound_frame_timeout: Duration::from_secs(10),

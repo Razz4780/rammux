@@ -496,7 +496,7 @@ mod test {
         let mut config = RammuxConfig::new();
         config.frame_limit = NonZeroU16::new(256).unwrap();
         config.local_recv_window = NonZeroU32::new(1024).unwrap();
-        config.remote_recv_window = 1024;
+        config.remote_recv_window = NonZeroU32::new(1024).unwrap();
         config.ping_interval = Duration::from_millis(25);
         config.max_inbound_streams = 16;
         config.max_outbound_streams = 16;

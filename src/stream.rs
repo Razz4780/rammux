@@ -29,7 +29,7 @@ pub(crate) fn new(
 ) -> (StreamHandle, StreamUpdates, RammuxDuplex) {
     let state = SharedStreamState {
         inbound: InboundTraffic::new(config.local_recv_window),
-        outbound: OutboundTraffic::new(config.frame_limit, config.remote_recv_window),
+        outbound: OutboundTraffic::new(config.frame_limit, config.remote_recv_window.get()),
         updates_poller: Default::default(),
     };
     let state = Arc::new(Mutex::new(state));

@@ -21,7 +21,9 @@ const CONFIG: RammuxConfig = RammuxConfig {
     max_inbound_streams: 4,
     max_outbound_streams: 4,
     local_recv_window: NonZeroU32::new(12).unwrap(),
-    remote_recv_window: 14,
+    remote_recv_window: NonZeroU32::new(14).unwrap(),
+    local_recv_pool: 32,
+    remote_recv_pool: 32,
     ping_bytes: NonZeroU32::new(32).unwrap(),
     ping_interval: Duration::from_secs(1),
     inbound_frame_timeout: Duration::from_secs(1),
@@ -166,7 +168,7 @@ async fn local_receive_window_is_respected() {
 #[tokio::test]
 async fn remote_receive_window_is_respected() {
     let (mut handle, mut selector, mut duplex) = new_stream(GlobalPool::default());
-    for _ in 0..CONFIG.remote_recv_window {
+    for _ in 0..CONFIG.remote_recv_window.get() {
         duplex.feed(Bytes::from_static(b"a")).await.unwrap();
         assert!(duplex.flush().now_or_never().is_none());
         let (update, fin_state) = selector.next().await.unwrap();
