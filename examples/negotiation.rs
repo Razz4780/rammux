@@ -1,4 +1,4 @@
-use std::num::NonZeroU32;
+use std::num::{NonZeroU16, NonZeroU32};
 
 use rammux::{
     config::{RammuxConfig, RammuxRole},
@@ -14,12 +14,12 @@ async fn main() {
     let (io_1, io_2) = tokio::io::duplex(4096);
 
     let mut config_1 = RammuxConfig::new();
-    config_1.frame_limit = NonZeroU32::new(512).unwrap();
+    config_1.frame_limit = NonZeroU16::new(512).unwrap();
     config_1.max_inbound_streams = 8;
     config_1.local_recv_window = NonZeroU32::new(256 * 1024).unwrap();
 
     let mut config_2 = RammuxConfig::new();
-    config_2.frame_limit = NonZeroU32::new(32 * 1024).unwrap();
+    config_2.frame_limit = NonZeroU16::new(32 * 1024).unwrap();
     config_2.max_inbound_streams = 256;
     config_2.local_recv_window = NonZeroU32::new(8 * 1024).unwrap();
 
@@ -42,7 +42,7 @@ async fn negotiate_rammux(role: RammuxRole, mut io: DuplexStream, mut config: Ra
         .await
         .expect("connection should not fail");
 
-    let mut buffer = [0_u8; 12];
+    let mut buffer = [0_u8; PeerConfig::LEN];
     io.read_exact(&mut buffer)
         .await
         .expect("connection should not fail");
@@ -79,7 +79,7 @@ struct PeerConfig {
     /// Our desired frame limit.
     ///
     /// Final config will use the smaller value.
-    pub frame_limit: NonZeroU32,
+    pub frame_limit: NonZeroU16,
     /// How many concurrent inbound streams we can serve.
     ///
     /// Final config will use the smaller value between this (we don't want to violate peer's resource limits)
@@ -90,20 +90,21 @@ struct PeerConfig {
 }
 
 impl PeerConfig {
-    fn encode(&self) -> [u8; 12] {
-        let mut result = [0_u8; 12];
-        result[..4].copy_from_slice(&self.frame_limit.get().to_be_bytes());
-        result[4..8].copy_from_slice(&self.max_inbound_streams.to_be_bytes());
-        result[8..].copy_from_slice(&self.recv_window.to_be_bytes());
+    const LEN: usize = 10;
+
+    fn encode(&self) -> [u8; Self::LEN] {
+        let mut result = [0_u8; Self::LEN];
+        result[..2].copy_from_slice(&self.frame_limit.get().to_be_bytes());
+        result[2..6].copy_from_slice(&self.max_inbound_streams.to_be_bytes());
+        result[6..].copy_from_slice(&self.recv_window.to_be_bytes());
         result
     }
 
-    fn decode(buffer: [u8; 12]) -> Self {
-        let chunks = buffer.as_chunks::<4>().0;
-        let frame_limit = u32::from_be_bytes(chunks[0]);
-        let frame_limit = NonZeroU32::new(frame_limit).expect("received non-positive frame limit");
-        let max_inbound_streams = u32::from_be_bytes(chunks[1]);
-        let recv_window = u32::from_be_bytes(chunks[2]);
+    fn decode(buffer: [u8; Self::LEN]) -> Self {
+        let frame_limit = u16::from_be_bytes([buffer[0], buffer[1]]);
+        let frame_limit = NonZeroU16::new(frame_limit).expect("received non-positive frame limit");
+        let max_inbound_streams = u32::from_be_bytes(buffer[2..6].try_into().unwrap());
+        let recv_window = u32::from_be_bytes(buffer[6..].try_into().unwrap());
         Self {
             frame_limit,
             max_inbound_streams,

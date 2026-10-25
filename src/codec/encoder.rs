@@ -1,303 +1,237 @@
-use std::io;
+use std::{io, num::NonZeroU16, num::NonZeroU32};
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 
 use crate::{
     StreamId,
-    header::{ControlFlags, PingPayload, RawFlags, RawHeader},
+    header::{ControlFlags, Header, MAX_HEADER_LEN, Pong, StreamHeader},
 };
 
+/// A frame to be written, before its header is encoded.
+///
+/// The header is encoded only when the frame starts being written,
+/// because it carries the timestamp of its first byte.
+#[derive(Debug, Default)]
+pub struct OutFrame {
+    /// Whether to send a `PING`. Its `t_ping` is set by the encoder.
+    pub ping: bool,
+    /// A `PONG` to send.
+    pub pong: Option<Pong>,
+    /// Stream part of the frame.
+    pub stream: Option<OutStream>,
+    /// Whether this is the `TERM` frame.
+    pub term: bool,
+}
+
+/// The stream part of an [`OutFrame`]. At least one of the fields must be set.
+#[derive(Debug)]
+pub struct OutStream {
+    pub id: StreamId,
+    pub flags: ControlFlags,
+    /// Bytes returned to the receive window of the peer, 0 for none.
+    pub credit: u32,
+    /// Stream data, empty for none. At most `u16::MAX` bytes.
+    pub data: Bytes,
+}
+
+impl OutFrame {
+    /// Returns the `TERM` frame.
+    pub fn terminate() -> Self {
+        Self {
+            term: true,
+            ..Default::default()
+        }
+    }
+
+    /// Returns whether the frame carries nothing, so it must not be sent.
+    pub fn is_empty(&self) -> bool {
+        !self.ping && self.pong.is_none() && self.stream.is_none() && !self.term
+    }
+
+    /// Length of the `DATA` payload in the frame.
+    pub fn data_len(&self) -> usize {
+        self.stream.as_ref().map_or(0, |stream| stream.data.len())
+    }
+}
+
+/// An [`OutFrame`] that is being written.
 pub struct EncoderItem {
-    headers: [u8; RawHeader::LEN * 2],
-    data: Bytes,
+    header: Header,
+    payload: Bytes,
+    encoded: [u8; MAX_HEADER_LEN],
+    header_len: usize,
+    /// How many bytes of the frame were accepted by the transport.
     consumed: usize,
 }
 
 impl EncoderItem {
-    pub fn new_ping(payload: PingPayload, is_response: bool) -> Self {
-        let flags = if is_response {
-            RawFlags::PING
-        } else {
-            RawFlags::PING | RawFlags::SYN
+    pub fn new(frame: OutFrame) -> Self {
+        let (stream, payload) = match frame.stream {
+            Some(stream) => {
+                let data_len = u16::try_from(stream.data.len()).expect("data too big");
+                (
+                    Some(StreamHeader {
+                        id: stream.id,
+                        flags: stream.flags,
+                        credit: NonZeroU32::new(stream.credit),
+                        data_len: NonZeroU16::new(data_len),
+                    }),
+                    stream.data,
+                )
+            },
+            None => (None, Bytes::new()),
         };
-        let header = RawHeader {
-            stream_id: payload.stream_id,
-            flags,
-            len: payload.len,
+        let header = Header {
+            stream,
+            // The value is set when the frame is written.
+            ping: frame.ping.then_some(0),
+            pong: frame.pong,
+            term: frame.term,
         };
-        let mut headers = [0_u8; RawHeader::LEN * 2];
-        headers[RawHeader::LEN..].copy_from_slice(&header.encode());
-        Self {
-            headers,
-            data: Default::default(),
-            consumed: RawHeader::LEN,
-        }
-    }
-
-    pub fn new_terminate() -> Self {
-        Self {
-            headers: [0_u8; RawHeader::LEN * 2],
-            data: Default::default(),
-            consumed: RawHeader::LEN,
-        }
-    }
-
-    pub fn new_window_update(stream_id: StreamId, flags: ControlFlags, update: u32) -> Self {
-        let header = RawHeader {
-            stream_id,
-            flags: RawFlags::from(flags).union(RawFlags::WINDOW_UPDATE),
-            len: update,
-        };
-        let mut headers = [0; RawHeader::LEN * 2];
-        headers[8..].copy_from_slice(&header.encode());
-        Self {
-            headers,
-            data: Default::default(),
-            consumed: RawHeader::LEN,
-        }
-    }
-
-    pub fn new_data(stream_id: StreamId, flags: ControlFlags, data: Bytes) -> Self {
-        let header = RawHeader {
-            stream_id,
-            flags: RawFlags::from(flags).union(RawFlags::DATA),
-            len: u32::try_from(data.len()).expect("data too big"),
-        };
-        let mut headers = [0; RawHeader::LEN * 2];
-        headers[8..].copy_from_slice(&header.encode());
-        Self {
-            headers,
-            data,
-            consumed: RawHeader::LEN,
-        }
-    }
-
-    pub fn new_window_update_and_data(
-        stream_id: StreamId,
-        flags: ControlFlags,
-        update: u32,
-        data: Bytes,
-    ) -> Self {
-        let flags = RawFlags::from(flags);
-        let header_1 = RawHeader {
-            stream_id,
-            flags: flags
-                .union(RawFlags::WINDOW_UPDATE)
-                .difference(RawFlags::FIN_WRITE),
-            len: update,
-        };
-        let header_2 = RawHeader {
-            stream_id,
-            flags: flags
-                .union(RawFlags::DATA)
-                .difference(RawFlags::FIN_READ | RawFlags::SYN),
-            len: u32::try_from(data.len()).expect("data too big"),
-        };
-        let mut headers = [0; RawHeader::LEN * 2];
-        headers[..8].copy_from_slice(&header_1.encode());
-        headers[8..].copy_from_slice(&header_2.encode());
-        Self {
-            headers,
-            data,
+        let mut item = Self {
+            header,
+            payload,
+            encoded: [0; MAX_HEADER_LEN],
+            header_len: 0,
             consumed: 0,
-        }
-    }
-}
-
-impl Buf for EncoderItem {
-    fn remaining(&self) -> usize {
-        self.headers.len() + self.data.len() - self.consumed
+        };
+        item.stamp(0);
+        item
     }
 
-    fn chunk(&self) -> &[u8] {
-        match self.consumed.checked_sub(self.headers.len()) {
-            Some(offset) => &self.data[offset..],
-            None => &self.headers[self.consumed..],
-        }
+    /// Whether the frame carries a `PING`, which needs a stamp.
+    pub fn has_ping(&self) -> bool {
+        self.header.ping.is_some()
     }
 
-    fn advance(&mut self, cnt: usize) {
-        if self.remaining() < cnt {
-            panic!("overflow")
+    /// Whether the transport already accepted some bytes of the frame.
+    ///
+    /// After that, the header is fixed.
+    pub fn is_started(&self) -> bool {
+        self.consumed > 0
+    }
+
+    /// Encodes the header with the given `t_ping`, if `PING` is carried.
+    ///
+    /// Can be repeated until the frame [starts](Self::is_started) being written.
+    pub fn stamp(&mut self, t_ping: u32) {
+        assert!(!self.is_started(), "the header is already fixed");
+        if self.has_ping() {
+            self.header.ping = Some(t_ping);
         }
+        self.header_len = self.header.encode(&mut self.encoded);
+    }
+
+    /// Returns how many bytes of the frame were not yet accepted by the transport.
+    pub fn remaining(&self) -> usize {
+        self.header_len + self.payload.len() - self.consumed
+    }
+
+    /// Returns the unwritten part of the frame as at most two slices.
+    pub fn slices(&self) -> ([io::IoSlice<'_>; 2], usize) {
+        let mut slices = [io::IoSlice::new(&[]), io::IoSlice::new(&[])];
+        let mut n = 0;
+        let header_left = self.header_len.saturating_sub(self.consumed);
+        if header_left > 0 {
+            slices[n] =
+                io::IoSlice::new(&self.encoded[self.header_len - header_left..self.header_len]);
+            n += 1;
+        }
+        let payload_done = self.consumed.saturating_sub(self.header_len);
+        if payload_done < self.payload.len() {
+            slices[n] = io::IoSlice::new(&self.payload[payload_done..]);
+            n += 1;
+        }
+        (slices, n)
+    }
+
+    /// Marks the given number of bytes as accepted by the transport.
+    pub fn advance(&mut self, cnt: usize) {
+        assert!(cnt <= self.remaining(), "overflow");
         self.consumed += cnt;
-    }
-
-    fn chunks_vectored<'a>(&'a self, dst: &mut [std::io::IoSlice<'a>]) -> usize {
-        let mut idx = 0;
-        let mut offset = self.consumed;
-        for chunk in [self.headers.as_slice(), self.data.as_ref()] {
-            let data = chunk.get(offset..).unwrap_or_default();
-            offset = offset.saturating_sub(chunk.len());
-            if data.is_empty() {
-                continue;
-            }
-            let Some(slot) = dst.get_mut(idx) else {
-                break;
-            };
-            *slot = io::IoSlice::new(data);
-            idx += 1;
-        }
-        idx
     }
 }
 
 #[cfg(test)]
 mod test {
-    use std::{io, ops::Not};
-
-    use bytes::{Buf, Bytes};
-    use rstest::rstest;
+    use bytes::Bytes;
 
     use crate::{
         StreamId,
-        codec::EncoderItem,
-        header::{ControlFlags, PingPayload, RawHeader},
+        codec::encoder::{EncoderItem, OutFrame, OutStream},
+        header::{ControlFlags, Pong},
     };
 
-    #[rstest]
-    #[case::request(
-        PingPayload {
-            stream_id: StreamId::from_be_bytes([1, 2, 3]),
-            len: 1337,
-        },
-        false,
-        &[1, 2, 3, 33, 0, 0, 5, 57],
-    )]
-    #[case::response(
-        PingPayload {
-            stream_id: StreamId::from_be_bytes([1, 2, 3]),
-            len: 1337,
-        },
-        true,
-        &[1, 2, 3, 1, 0, 0, 5, 57],
-    )]
+    fn collect(item: &EncoderItem) -> Vec<u8> {
+        let (slices, n) = item.slices();
+        slices[..n].iter().flat_map(|s| s.iter().copied()).collect()
+    }
+
+    fn frame() -> OutFrame {
+        OutFrame {
+            ping: true,
+            pong: Some(Pong {
+                t_echo: 1,
+                t_read: 2,
+                rx_bytes: 3,
+            }),
+            stream: Some(OutStream {
+                id: StreamId::from_be_bytes([0, 6]),
+                flags: ControlFlags {
+                    syn: true,
+                    ..Default::default()
+                },
+                credit: 9,
+                data: Bytes::from_static(b"hello"),
+            }),
+            term: false,
+        }
+    }
+
     #[test]
-    fn ping_frame(
-        #[case] payload: PingPayload,
-        #[case] is_response: bool,
-        #[case] mut expected: &[u8],
-    ) {
-        let mut item = EncoderItem::new_ping(payload, is_response);
+    fn slices_follow_the_progress() {
+        let mut item = EncoderItem::new(frame());
+        item.stamp(0x0A0B0C0D);
+        let all = collect(&item);
+        // 2 flags, 2 id, 4 credit, 2 len, 4 t_ping, 12 pong, 5 payload.
+        assert_eq!(all.len(), 31);
+        assert_eq!(item.remaining(), 31);
+        assert_eq!(&all[10..14], &[0x0A, 0x0B, 0x0C, 0x0D]);
+        assert_eq!(&all[26..], b"hello");
+        assert_eq!(item.slices().1, 2);
 
-        assert_eq!(item.remaining(), expected.len());
-        assert_eq!(item.chunk(), expected);
-        let mut slices = [io::IoSlice::new(&[]); 4];
-        assert_eq!(1, item.chunks_vectored(&mut slices));
-        assert_eq!(slices[0].as_ref(), expected);
+        for advanced in 1..=all.len() {
+            item.advance(1);
+            assert_eq!(collect(&item), &all[advanced..]);
+            assert_eq!(item.remaining(), all.len() - advanced);
+        }
+        assert_eq!(item.slices().1, 0);
+    }
 
-        expected = expected.split_at(RawHeader::LEN / 2).1;
-        item.advance(RawHeader::LEN / 2);
-        assert_eq!(item.remaining(), RawHeader::LEN / 2);
-        assert_eq!(item.chunk(), expected);
-        let mut slices = [io::IoSlice::new(&[]); 4];
-        assert_eq!(1, item.chunks_vectored(&mut slices));
-        assert_eq!(slices[0].as_ref(), expected);
+    #[test]
+    fn restamping_changes_only_the_ping() {
+        let mut item = EncoderItem::new(frame());
+        item.stamp(77);
+        let first = collect(&item);
+        item.stamp(78);
+        let second = collect(&item);
+        assert_eq!(first.len(), second.len());
+        assert_eq!(&first[..10], &second[..10]);
+        assert_eq!(&second[10..14], &78_u32.to_be_bytes());
+        assert_eq!(&first[14..], &second[14..]);
+    }
 
-        item.advance(RawHeader::LEN / 2);
-        assert_eq!(item.remaining(), 0);
-        assert_eq!(item.chunk(), &[]);
-        let mut slices = [io::IoSlice::new(&[]); 4];
-        assert_eq!(0, item.chunks_vectored(&mut slices));
+    #[test]
+    #[should_panic(expected = "already fixed")]
+    fn header_is_fixed_after_the_first_byte() {
+        let mut item = EncoderItem::new(frame());
+        item.advance(1);
+        item.stamp(5);
     }
 
     #[test]
     fn term_frame() {
-        let mut expected = [0; RawHeader::LEN].as_slice();
-        let mut item = EncoderItem::new_terminate();
-
-        assert_eq!(item.remaining(), expected.len());
-        assert_eq!(item.chunk(), expected);
-        let mut slices = [io::IoSlice::new(&[]); 4];
-        assert_eq!(1, item.chunks_vectored(&mut slices));
-        assert_eq!(slices[0].as_ref(), expected);
-
-        expected = expected.split_at(RawHeader::LEN / 2).1;
-        item.advance(RawHeader::LEN / 2);
-        assert_eq!(item.remaining(), RawHeader::LEN / 2);
-        assert_eq!(item.chunk(), expected);
-        let mut slices = [io::IoSlice::new(&[]); 4];
-        assert_eq!(1, item.chunks_vectored(&mut slices));
-        assert_eq!(slices[0].as_ref(), expected);
-
-        item.advance(RawHeader::LEN / 2);
-        assert_eq!(item.remaining(), 0);
-        assert_eq!(item.chunk(), &[]);
-        let mut slices = [io::IoSlice::new(&[]); 4];
-        assert_eq!(0, item.chunks_vectored(&mut slices));
-    }
-
-    #[rstest]
-    #[case::window_update(
-        EncoderItem::new_window_update(
-            StreamId::from_be_bytes([4, 3, 2]),
-            ControlFlags {
-                syn: true,
-                fin_read: true,
-                fin_write: false,
-            },
-            2137,
-        ),
-        &[4, 3, 2, 42, 0, 0, 8, 89],
-    )]
-    #[case::data(
-        EncoderItem::new_data(
-            StreamId::from_be_bytes([71, 99, 21]),
-            ControlFlags {
-                syn: false,
-                fin_read: false,
-                fin_write: true,
-            },
-            Bytes::from_static(b"9999"),
-        ),
-        &[71, 99, 21, 20, 0, 0, 0, 4, 57, 57, 57, 57],
-    )]
-    #[case::both(
-        EncoderItem::new_window_update_and_data(
-            StreamId::from_be_bytes([7, 6, 5]),
-            ControlFlags {
-                syn: true,
-                fin_read: true,
-                fin_write: true,
-            },
-            12,
-            Bytes::from_static(b"2137"),
-        ),
-        &[
-            7, 6, 5, 42, 0, 0, 0, 12,
-            7, 6, 5, 20, 0, 0, 0, 4, 50, 49, 51, 55,
-        ],
-    )]
-    #[test]
-    fn stream_update_frame(#[case] mut item: EncoderItem, #[case] mut expected: &[u8]) {
-        while expected.is_empty().not() {
-            let remaining = item.remaining();
-            assert_eq!(remaining, expected.len());
-            let chunk = item.chunk();
-            assert!(chunk.is_empty().not());
-            assert!(expected.starts_with(chunk));
-
-            let mut slices_arr = [io::IoSlice::new(&[]); 4];
-            let filled = item.chunks_vectored(&mut slices_arr);
-            assert!(filled > 0);
-            let mut slices = slices_arr.get_mut(..filled).unwrap();
-            let total_len = slices.iter().map(|slice| slice.len()).sum::<usize>();
-            assert_eq!(total_len, expected.len());
-            let mut expected_suffix = expected;
-            while expected_suffix.is_empty().not() {
-                assert!(slices[0].is_empty().not());
-                assert!(expected_suffix.starts_with(slices[0].as_ref()));
-                expected_suffix = expected_suffix.split_at(slices[0].len()).1;
-                slices = slices.split_at_mut(1).1;
-            }
-
-            expected = expected.split_at(1).1;
-            item.advance(1);
-        }
-
-        assert_eq!(item.remaining(), 0);
-        assert_eq!(item.chunk(), &[]);
-        let mut slices = [io::IoSlice::new(&[]); 4];
-        assert_eq!(item.chunks_vectored(&mut slices), 0);
+        let item = EncoderItem::new(OutFrame::terminate());
+        assert_eq!(collect(&item), &[0x01, 0x00]);
     }
 }

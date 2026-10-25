@@ -8,7 +8,7 @@ use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{
-    codec::{RammuxCodec, decoder::DecodedFrame, encoder::EncoderItem},
+    codec::{RammuxCodec, decoder::DecodedFrame, encoder::OutFrame},
     error::{ErrorKind, RammuxError},
 };
 
@@ -21,7 +21,10 @@ use crate::{
 #[must_use = "downgrade should be polled to unblock the rammux peer"]
 pub struct Downgraded<IO> {
     /// Recovered from [`Active::codec`](super::state::Active::codec).
-    codec: Option<RammuxCodec<IO>>,
+    ///
+    /// Boxed: the codec holds a decoder buffer and a pending frame, which would make every future
+    /// that holds a [`Downgraded`] large.
+    codec: Option<Box<RammuxCodec<IO>>>,
     /// Whether we've received the `TERM` frame.
     term_received: bool,
     /// Describes the state of our `TERM` frame.
@@ -33,7 +36,7 @@ pub struct Downgraded<IO> {
 impl<IO> Downgraded<IO> {
     pub(super) fn new(codec: RammuxCodec<IO>, term_received: bool) -> Self {
         Self {
-            codec: Some(codec),
+            codec: Some(Box::new(codec)),
             term_received,
             term_sent: TermSendState::Init,
             with_shutdown: false,
@@ -64,7 +67,7 @@ where
             match self.term_sent {
                 TermSendState::Init => {
                     std::task::ready!(codec.poll_ready_unpin(cx))?;
-                    codec.start_send_unpin(EncoderItem::new_terminate())?;
+                    codec.start_send_unpin(OutFrame::terminate())?;
                     self.term_sent = TermSendState::Enqueued;
                 },
                 TermSendState::Enqueued => {

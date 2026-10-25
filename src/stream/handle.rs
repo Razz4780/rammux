@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    num::NonZeroU32,
+    sync::{Arc, Mutex},
+};
 
 use crate::{
     buffer::Data,
@@ -10,14 +13,18 @@ use crate::{
 pub struct StreamHandle(pub(super) Arc<Mutex<SharedStreamState>>);
 
 impl StreamHandle {
-    /// Updates the state of this stream with a received `DATA` frame.
+    /// Updates the state of this stream with the stream part of a received frame.
+    ///
+    /// The parts of the frame are processed in the order of the protocol:
+    /// `WINDOW`, `DATA`, `FIN_WRITE`, `FIN_READ`.
     ///
     /// Returns the new [`FinState`] of the whole stream.
-    pub fn received_data(
+    pub fn received(
         &mut self,
+        credit: Option<NonZeroU32>,
         data: Data,
-        fin_read: bool,
         fin_write: bool,
+        fin_read: bool,
     ) -> Result<FinState, StreamError> {
         let mut guard = self.0.lock().unwrap();
         let SharedStreamState {
@@ -25,37 +32,15 @@ impl StreamHandle {
             outbound,
             updates_poller,
         } = &mut *guard;
+        if let Some(credit) = credit {
+            outbound.received_window_update(credit.get(), updates_poller)?;
+        }
         inbound.received_data(data)?;
         if fin_write {
             inbound.received_fin_write(updates_poller)?;
         }
         if fin_read {
             outbound.received_fin_read(updates_poller)?;
-        }
-        Ok(inbound.fin_state().and(outbound.fin_state()))
-    }
-
-    /// Updates the state of this stream with a received `WINDOW_UPDATE` frame.
-    ///
-    /// Returns the new [`FinState`] of the whole stream.
-    pub fn received_window_update(
-        &mut self,
-        update: u32,
-        fin_read: bool,
-        fin_write: bool,
-    ) -> Result<FinState, StreamError> {
-        let mut guard = self.0.lock().unwrap();
-        let SharedStreamState {
-            inbound,
-            outbound,
-            updates_poller,
-        } = &mut *guard;
-        outbound.received_window_update(update, updates_poller)?;
-        if fin_read {
-            outbound.received_fin_read(updates_poller)?;
-        }
-        if fin_write {
-            inbound.received_fin_write(updates_poller)?;
         }
         Ok(inbound.fin_state().and(outbound.fin_state()))
     }

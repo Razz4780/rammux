@@ -1,183 +1,102 @@
 //! Types for encoding/decoding rammux frame headers.
+//!
+//! There is one frame type. A frame starts with 16 bits of flags,
+//! followed by the header fields whose flags are set (in the fixed wire order), followed by the payload.
+//! See `PROTOCOL.md`.
 
-use std::{fmt, ops::Not};
+use std::num::{NonZeroU16, NonZeroU32};
 
-use bitflags::{Flags, bitflags};
+use bitflags::bitflags;
 
 use crate::{error::DecodeError, stream_id::StreamId};
-
-/// 8-byte header of a rammux frame, not validated.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RawHeader {
-    /// ID of a rammux stream.
-    ///
-    /// 1. For [`RawFlags::DATA`] and [`RawFlags::WINDOW_UPDATE`] frames,
-    ///    this denotes the stream in which data is transferred.
-    /// 2. For [`RawFlags::PING`] frames, this is the first part of the payload.
-    /// 3. For [`RawFlags::TERM`] frames, this is `0`.
-    pub stream_id: StreamId,
-    /// Flags set on the frame.
-    ///
-    /// For [`RawFlags::TERM`] frames, the is [`RawFlags::empty`].
-    pub flags: RawFlags,
-    /// Len of the frame.
-    ///
-    /// 1. For [`RawFlags::DATA`] frames, this denotes the length of the data.
-    /// 2. For [`RawFlags::WINDOW_UPDATE`] frames, this denotes the number of bytes returned to the receive window.
-    /// 3. For [`RawFlags::PING`] frames, this is the second part of the payload.
-    /// 4. For [`RawFlags::TERM`] frames, this is `0`.
-    pub len: u32,
-}
-
-impl RawHeader {
-    /// Length of the header in bytes.
-    pub const LEN: usize = 8;
-
-    /// Decodes the header from the given wire representation.
-    ///
-    /// This function does not verify the bytes in any way.
-    pub const fn decode(raw: [u8; Self::LEN]) -> Self {
-        let [s1, s2, s3, flags, l1, l2, l3, l4] = raw;
-        let stream_id = StreamId::from_be_bytes([s1, s2, s3]);
-        let flags = RawFlags::from_bits_retain(flags);
-        let len = u32::from_be_bytes([l1, l2, l3, l4]);
-
-        Self {
-            stream_id,
-            flags,
-            len,
-        }
-    }
-
-    /// Encodes the header to the wire representation.
-    pub const fn encode(self) -> [u8; Self::LEN] {
-        let [s1, s2, s3] = self.stream_id.to_be_bytes();
-        let flags = self.flags.bits();
-        let [l1, l2, l3, l4] = self.len.to_be_bytes();
-
-        [s1, s2, s3, flags, l1, l2, l3, l4]
-    }
-
-    /// Validates this raw header, returning a clean enum.
-    pub fn validate(self) -> Result<Header, DecodeError> {
-        if self.flags.contains_unknown_bits() {
-            return Err(DecodeError {
-                header: self,
-                message: "unknown flags set",
-            });
-        }
-
-        let frame_type = self
-            .flags
-            .intersection(RawFlags::PING | RawFlags::WINDOW_UPDATE | RawFlags::DATA);
-        match frame_type {
-            RawFlags::PING => {
-                if self
-                    .flags
-                    .intersects(RawFlags::FIN_READ | RawFlags::FIN_WRITE)
-                {
-                    Err(DecodeError {
-                        header: self,
-                        message: "PING frame with forbidden flags",
-                    })
-                } else {
-                    Ok(Header::Ping {
-                        payload: PingPayload {
-                            stream_id: self.stream_id,
-                            len: self.len,
-                        },
-                        is_response: self.flags.contains(RawFlags::SYN).not(),
-                    })
-                }
-            },
-
-            RawFlags::WINDOW_UPDATE => Ok(Header::WindowUpdate {
-                stream_id: self.stream_id,
-                flags: self.flags.into(),
-                len: self.len,
-            }),
-
-            RawFlags::DATA => Ok(Header::Data {
-                stream_id: self.stream_id,
-                flags: self.flags.into(),
-                len: self.len,
-            }),
-
-            RawFlags::TERM => {
-                if u32::from(self.stream_id) == 0 && self.flags.is_empty() && self.len == 0 {
-                    Ok(Header::Term)
-                } else {
-                    Err(DecodeError {
-                        header: self,
-                        message: "TERM frame with dirty bits",
-                    })
-                }
-            },
-
-            _ => Err(DecodeError {
-                header: self,
-                message: "invalid frame type",
-            }),
-        }
-    }
-}
-
-impl fmt::LowerHex for RawHeader {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let as_u64 = u64::from_be_bytes(self.encode());
-        fmt::LowerHex::fmt(&as_u64, f)
-    }
-}
 
 bitflags! {
     /// Flags of a rammux frame.
     #[derive(PartialEq, Eq, Clone, Copy, Debug)]
-    pub struct RawFlags: u8 {
-        /// Denotes `PING` type of the frame.
-        const PING          = 0b00000001;
-        /// Denotes `WINDOW_UPDATE` type of the frame.
-        const WINDOW_UPDATE = 0b00000010;
-        /// Denotes `DATA` type of the frame.
-        const DATA          = 0b00000100;
-        /// Signals that the sender stopped reading from the stream.
-        const FIN_READ      = 0b00001000;
-        /// Signals that the sender stopped writing to the stream.
-        const FIN_WRITE     = 0b00010000;
-        /// Set on:
-        /// 1. `PING` requests
-        /// 2. `DATA` and `WINDOW_UPDATE` frames that initiate a new stream.
-        const SYN           = 0b00100000;
+    pub struct Flags: u16 {
+        /// First frame of a stream.
+        const SYN       = 0x0001;
+        /// The sender of the frame stopped reading the stream.
+        const FIN_READ  = 0x0002;
+        /// The sender of the frame stopped writing the stream.
+        const FIN_WRITE = 0x0004;
+        /// The frame returns bytes of the receive window to the peer.
+        const WINDOW    = 0x0008;
+        /// The frame carries stream data.
+        const DATA      = 0x0010;
+        /// The frame carries a `PING`.
+        const PING      = 0x0020;
+        /// The frame carries a `PONG`.
+        const PONG      = 0x0040;
+        /// End of the rammux session.
+        const TERM      = 0x0100;
     }
 }
 
-impl RawFlags {
-    /// Flags for a term frame used in rammux connection dowgrade.
+impl Flags {
+    /// Flags that make the frame carry a stream ID.
+    const STREAM: Self = Self::SYN
+        .union(Self::FIN_READ)
+        .union(Self::FIN_WRITE)
+        .union(Self::WINDOW)
+        .union(Self::DATA);
+
+    /// Returns the length of the whole header with these flags.
     ///
-    /// All bits unset.
-    pub const TERM: Self = Self::empty();
+    /// The flags must be [valid](Self::validate).
+    pub const fn header_len(self) -> usize {
+        let mut len = Self::FLAGS_LEN;
+        if self.intersects(Self::STREAM) {
+            len += 2;
+        }
+        if self.contains(Self::WINDOW) {
+            len += 4;
+        }
+        if self.contains(Self::DATA) {
+            len += 2;
+        }
+        if self.contains(Self::PING) {
+            len += 4;
+        }
+        if self.contains(Self::PONG) {
+            len += 12;
+        }
+        len
+    }
+
+    /// Length of the flags field itself.
+    pub const FLAGS_LEN: usize = 2;
+
+    /// Checks the flags in isolation.
+    pub fn validate(raw: u16) -> Result<Self, DecodeError> {
+        let Some(flags) = Self::from_bits(raw) else {
+            return Err(DecodeError("reserved flags set"));
+        };
+        if flags.is_empty() {
+            return Err(DecodeError("frame without flags"));
+        }
+        if flags.contains(Self::TERM) && flags != Self::TERM {
+            return Err(DecodeError("TERM combined with other flags"));
+        }
+        Ok(flags)
+    }
 }
 
-/// Clean enum representing a valid rammux frame header.
+/// Length of the longest possible header.
+pub const MAX_HEADER_LEN: usize = 26;
+
+/// Fields of a `PONG`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Header {
-    Ping {
-        payload: PingPayload,
-        is_response: bool,
-    },
-    WindowUpdate {
-        stream_id: StreamId,
-        flags: ControlFlags,
-        len: u32,
-    },
-    Data {
-        stream_id: StreamId,
-        flags: ControlFlags,
-        len: u32,
-    },
-    Term,
+pub struct Pong {
+    /// `t_ping` of the `PING` that is answered.
+    pub t_echo: u32,
+    /// Clock of the responder at the moment it read that `PING`.
+    pub t_read: u32,
+    /// Bytes of `DATA` the responder had read before it read that `PING`.
+    pub rx_bytes: u32,
 }
 
-/// Control flags extracted from [`RawFlags`].
+/// Control flags of a stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct ControlFlags {
     pub fin_read: bool,
@@ -185,189 +104,356 @@ pub struct ControlFlags {
     pub syn: bool,
 }
 
-impl From<RawFlags> for ControlFlags {
-    fn from(value: RawFlags) -> Self {
-        Self {
-            fin_read: value.contains(RawFlags::FIN_READ),
-            fin_write: value.contains(RawFlags::FIN_WRITE),
-            syn: value.contains(RawFlags::SYN),
-        }
-    }
+/// The part of a header that concerns one stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamHeader {
+    /// ID of the stream.
+    pub id: StreamId,
+    /// Control flags.
+    pub flags: ControlFlags,
+    /// Bytes returned to the receive window of the peer.
+    pub credit: Option<NonZeroU32>,
+    /// Length of the payload.
+    pub data_len: Option<NonZeroU16>,
 }
 
-impl From<ControlFlags> for RawFlags {
-    fn from(value: ControlFlags) -> Self {
-        let mut flags = RawFlags::empty();
-        if value.fin_read {
-            flags |= RawFlags::FIN_READ;
-        }
-        if value.fin_write {
-            flags |= RawFlags::FIN_WRITE;
-        }
-        if value.syn {
-            flags |= RawFlags::SYN;
-        }
+impl StreamHeader {
+    fn flags(&self) -> Flags {
+        let mut flags = Flags::empty();
+        flags.set(Flags::SYN, self.flags.syn);
+        flags.set(Flags::FIN_READ, self.flags.fin_read);
+        flags.set(Flags::FIN_WRITE, self.flags.fin_write);
+        flags.set(Flags::WINDOW, self.credit.is_some());
+        flags.set(Flags::DATA, self.data_len.is_some());
         flags
     }
 }
 
-/// Payload of a [`RawFlags::PING`] frame.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct PingPayload {
-    /// In ping frames stream ID has no special meaning.
-    /// It is used as the first 3 bytes of the payload.
-    pub stream_id: StreamId,
-    /// In ping frames frame length is used as the last 4 bytes of the payload.
-    pub len: u32,
+/// A frame header, validated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Header {
+    /// Stream part of the frame.
+    pub stream: Option<StreamHeader>,
+    /// `t_ping` of a `PING` carried by the frame.
+    pub ping: Option<u32>,
+    /// A `PONG` carried by the frame.
+    pub pong: Option<Pong>,
+    /// Whether this is the `TERM` frame.
+    pub term: bool,
 }
 
-impl PingPayload {
-    /// Generates a random payload using the thread-local RNG.
-    pub fn random() -> Self {
-        Self {
-            stream_id: rand::random(),
-            len: rand::random(),
+impl Header {
+    /// Returns the flags of this header.
+    ///
+    /// The flags are the source of truth for which fields are encoded.
+    pub fn flags(&self) -> Flags {
+        let mut flags = self.stream.as_ref().map_or(Flags::empty(), |s| s.flags());
+        flags.set(Flags::PING, self.ping.is_some());
+        flags.set(Flags::PONG, self.pong.is_some());
+        flags.set(Flags::TERM, self.term);
+        flags
+    }
+
+    /// Encodes this header, returning the number of used bytes of the buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the header is not a legal frame: it has no flags,
+    /// it has a stream part without flags, or `TERM` is combined with something else.
+    pub fn encode(&self, out: &mut [u8; MAX_HEADER_LEN]) -> usize {
+        let flags = self.flags();
+        assert!(
+            Flags::validate(flags.bits()).is_ok(),
+            "illegal frame: {flags:?}"
+        );
+        if let Some(stream) = &self.stream {
+            assert!(!stream.flags().is_empty(), "stream part without flags");
         }
+
+        let mut writer = Writer { buf: out, at: 0 };
+        writer.put(&flags.bits().to_be_bytes());
+        if let Some(stream) = &self.stream {
+            writer.put(&stream.id.to_be_bytes());
+            if let Some(credit) = stream.credit {
+                writer.put(&credit.get().to_be_bytes());
+            }
+            if let Some(len) = stream.data_len {
+                writer.put(&len.get().to_be_bytes());
+            }
+        }
+        if let Some(t_ping) = self.ping {
+            writer.put(&t_ping.to_be_bytes());
+        }
+        if let Some(pong) = &self.pong {
+            writer.put(&pong.t_echo.to_be_bytes());
+            writer.put(&pong.t_read.to_be_bytes());
+            writer.put(&pong.rx_bytes.to_be_bytes());
+        }
+        debug_assert_eq!(writer.at, flags.header_len());
+        writer.at
+    }
+
+    /// Decodes a header.
+    ///
+    /// `bytes` must be exactly `flags.header_len()` long, and start with the flags.
+    /// The flags must be [valid](Flags::validate).
+    /// Fails if the values of the fields are illegal.
+    pub fn decode(flags: Flags, bytes: &[u8]) -> Result<Self, DecodeError> {
+        debug_assert_eq!(bytes.len(), flags.header_len());
+        let mut reader = Reader {
+            buf: bytes,
+            at: Flags::FLAGS_LEN,
+        };
+
+        let stream = if flags.intersects(Flags::STREAM) {
+            let id = StreamId::from_be_bytes(reader.take());
+            let credit = if flags.contains(Flags::WINDOW) {
+                Some(
+                    NonZeroU32::new(u32::from_be_bytes(reader.take()))
+                        .ok_or(DecodeError("WINDOW with zero credit"))?,
+                )
+            } else {
+                None
+            };
+            let data_len = if flags.contains(Flags::DATA) {
+                Some(
+                    NonZeroU16::new(u16::from_be_bytes(reader.take()))
+                        .ok_or(DecodeError("DATA with zero length"))?,
+                )
+            } else {
+                None
+            };
+            Some(StreamHeader {
+                id,
+                flags: ControlFlags {
+                    fin_read: flags.contains(Flags::FIN_READ),
+                    fin_write: flags.contains(Flags::FIN_WRITE),
+                    syn: flags.contains(Flags::SYN),
+                },
+                credit,
+                data_len,
+            })
+        } else {
+            None
+        };
+        let ping = flags
+            .contains(Flags::PING)
+            .then(|| u32::from_be_bytes(reader.take()));
+        let pong = flags.contains(Flags::PONG).then(|| Pong {
+            t_echo: u32::from_be_bytes(reader.take()),
+            t_read: u32::from_be_bytes(reader.take()),
+            rx_bytes: u32::from_be_bytes(reader.take()),
+        });
+        debug_assert_eq!(reader.at, bytes.len());
+
+        Ok(Self {
+            stream,
+            ping,
+            pong,
+            term: flags.contains(Flags::TERM),
+        })
     }
 }
 
-impl fmt::Display for PingPayload {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let composed = (u64::from(u32::from(self.stream_id)) << 32) | u64::from(self.len);
-        write!(f, "{composed:#016x}")
+struct Writer<'a> {
+    buf: &'a mut [u8; MAX_HEADER_LEN],
+    at: usize,
+}
+
+impl Writer<'_> {
+    fn put(&mut self, bytes: &[u8]) {
+        self.buf[self.at..self.at + bytes.len()].copy_from_slice(bytes);
+        self.at += bytes.len();
     }
 }
 
-impl fmt::Debug for PingPayload {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self, f)
+struct Reader<'a> {
+    buf: &'a [u8],
+    at: usize,
+}
+
+impl Reader<'_> {
+    fn take<const N: usize>(&mut self) -> [u8; N] {
+        let out = self.buf[self.at..self.at + N]
+            .try_into()
+            .expect("slice has N bytes");
+        self.at += N;
+        out
     }
 }
 
 #[cfg(test)]
 mod test {
+    use std::num::{NonZeroU16, NonZeroU32};
+
     use rstest::rstest;
 
     use crate::{
         StreamId,
-        header::{ControlFlags, Header, PingPayload, RawFlags, RawHeader},
+        header::{ControlFlags, Flags, Header, MAX_HEADER_LEN, Pong, StreamHeader},
     };
 
+    fn stream(flags: ControlFlags, credit: Option<u32>, len: Option<u16>) -> Option<StreamHeader> {
+        Some(StreamHeader {
+            id: StreamId::from_be_bytes([0x12, 0x34]),
+            flags,
+            credit: credit.and_then(NonZeroU32::new),
+            data_len: len.and_then(NonZeroU16::new),
+        })
+    }
+
+    const PONG: Pong = Pong {
+        t_echo: 0x0A0B0C0D,
+        t_read: 0x01020304,
+        rx_bytes: 0xF0F1F2F3,
+    };
+
+    #[test]
+    fn longest_header_fits() {
+        assert_eq!(
+            Flags::all().difference(Flags::TERM).header_len(),
+            MAX_HEADER_LEN
+        );
+    }
+
+    #[test]
+    fn layout() {
+        let header = Header {
+            stream: stream(
+                ControlFlags {
+                    fin_read: true,
+                    fin_write: false,
+                    syn: true,
+                },
+                Some(0x11223344),
+                Some(0x5566),
+            ),
+            ping: Some(0x99AABBCC),
+            pong: Some(PONG),
+            term: false,
+        };
+        let mut buf = [0; MAX_HEADER_LEN];
+        let len = header.encode(&mut buf);
+        assert_eq!(
+            &buf[..len],
+            &[
+                0x00, 0x7B, // SYN | FIN_READ | WINDOW | DATA | PING | PONG
+                0x12, 0x34, // stream_id
+                0x11, 0x22, 0x33, 0x44, // credit
+                0x55, 0x66, // len
+                0x99, 0xAA, 0xBB, 0xCC, // t_ping
+                0x0A, 0x0B, 0x0C, 0x0D, // t_echo
+                0x01, 0x02, 0x03, 0x04, // t_read
+                0xF0, 0xF1, 0xF2, 0xF3, // rx_bytes
+            ]
+        );
+        assert_eq!(len, MAX_HEADER_LEN);
+    }
+
     #[rstest]
-    #[case(
-        RawHeader { stream_id: StreamId::from_be_bytes([1, 2, 3]), flags: RawFlags::PING | RawFlags::SYN, len: 2137 },
-        Some(Header::Ping {
-            payload: PingPayload {
-                stream_id: StreamId::from_be_bytes([1, 2, 3]),
-                len: 2137,
-            },
-            is_response: false,
-        }),
+    #[case::term(Header { term: true, ..Default::default() }, &[0x01, 0x00])]
+    #[case::ping(Header { ping: Some(7), ..Default::default() }, &[0x00, 0x20, 0, 0, 0, 7])]
+    #[case::pong(
+        Header { pong: Some(PONG), ..Default::default() },
+        &[0x00, 0x40, 0x0A, 0x0B, 0x0C, 0x0D, 0x01, 0x02, 0x03, 0x04, 0xF0, 0xF1, 0xF2, 0xF3],
     )]
-    #[case(
-        RawHeader { stream_id: StreamId::from_be_bytes([4, 5, 6]), flags: RawFlags::PING, len: 444 },
-        Some(Header::Ping {
-            payload: PingPayload {
-                stream_id: StreamId::from_be_bytes([4, 5, 6]),
-                len: 444,
-            },
-            is_response: true,
-        }),
-    )]
-    #[case(
-        RawHeader {
-            stream_id: StreamId::from_be_bytes([7, 8, 9]),
-            flags: RawFlags::WINDOW_UPDATE | RawFlags::FIN_READ | RawFlags::SYN,
-            len: 99999,
+    #[case::fin_only(
+        Header {
+            stream: stream(ControlFlags { fin_read: true, fin_write: true, syn: false }, None, None),
+            ..Default::default()
         },
-        Some(Header::WindowUpdate {
-            stream_id: StreamId::from_be_bytes([7, 8, 9]),
-            flags: ControlFlags {
-                fin_read: true,
-                fin_write: false,
-                syn: true,
-            },
-            len: 99999,
-        }),
+        &[0x00, 0x06, 0x12, 0x34],
     )]
-    #[case(
-        RawHeader {
-            stream_id: StreamId::from_be_bytes([7, 8, 9]),
-            flags: RawFlags::DATA | RawFlags::FIN_WRITE,
-            len: 88,
+    #[case::data(
+        Header {
+            stream: stream(ControlFlags::default(), None, Some(3)),
+            ..Default::default()
         },
-        Some(Header::Data {
-            stream_id: StreamId::from_be_bytes([7, 8, 9]),
-            flags: ControlFlags {
-                fin_read: false,
-                fin_write: true,
-                syn: false,
-            },
-            len: 88,
-        }),
+        &[0x00, 0x10, 0x12, 0x34, 0x00, 0x03],
     )]
-    #[case(
-        RawHeader {
-            stream_id: StreamId::from_be_bytes([0, 0, 0]),
-            flags: RawFlags::TERM,
-            len: 0,
+    #[case::window(
+        Header {
+            stream: stream(ControlFlags { syn: true, ..Default::default() }, Some(2137), None),
+            ..Default::default()
         },
-        Some(Header::Term),
-    )]
-    #[case(
-        RawHeader {
-            stream_id: StreamId::from_be_bytes([1, 2, 3]),
-            flags: RawFlags::PING | RawFlags::SYN | RawFlags::FIN_READ,
-            len: 2137,
-        },
-        None,
-    )]
-    #[case(
-        RawHeader {
-            stream_id: StreamId::from_be_bytes([1, 2, 3]),
-            flags: RawFlags::DATA | RawFlags::WINDOW_UPDATE,
-            len: 2137,
-        },
-        None,
-    )]
-    #[case(
-        RawHeader {
-            stream_id: StreamId::from_be_bytes([1, 0, 0]),
-            flags: RawFlags::TERM,
-            len: 0,
-        },
-        None,
-    )]
-    #[case(
-        RawHeader {
-            stream_id: StreamId::from_be_bytes([0, 0, 0]),
-            flags: RawFlags::SYN,
-            len: 0,
-        },
-        None,
-    )]
-    #[case(
-        RawHeader {
-            stream_id: StreamId::from_be_bytes([0, 0, 0]),
-            flags: RawFlags::TERM,
-            len: 1,
-        },
-        None,
+        &[0x00, 0x09, 0x12, 0x34, 0, 0, 0x08, 0x59],
     )]
     #[test]
-    fn decode_validate(#[case] decoded: RawHeader, #[case] validated: Option<Header>) {
-        let encoded = decoded.encode();
-        let decoded_again = RawHeader::decode(encoded);
-        assert_eq!(decoded_again, decoded);
+    fn encode_decode(#[case] header: Header, #[case] expected: &[u8]) {
+        let mut buf = [0; MAX_HEADER_LEN];
+        let len = header.encode(&mut buf);
+        assert_eq!(&buf[..len], expected);
 
-        match validated {
-            Some(expected) => {
-                let validated = decoded_again.validate().unwrap();
-                assert_eq!(validated, expected);
-            },
-            None => {
-                decoded_again.validate().unwrap_err();
-            },
+        let raw_flags = u16::from_be_bytes([buf[0], buf[1]]);
+        let flags = Flags::validate(raw_flags).unwrap();
+        assert_eq!(flags, header.flags());
+        assert_eq!(flags.header_len(), len);
+        assert_eq!(Header::decode(flags, &buf[..len]).unwrap(), header);
+    }
+
+    #[test]
+    fn every_legal_flag_combination_roundtrips() {
+        // All 2^7 combinations of the non-TERM flags.
+        let all = Flags::all().difference(Flags::TERM).bits();
+        let mut legal = 0;
+        for bits in 0..=all {
+            let Some(flags) = Flags::from_bits(bits).filter(|f| !f.is_empty()) else {
+                continue;
+            };
+            legal += 1;
+            let header = Header {
+                stream: flags
+                    .intersects(
+                        Flags::SYN
+                            | Flags::FIN_READ
+                            | Flags::FIN_WRITE
+                            | Flags::WINDOW
+                            | Flags::DATA,
+                    )
+                    .then(|| StreamHeader {
+                        id: StreamId::from_be_bytes([0xFF, 0xFE]),
+                        flags: ControlFlags {
+                            fin_read: flags.contains(Flags::FIN_READ),
+                            fin_write: flags.contains(Flags::FIN_WRITE),
+                            syn: flags.contains(Flags::SYN),
+                        },
+                        credit: flags.contains(Flags::WINDOW).then_some(NonZeroU32::MIN),
+                        data_len: flags.contains(Flags::DATA).then_some(NonZeroU16::MAX),
+                    }),
+                ping: flags.contains(Flags::PING).then_some(u32::MAX),
+                pong: flags.contains(Flags::PONG).then_some(PONG),
+                term: false,
+            };
+            let mut buf = [0; MAX_HEADER_LEN];
+            let len = header.encode(&mut buf);
+            assert_eq!(len, flags.header_len());
+            let decoded_flags = Flags::validate(u16::from_be_bytes([buf[0], buf[1]])).unwrap();
+            assert_eq!(decoded_flags, flags);
+            assert_eq!(Header::decode(flags, &buf[..len]).unwrap(), header);
         }
+        assert_eq!(legal, 127);
+    }
+
+    #[rstest]
+    #[case::reserved_bit_0x0080(0x0080)]
+    #[case::reserved(0x0200)]
+    #[case::reserved_high(0x8001)]
+    #[case::no_flags(0x0000)]
+    #[case::term_and_ping(0x0120)]
+    #[case::term_and_data(0x0110)]
+    #[case::term_and_syn(0x0101)]
+    #[test]
+    fn invalid_flags(#[case] raw: u16) {
+        Flags::validate(raw).unwrap_err();
+    }
+
+    #[test]
+    fn invalid_values() {
+        // WINDOW with credit 0.
+        let flags = Flags::WINDOW;
+        Header::decode(flags, &[0x00, 0x08, 0x00, 0x01, 0, 0, 0, 0]).unwrap_err();
+        // DATA with len 0.
+        let flags = Flags::DATA;
+        Header::decode(flags, &[0x00, 0x10, 0x00, 0x01, 0, 0]).unwrap_err();
     }
 }

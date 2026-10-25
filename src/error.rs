@@ -4,10 +4,7 @@ use std::io;
 
 use thiserror::Error;
 
-use crate::{
-    header::{PingPayload, RawHeader},
-    stream_id::StreamId,
-};
+use crate::stream_id::StreamId;
 
 /// Opaque error originating from a rammux connection.
 #[derive(Error, Debug)]
@@ -45,9 +42,7 @@ impl RammuxError {
     /// Returns whether this error originates from a protocol violation by the other side of the connection.
     pub fn is_protocol_violation(&self) -> bool {
         match &self.0 {
-            ErrorKind::Decode(..) | ErrorKind::UnexpectedPing(..) | ErrorKind::Stream { .. } => {
-                true
-            },
+            ErrorKind::Decode(..) | ErrorKind::Stream { .. } => true,
             ErrorKind::Io(..) | ErrorKind::AlreadyDowngraded | ErrorKind::Poisoned => false,
         }
     }
@@ -79,9 +74,6 @@ pub enum ErrorKind {
         #[source]
         error: StreamError,
     },
-    /// Received an unexpected `PING` frame.
-    #[error("received an unexpected ping {0}")]
-    UnexpectedPing(PingPayload),
     /// rammux connection was downgraded and is no longer valid.
     #[error("connection already downgraded")]
     AlreadyDowngraded,
@@ -107,11 +99,8 @@ impl From<&'static str> for StreamError {
 }
 
 /// Errors that can occur when decoding an inbound rammux frame.
+///
+/// The message describes the framing violation.
 #[derive(Error, Debug, Clone, Copy)]
-#[error("received an invalid frame header {header:#018x} ({message})")]
-pub struct DecodeError {
-    /// Raw frame header that failed decoding.
-    pub header: RawHeader,
-    /// Opaque message.
-    pub message: &'static str,
-}
+#[error("received an invalid frame ({0})")]
+pub struct DecodeError(pub &'static str);

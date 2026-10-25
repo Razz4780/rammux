@@ -1,4 +1,7 @@
-use std::{num::NonZeroU32, time::Duration};
+use std::{
+    num::{NonZeroU16, NonZeroU32},
+    time::Duration,
+};
 
 use async_selector::selector::Selector;
 use bytes::Bytes;
@@ -14,11 +17,12 @@ use crate::{
 };
 
 const CONFIG: RammuxConfig = RammuxConfig {
-    frame_limit: NonZeroU32::new(8).unwrap(),
+    frame_limit: NonZeroU16::new(8).unwrap(),
     max_inbound_streams: 4,
     max_outbound_streams: 4,
     local_recv_window: NonZeroU32::new(12).unwrap(),
     remote_recv_window: 14,
+    ping_bytes: NonZeroU32::new(32).unwrap(),
     ping_interval: Duration::from_secs(1),
     inbound_frame_timeout: Duration::from_secs(1),
     global_recv_window: 32,
@@ -31,7 +35,7 @@ fn new_stream(
     Selector<StreamUpdates, GlobalPool>,
     RammuxDuplex,
 ) {
-    let (handle, updates, duplex) = super::new(StreamId::from_be_bytes([0, 0, 0]), true, &CONFIG);
+    let (handle, updates, duplex) = super::new(StreamId::from_be_bytes([0, 0]), true, &CONFIG);
     let mut selector = Selector::new(global);
     selector.push(updates);
     (handle, selector, duplex)
@@ -106,15 +110,15 @@ async fn rammux_stream_drop_closes_reading() {
 #[tokio::test(start_paused = true)]
 async fn local_receive_window_is_autotuned() {
     let (mut handle, mut selector, mut duplex) = new_stream(GlobalPool {
-        rtt: None,
         available: CONFIG.local_recv_window.get() as usize * 4,
+        ..Default::default()
     });
 
     for _ in 0..5 {
         let data =
             std::iter::repeat_n(b'a', CONFIG.local_recv_window.get() as usize).collect::<Vec<_>>();
         let data = Data::copy_from_slice(&data);
-        handle.received_data(data, false, false).unwrap();
+        handle.received(None, data, false, false).unwrap();
         duplex.next().await.unwrap();
         let (update, ..) = selector.next().await.unwrap();
         assert_eq!(update.window_update, CONFIG.local_recv_window.get());
@@ -127,7 +131,7 @@ async fn local_receive_window_is_autotuned() {
         tokio::time::advance(Duration::from_millis(100)).await;
         let data = std::iter::repeat_n(b'a', current_window as usize).collect::<Vec<_>>();
         let data = Data::copy_from_slice(&data);
-        handle.received_data(data, false, false).unwrap();
+        handle.received(None, data, false, false).unwrap();
         duplex.next().await.unwrap();
         let (update, ..) = selector.next().await.unwrap();
         assert!(update.window_update > current_window);
@@ -138,7 +142,7 @@ async fn local_receive_window_is_autotuned() {
         tokio::time::advance(Duration::from_secs(5)).await;
         let data = std::iter::repeat_n(b'a', current_window as usize).collect::<Vec<_>>();
         let data = Data::copy_from_slice(&data);
-        handle.received_data(data, false, false).unwrap();
+        handle.received(None, data, false, false).unwrap();
         duplex.next().await.unwrap();
         let (update, ..) = selector.next().await.unwrap();
         assert!(update.window_update < current_window);
@@ -151,11 +155,11 @@ async fn local_receive_window_is_respected() {
     let (mut handle, _selector, _duplex) = new_stream(GlobalPool::default());
     for _ in 0..CONFIG.local_recv_window.get() {
         handle
-            .received_data(Data::copy_from_slice(b"a"), false, false)
+            .received(None, Data::copy_from_slice(b"a"), false, false)
             .unwrap();
     }
     handle
-        .received_data(Data::copy_from_slice(b"a"), false, false)
+        .received(None, Data::copy_from_slice(b"a"), false, false)
         .unwrap_err();
 }
 
@@ -180,7 +184,9 @@ async fn remote_receive_window_is_respected() {
     duplex.feed(Bytes::from_static(b"a")).await.unwrap();
     assert!(duplex.flush().now_or_never().is_none());
     assert!(selector.next().now_or_never().is_none());
-    handle.received_window_update(8, false, false).unwrap();
+    handle
+        .received(NonZeroU32::new(8), Data::default(), false, false)
+        .unwrap();
     let (update, fin_state) = selector.next().await.unwrap();
     assert_eq!(update.data.len(), 1);
     assert_eq!(
@@ -196,13 +202,13 @@ async fn remote_receive_window_is_respected() {
 #[tokio::test]
 async fn fin_read_closes_writing() {
     let (mut handle, _selector, mut duplex) = new_stream(GlobalPool::default());
-    handle.received_window_update(0, true, false).unwrap();
+    handle.received(None, Data::default(), false, true).unwrap();
     duplex.send(Bytes::from_static(b"a")).await.unwrap_err();
 }
 
 #[tokio::test]
 async fn fin_write_closes_reading() {
     let (mut handle, _selector, mut duplex) = new_stream(GlobalPool::default());
-    handle.received_window_update(0, false, true).unwrap();
+    handle.received(None, Data::default(), true, false).unwrap();
     assert!(duplex.next().await.is_none());
 }

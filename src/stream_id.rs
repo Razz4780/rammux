@@ -1,23 +1,15 @@
 use std::fmt;
 
-use rand::{
-    Rng,
-    distr::{Distribution, StandardUniform},
-};
-
 use crate::config::RammuxRole;
 
-/// 24-bit ID of a rammux stream.
+/// 16-bit ID of a rammux stream.
 ///
 /// Each active rammux stream has an ID uniquely identifies that stream
 /// relative to all other active streams. Freed IDs are reused.
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct StreamId(u32);
+pub struct StreamId(u16);
 
 impl StreamId {
-    /// Maximal value of a 24-bit unsigned integer.
-    const MAX: u32 = u32::MAX >> 8;
-
     /// Returns the role that initiated the stream.
     pub const fn initiated_by(self) -> RammuxRole {
         if self.0.is_multiple_of(2) {
@@ -28,20 +20,18 @@ impl StreamId {
     }
 
     /// Reads an ID from the given big endian representation.
-    pub(crate) const fn from_be_bytes(bytes: [u8; 3]) -> Self {
-        let [b1, b2, b3] = bytes;
-        Self(u32::from_be_bytes([0, b1, b2, b3]))
+    pub(crate) const fn from_be_bytes(bytes: [u8; 2]) -> Self {
+        Self(u16::from_be_bytes(bytes))
     }
 
     /// Returns a big endian representation of this ID.
-    pub(crate) const fn to_be_bytes(self) -> [u8; 3] {
-        let [_, b1, b2, b3] = self.0.to_be_bytes();
-        [b1, b2, b3]
+    pub(crate) const fn to_be_bytes(self) -> [u8; 2] {
+        self.0.to_be_bytes()
     }
 
     /// Returns a [`slab`] index for this ID.
     pub(crate) const fn slab_idx(self) -> usize {
-        crate::safe_cast_usize(self.0 / 2)
+        (self.0 / 2) as usize
     }
 
     /// Returns an ID for the index of its allocated [`slab`] slot
@@ -50,8 +40,7 @@ impl StreamId {
         let id = idx
             .checked_mul(2)?
             .checked_add(usize::from(role == RammuxRole::Server))?;
-        let id = u32::try_from(id).ok()?;
-        (id <= Self::MAX).then_some(Self(id))
+        u16::try_from(id).ok().map(Self)
     }
 }
 
@@ -67,19 +56,6 @@ impl fmt::Debug for StreamId {
     }
 }
 
-impl Distribution<StreamId> for StandardUniform {
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> StreamId {
-        let num = rng.next_u32();
-        StreamId(num >> 8)
-    }
-}
-
-impl From<StreamId> for u32 {
-    fn from(value: StreamId) -> Self {
-        value.0
-    }
-}
-
 #[cfg(test)]
 mod test {
     use rstest::rstest;
@@ -87,12 +63,11 @@ mod test {
     use crate::{config::RammuxRole, stream_id::StreamId};
 
     #[rstest]
-    #[case(0x000000, [0x00, 0x00, 0x00])]
-    #[case(0x000001, [0x00, 0x00, 0x01])]
-    #[case(0xAABBCC, [0xAA, 0xBB, 0xCC])]
+    #[case(0x0000, [0x00, 0x00])]
+    #[case(0x0001, [0x00, 0x01])]
+    #[case(0xAABB, [0xAA, 0xBB])]
     #[test]
-    fn be_representation(#[case] raw_id: u32, #[case] expected: [u8; 3]) {
-        assert!(raw_id <= StreamId::MAX);
+    fn be_representation(#[case] raw_id: u16, #[case] expected: [u8; 2]) {
         let id = StreamId(raw_id);
         assert_eq!(id.to_be_bytes(), expected,);
         let reconstructed = StreamId::from_be_bytes(expected);
@@ -104,6 +79,7 @@ mod test {
     #[case(StreamId(1), 0)]
     #[case(StreamId(2), 1)]
     #[case(StreamId(3), 1)]
+    #[case(StreamId(u16::MAX), 32767)]
     #[test]
     fn slab_idx(#[case] id: StreamId, #[case] idx: usize) {
         assert_eq!(id.slab_idx(), idx);
@@ -114,8 +90,10 @@ mod test {
     #[case(0, RammuxRole::Server, Some(StreamId(1)))]
     #[case(1, RammuxRole::Client, Some(StreamId(2)))]
     #[case(1, RammuxRole::Server, Some(StreamId(3)))]
-    #[case(crate::safe_cast_usize(StreamId::MAX), RammuxRole::Client, None)]
-    #[case(crate::safe_cast_usize(StreamId::MAX), RammuxRole::Server, None)]
+    #[case(32767, RammuxRole::Client, Some(StreamId(u16::MAX - 1)))]
+    #[case(32767, RammuxRole::Server, Some(StreamId(u16::MAX)))]
+    #[case(32768, RammuxRole::Client, None)]
+    #[case(32768, RammuxRole::Server, None)]
     #[test]
     fn from_slab_idx(
         #[case] idx: usize,
@@ -124,5 +102,11 @@ mod test {
     ) {
         let calculated = StreamId::from_slab_idx(idx, role);
         assert_eq!(calculated, expected)
+    }
+
+    #[test]
+    fn initiator() {
+        assert_eq!(StreamId(4).initiated_by(), RammuxRole::Client);
+        assert_eq!(StreamId(5).initiated_by(), RammuxRole::Server);
     }
 }

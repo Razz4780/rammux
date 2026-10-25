@@ -4,6 +4,7 @@ use std::{
     collections::hash_map::Entry,
     convert::Infallible,
     io,
+    num::NonZeroU16,
     task::{Context, Poll},
     time::Duration,
 };
@@ -13,18 +14,20 @@ use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{
+    clock::{self, Clock},
     codec::{
         RammuxCodec,
-        decoder::{DecodedFrame, StreamPayload},
-        encoder::EncoderItem,
+        decoder::{DecodedFrame, InboundFrame},
+        encoder::OutFrame,
     },
     config::{ConfigError, RammuxConfig, RammuxRole},
     connection::{
-        pings::OutboundPings,
+        pings::PingSchedule,
         state::{Active, ConnState},
     },
     error::{ErrorKind, RammuxError},
     global_pool::GlobalPool,
+    header::Pong,
     stream::RammuxDuplex,
     stream_id::StreamId,
 };
@@ -37,6 +40,14 @@ mod state;
 
 /// How many inbound frames are processed in a row before outbound frames get a turn.
 const INBOUND_BATCH: usize = 16;
+
+/// How many `PONG`s a connection may owe before it stops reading.
+///
+/// Every `PING` is answered, and a frame carries at most one `PONG`. A peer that sends `PING`s faster
+/// than we can write the answers (or that does not read them at all) would make the queue grow
+/// without bound. Past this many, we stop reading until the queue shrinks: the memory is bounded,
+/// and the peer is pushed back through the transport (TCP's window), like by any other slow reader.
+const MAX_OWED_PONGS: usize = 256;
 
 /// State machine of a single rammux connection.
 ///
@@ -86,16 +97,23 @@ where
     /// Fails if the config is not valid, see [`RammuxConfig::validate`].
     pub fn new(role: RammuxRole, io: IO, config: RammuxConfig) -> Result<Self, ConfigError> {
         config.validate()?;
+        let clock = Clock::new();
         Ok(Self {
             state: ConnState::Active(Active {
-                codec: RammuxCodec::new(io, config.frame_limit, config.inbound_frame_timeout),
+                codec: RammuxCodec::new(
+                    io,
+                    config.frame_limit,
+                    config.inbound_frame_timeout,
+                    clock,
+                ),
                 streams: Default::default(),
                 selector: Selector::new(GlobalPool {
-                    rtt: None,
                     available: config.global_recv_window,
+                    ..Default::default()
                 }),
-                out_pings: OutboundPings::new(config.ping_interval),
-                in_ping: None,
+                pings: PingSchedule::new(config.ping_interval, config.ping_bytes.get()),
+                pongs: Default::default(),
+                clock,
             }),
             config,
             role,
@@ -117,133 +135,128 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<RammuxProgress<IO>, ErrorKind>> {
         let active = self.state.active_mut()?;
+        if active.pongs.len() >= MAX_OWED_PONGS {
+            // The caller wakes us up when the owed PONGs drop below the cap.
+            return Poll::Pending;
+        }
         let frame = std::task::ready!(active.codec.poll_next_unpin(cx))
             .ok_or(io::ErrorKind::UnexpectedEof)
             .map_err(io::Error::from)??;
 
-        let progress = match frame {
-            DecodedFrame::Ping {
-                payload,
-                is_response: false,
-            } => {
-                if active.in_ping.replace(payload).is_some() {
-                    return Poll::Ready(Err(ErrorKind::UnexpectedPing(payload)));
-                }
-                RammuxProgress::Empty
-            },
-
-            DecodedFrame::Ping {
-                payload,
-                is_response: true,
-            } => {
-                let elapsed = active.out_pings.received_response(payload)?;
-                active.selector.strategy_mut().rtt = Some(elapsed);
-                RammuxProgress::Empty
-            },
-
-            DecodedFrame::Stream {
-                stream_id,
-                flags,
-                payload,
-            } if stream_id.initiated_by() == self.role => {
-                if flags.syn {
-                    return Poll::Ready(Err(ErrorKind::Stream {
-                        id: stream_id,
-                        error: "started a new stream with an ID from the wrong pool".into(),
-                    }));
-                }
-                let slab_idx = stream_id.slab_idx();
-                let e = active
-                    .streams
-                    .outbound
-                    .get_mut(slab_idx)
-                    .ok_or(ErrorKind::Stream {
-                        id: stream_id,
-                        error: "sent a frame for an unknown stream".into(),
-                    })?;
-
-                let fin_state = match payload {
-                    StreamPayload::WindowUpdate(update) => {
-                        e.received_window_update(update, flags.fin_read, flags.fin_write)
-                    },
-                    StreamPayload::Data(data) => {
-                        e.received_data(data, flags.fin_read, flags.fin_write)
-                    },
-                }
-                .map_err(|error| ErrorKind::Stream {
-                    id: stream_id,
-                    error,
-                })?;
-                if fin_state.is_dead() {
-                    active.streams.outbound.remove(slab_idx);
-                }
-
-                RammuxProgress::Empty
-            },
-
-            DecodedFrame::Stream {
-                stream_id,
-                flags,
-                payload,
-            } => {
-                let stream_count = active.streams.inbound.len();
-                let (mut e, new_stream) = match active.streams.inbound.entry(stream_id) {
-                    Entry::Occupied(..) if flags.syn => {
-                        return Poll::Ready(Err(ErrorKind::Stream {
-                            id: stream_id,
-                            error: "started a new stream with an occupied ID".into(),
-                        }));
-                    },
-                    Entry::Occupied(e) => (e, None),
-                    Entry::Vacant(e) if flags.syn => {
-                        if stream_count == crate::safe_cast_usize(self.config.max_inbound_streams) {
-                            return Poll::Ready(Err(ErrorKind::Stream {
-                                id: stream_id,
-                                error:
-                                    "started a new stream without respecting the configured limit"
-                                        .into(),
-                            }));
-                        }
-                        let (handle, updates, duplex) =
-                            crate::stream::new(stream_id, false, &self.config);
-                        active.selector.push(updates);
-                        (e.insert_entry(handle), Some(duplex))
-                    },
-                    Entry::Vacant(..) => {
-                        return Poll::Ready(Err(ErrorKind::Stream {
-                            id: stream_id,
-                            error: "sent a frame for an unknown stream".into(),
-                        }));
-                    },
-                };
-
-                let fin_state = match payload {
-                    StreamPayload::WindowUpdate(update) => {
-                        e.get_mut()
-                            .received_window_update(update, flags.fin_read, flags.fin_write)
-                    },
-                    StreamPayload::Data(data) => {
-                        e.get_mut()
-                            .received_data(data, flags.fin_read, flags.fin_write)
-                    },
-                }
-                .map_err(|error| ErrorKind::Stream {
-                    id: stream_id,
-                    error,
-                })?;
-                if fin_state.is_dead() {
-                    e.remove();
-                }
-
-                new_stream
-                    .map(RammuxProgress::Inbound)
-                    .unwrap_or(RammuxProgress::Empty)
-            },
-
+        let frame = match frame {
+            DecodedFrame::Frame(frame) => frame,
             DecodedFrame::Terminate => {
                 let downgraded = self.state.downgrade(true)?;
-                RammuxProgress::Downgraded(downgraded)
+                return Poll::Ready(Ok(RammuxProgress::Downgraded(downgraded)));
             },
+        };
+        let InboundFrame {
+            header,
+            data,
+            header_at,
+        } = frame;
+
+        // The connection part of the frame comes first.
+        let global = active.selector.strategy_mut();
+        let now = active.clock.micros(header_at);
+        if let Some(pong) = header.pong {
+            // A PONG is welcome even if we have no idea what it answers.
+            // If it seems to come from the future, it does not make sense, and we ignore it.
+            if let Some(rtt) = clock::elapsed(now, pong.t_echo) {
+                global.rtt = Some(rtt);
+            }
+        }
+        if let Some(t_ping) = header.ping {
+            // The counter does not include the payload of this frame.
+            active.pongs.push_back(Pong {
+                t_echo: t_ping,
+                t_read: now,
+                rx_bytes: global.rx_bytes,
+            });
+        }
+
+        let Some(stream) = header.stream else {
+            return Poll::Ready(Ok(RammuxProgress::Empty));
+        };
+        let stream_id = stream.id;
+        let flags = stream.flags;
+        global.rx_bytes = global
+            .rx_bytes
+            .wrapping_add(u32::from(stream.data_len.map_or(0, NonZeroU16::get)));
+
+        let progress = if stream_id.initiated_by() == self.role {
+            if flags.syn {
+                return Poll::Ready(Err(ErrorKind::Stream {
+                    id: stream_id,
+                    error: "started a new stream with an ID from the wrong pool".into(),
+                }));
+            }
+            let slab_idx = stream_id.slab_idx();
+            let e = active
+                .streams
+                .outbound
+                .get_mut(slab_idx)
+                .ok_or(ErrorKind::Stream {
+                    id: stream_id,
+                    error: "sent a frame for an unknown stream".into(),
+                })?;
+
+            let fin_state = e
+                .received(stream.credit, data, flags.fin_write, flags.fin_read)
+                .map_err(|error| ErrorKind::Stream {
+                    id: stream_id,
+                    error,
+                })?;
+            if fin_state.is_dead() {
+                active.streams.outbound.remove(slab_idx);
+            }
+
+            RammuxProgress::Empty
+        } else {
+            let stream_count = active.streams.inbound.len();
+            let (mut e, new_stream) = match active.streams.inbound.entry(stream_id) {
+                Entry::Occupied(..) if flags.syn => {
+                    return Poll::Ready(Err(ErrorKind::Stream {
+                        id: stream_id,
+                        error: "started a new stream with an occupied ID".into(),
+                    }));
+                },
+                Entry::Occupied(e) => (e, None),
+                Entry::Vacant(e) if flags.syn => {
+                    if stream_count == crate::safe_cast_usize(self.config.max_inbound_streams) {
+                        return Poll::Ready(Err(ErrorKind::Stream {
+                            id: stream_id,
+                            error: "started a new stream without respecting the configured limit"
+                                .into(),
+                        }));
+                    }
+                    let (handle, updates, duplex) =
+                        crate::stream::new(stream_id, false, &self.config);
+                    active.selector.push(updates);
+                    (e.insert_entry(handle), Some(duplex))
+                },
+                Entry::Vacant(..) => {
+                    return Poll::Ready(Err(ErrorKind::Stream {
+                        id: stream_id,
+                        error: "sent a frame for an unknown stream".into(),
+                    }));
+                },
+            };
+
+            let fin_state = e
+                .get_mut()
+                .received(stream.credit, data, flags.fin_write, flags.fin_read)
+                .map_err(|error| ErrorKind::Stream {
+                    id: stream_id,
+                    error,
+                })?;
+            if fin_state.is_dead() {
+                e.remove();
+            }
+
+            new_stream
+                .map(RammuxProgress::Inbound)
+                .unwrap_or(RammuxProgress::Empty)
         };
 
         Poll::Ready(Ok(progress))
@@ -258,38 +271,53 @@ where
         loop {
             std::task::ready!(active.codec.poll_ready_unpin(cx))?;
 
-            if let Poll::Ready(payload) = active.out_pings.poll_next(cx) {
-                active
-                    .codec
-                    .start_send_unpin(EncoderItem::new_ping(payload, false))?;
-                continue;
+            // Compose the next frame. The order of importance is:
+            // 1. PONG, the peer measures its round trip with it,
+            // 2. PING, same,
+            // 3. stream control,
+            // 4. stream data.
+            // What goes first cannot wait behind what goes later,
+            // but it rides along if the later frame is going out anyway.
+            let mut frame = OutFrame::default();
+            let tx_bytes = active.selector.strategy().tx_bytes;
+
+            frame.pong = active.pongs.pop_front();
+            if active.pings.poll_due(cx, tx_bytes).is_ready() {
+                active.pings.sent(tx_bytes);
+                frame.ping = true;
             }
 
-            if let Some(payload) = active.in_ping.take() {
-                active
-                    .codec
-                    .start_send_unpin(EncoderItem::new_ping(payload, true))?;
-                continue;
-            }
-
+            let mut finished = None;
             if let Poll::Ready(Some((update, fin_state))) = active.selector.poll_next_unpin(cx) {
-                let id = update.id;
-                let item = EncoderItem::from(update);
-                active.codec.start_send_unpin(item)?;
-                if fin_state.is_dead() {
-                    if id.initiated_by() == self.role {
-                        let idx = id.slab_idx();
-                        active.streams.outbound.remove(idx);
-                    } else {
-                        active.streams.inbound.remove(&id);
-                    }
-                }
-                continue;
-            } else {
+                finished = fin_state.is_dead().then_some(update.id);
+                frame.stream = Some(update.into());
+            }
+
+            if frame.is_empty() {
                 let _ = active.codec.poll_flush_unpin(cx)?;
                 break Poll::Pending;
             }
+
+            let global = active.selector.strategy_mut();
+            global.tx_bytes = global.tx_bytes.wrapping_add(
+                u32::try_from(frame.data_len()).expect("a frame carries at most u16::MAX bytes"),
+            );
+            active.codec.start_send_unpin(frame)?;
+
+            if let Some(id) = finished {
+                if id.initiated_by() == self.role {
+                    active.streams.outbound.remove(id.slab_idx());
+                } else {
+                    active.streams.inbound.remove(&id);
+                }
+            }
         }
+    }
+
+    fn owes_too_many_pongs(&self) -> bool {
+        self.state
+            .active()
+            .is_ok_and(|active| active.pongs.len() >= MAX_OWED_PONGS)
     }
 
     fn poll_progress_inner(
@@ -315,7 +343,12 @@ where
         if let Poll::Ready(RammuxProgress::Downgraded(..)) = inbound {
             return inbound.map(Ok);
         }
+        let was_capped = self.owes_too_many_pongs();
         let _ = self.make_outbound_progress(cx)?;
+        if was_capped && !self.owes_too_many_pongs() {
+            // Reading was paused, and the codec has no reason to wake us.
+            cx.waker().wake_by_ref();
+        }
         inbound.map(Ok)
     }
 
@@ -436,7 +469,10 @@ pub struct RammuxStats {
 
 #[cfg(test)]
 mod test {
-    use std::{num::NonZeroU32, time::Duration};
+    use std::{
+        num::{NonZeroU16, NonZeroU32},
+        time::Duration,
+    };
 
     use bytes::Bytes;
     use futures::{FutureExt, SinkExt, StreamExt, stream::FuturesUnordered};
@@ -456,7 +492,7 @@ mod test {
     async fn two_sides(#[values(1, 16, 64)] streams: u32) {
         let (io_1, io_2) = tokio::io::duplex(512);
         let mut config = RammuxConfig::new();
-        config.frame_limit = NonZeroU32::new(256).unwrap();
+        config.frame_limit = NonZeroU16::new(256).unwrap();
         config.local_recv_window = NonZeroU32::new(1024).unwrap();
         config.remote_recv_window = 1024;
         config.ping_interval = Duration::from_millis(25);

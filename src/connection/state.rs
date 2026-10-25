@@ -1,15 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use async_selector::selector::Selector;
 use slab::Slab;
 
 use crate::{
     StreamId,
+    clock::Clock,
     codec::RammuxCodec,
-    connection::{downgrade::Downgraded, pings::OutboundPings},
+    connection::{downgrade::Downgraded, pings::PingSchedule},
     error::ErrorKind,
     global_pool::GlobalPool,
-    header::PingPayload,
+    header::Pong,
     stream::{handle::StreamHandle, updates::StreamUpdates},
 };
 
@@ -57,8 +58,12 @@ pub struct Active<IO> {
     pub codec: RammuxCodec<IO>,
     pub streams: ActiveStreams,
     pub selector: Selector<StreamUpdates, GlobalPool>,
-    pub out_pings: OutboundPings,
-    pub in_ping: Option<PingPayload>,
+    /// Decides when to send `PING`s.
+    pub pings: PingSchedule,
+    /// Answers to the `PING`s we read, not written yet. Oldest first.
+    pub pongs: VecDeque<Pong>,
+    /// The private clock of this side.
+    pub clock: Clock,
 }
 
 /// Stores active rammux streams.

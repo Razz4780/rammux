@@ -13,7 +13,7 @@ use bytes::Bytes;
 
 use crate::{
     StreamId,
-    codec::encoder::EncoderItem,
+    codec::encoder::OutStream,
     global_pool::GlobalPool,
     header::ControlFlags,
     stream::{FinState, SharedStreamState},
@@ -101,22 +101,13 @@ pub struct StreamUpdate {
     pub flags: ControlFlags,
 }
 
-impl From<StreamUpdate> for EncoderItem {
+impl From<StreamUpdate> for OutStream {
     fn from(value: StreamUpdate) -> Self {
-        if value.data.is_empty() {
-            // Single WINDOW_UPDATE frame.
-            EncoderItem::new_window_update(value.id, value.flags, value.window_update)
-        } else if value.window_update > 0 {
-            // Two frames, WINDOW_UPDATE and DATA.
-            EncoderItem::new_window_update_and_data(
-                value.id,
-                value.flags,
-                value.window_update,
-                value.data,
-            )
-        } else {
-            // Single DATA frame.
-            EncoderItem::new_data(value.id, value.flags, value.data)
+        Self {
+            id: value.id,
+            flags: value.flags,
+            credit: value.window_update,
+            data: value.data,
         }
     }
 }

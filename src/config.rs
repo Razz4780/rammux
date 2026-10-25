@@ -1,6 +1,10 @@
 //! rammux connection configuration.
 
-use std::{fmt, num::NonZeroU32, time::Duration};
+use std::{
+    fmt,
+    num::{NonZeroU16, NonZeroU32},
+    time::Duration,
+};
 
 use thiserror::Error;
 
@@ -45,7 +49,7 @@ pub struct RammuxConfig {
     ///
     /// This limit applies to both sides of the connection, has to be negotiated beforehand,
     /// and must match on both sides.
-    pub frame_limit: NonZeroU32,
+    pub frame_limit: NonZeroU16,
     /// How many concurrent inbound (initiated by the remote side of the connection) streams we allow.
     ///
     /// # Negotiation
@@ -74,11 +78,17 @@ pub struct RammuxConfig {
     /// This value has to be negotiated beforehand and
     /// must match the peer's [`RammuxConfig::local_recv_window`].
     pub remote_recv_window: u32,
-    /// Interval on which `PING` frames will be sent to the peer.
+    /// A `PING` is sent when this much `DATA` was written since the last one.
     ///
-    /// rammux only allows for at most one inflight `PING` from each side.
-    /// If the previous `PING` takes longer than this interval,
-    /// the next `PING` is sent immediately after.
+    /// Every `PING` is answered with a `PONG`, which gives the peer a round trip time sample.
+    /// Several `PING`s can be in flight.
+    ///
+    /// This value is a local knob and does not have to be negotiated.
+    pub ping_bytes: NonZeroU32,
+    /// A `PING` is sent when this much time passed since the last one, no matter how much data was written.
+    ///
+    /// This keeps an idle connection alive (see [`RammuxConfig::inbound_frame_timeout`]),
+    /// so it must be shorter than the timeout.
     ///
     /// This value is a local knob and does not have to be negotiated.
     pub ping_interval: Duration,
@@ -109,16 +119,18 @@ impl RammuxConfig {
     /// 1. [`Self::frame_limit`] - 16kb
     /// 2. [`Self::max_inbound_streams`] and [`Self::max_outbound_streams`] - 128
     /// 3. [`Self::local_recv_window`] and [`Self::remote_recv_window`] - 64kb
-    /// 4. [`Self::ping_interval`] - 5s
-    /// 5. [`Self::inbound_frame_timeout`] - 10s
-    /// 6. [`Self::global_recv_window`] - 4mb
+    /// 4. [`Self::ping_bytes`] - 32kb
+    /// 5. [`Self::ping_interval`] - 5s
+    /// 6. [`Self::inbound_frame_timeout`] - 10s
+    /// 7. [`Self::global_recv_window`] - 4mb
     pub const fn new() -> Self {
         Self {
-            frame_limit: NonZeroU32::new(16 * 1024).unwrap(),
+            frame_limit: NonZeroU16::new(16 * 1024).unwrap(),
             max_inbound_streams: 128,
             max_outbound_streams: 128,
             local_recv_window: NonZeroU32::new(64 * 1024).unwrap(),
             remote_recv_window: 64 * 1024,
+            ping_bytes: NonZeroU32::new(32 * 1024).unwrap(),
             ping_interval: Duration::from_secs(5),
             inbound_frame_timeout: Duration::from_secs(10),
             global_recv_window: 4 * 1024 * 1024,
@@ -158,8 +170,8 @@ impl RammuxConfig {
 
 /// How many streams each side of a connection can have at most.
 ///
-/// Stream IDs are 24-bit, the lowest bit tells which side initiated the stream.
-pub const MAX_STREAMS_PER_SIDE: u32 = 1 << 23;
+/// Stream IDs are 16-bit, the lowest bit tells which side initiated the stream.
+pub const MAX_STREAMS_PER_SIDE: u32 = 1 << 15;
 
 /// Reason why a [`RammuxConfig`] cannot be used.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

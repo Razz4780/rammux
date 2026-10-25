@@ -1,6 +1,6 @@
 use std::{
     io,
-    num::NonZeroU32,
+    num::NonZeroU16,
     ops::Not,
     task::{Poll, Waker},
 };
@@ -15,7 +15,7 @@ use crate::{
 pub struct OutboundTraffic(OutboundState);
 
 impl OutboundTraffic {
-    pub fn new(frame_limit: NonZeroU32, recv_window: u32) -> Self {
+    pub fn new(frame_limit: NonZeroU16, recv_window: u32) -> Self {
         Self(OutboundState::Open {
             ready_data: Default::default(),
             frame_limit,
@@ -45,7 +45,7 @@ impl OutboundTraffic {
                 let chunk_len = u32::try_from(ready_data.len())
                     .unwrap_or(u32::MAX)
                     .min(*recv_window)
-                    .min(frame_limit.get());
+                    .min(u32::from(frame_limit.get()));
                 *recv_window -= chunk_len;
                 let chunk = ready_data.split_to(crate::safe_cast_usize(chunk_len));
                 if ready_data.is_empty() {
@@ -66,7 +66,7 @@ impl OutboundTraffic {
                 let chunk_len = u32::try_from(ready_data.len())
                     .unwrap_or(u32::MAX)
                     .min(*recv_window)
-                    .min(frame_limit.get());
+                    .min(u32::from(frame_limit.get()));
                 *recv_window -= chunk_len;
                 let chunk = ready_data.split_to(crate::safe_cast_usize(chunk_len));
                 let fin = if ready_data.is_empty() {
@@ -272,7 +272,7 @@ enum OutboundState {
     /// Traffic direction is fully open.
     Open {
         ready_data: Bytes,
-        frame_limit: NonZeroU32,
+        frame_limit: NonZeroU16,
         recv_window: u32,
         writer: WakerSlot,
     },
@@ -280,7 +280,7 @@ enum OutboundState {
     HalfClosed {
         /// Never empty.
         ready_data: Bytes,
-        frame_limit: NonZeroU32,
+        frame_limit: NonZeroU16,
         recv_window: u32,
         writer: WakerSlot,
     },

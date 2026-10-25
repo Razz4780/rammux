@@ -7,4 +7,8 @@ pub struct GlobalPool {
     pub rtt: Option<Duration>,
     /// Amount of bytes that are currently available in the pool.
     pub available: usize,
+    /// Bytes of `DATA` written to the transport. Wraps.
+    pub tx_bytes: u32,
+    /// Bytes of `DATA` read from the transport, including discarded ones. Wraps.
+    pub rx_bytes: u32,
 }
