@@ -131,8 +131,10 @@ where
             num_streams,
             num_bytes_in_stream,
         } => {
-            let client = RammuxConnection::new(RammuxRole::Client, io_1, RammuxConfig::new());
-            let server = RammuxConnection::new(RammuxRole::Server, io_2, RammuxConfig::new());
+            let client = RammuxConnection::new(RammuxRole::Client, io_1, RammuxConfig::new())
+                .expect("config is valid");
+            let server = RammuxConnection::new(RammuxRole::Server, io_2, RammuxConfig::new())
+                .expect("config is valid");
 
             let started_at = Instant::now();
             let (client, server) = tokio::join!(

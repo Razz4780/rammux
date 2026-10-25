@@ -2,6 +2,8 @@
 
 use std::{fmt, num::NonZeroU32, time::Duration};
 
+use thiserror::Error;
+
 /// Role in a rammux connection.
 ///
 /// The only difference between the roles in a rammux connection
@@ -124,8 +126,128 @@ impl RammuxConfig {
     }
 }
 
+impl RammuxConfig {
+    /// Checks that this config can be used to run a connection.
+    ///
+    /// [`RammuxConnection::new`](crate::connection::RammuxConnection::new) calls this.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_inbound_streams > MAX_STREAMS_PER_SIDE {
+            return Err(ConfigError::TooManyStreams {
+                field: "max_inbound_streams",
+                value: self.max_inbound_streams,
+            });
+        }
+        if self.max_outbound_streams > MAX_STREAMS_PER_SIDE {
+            return Err(ConfigError::TooManyStreams {
+                field: "max_outbound_streams",
+                value: self.max_outbound_streams,
+            });
+        }
+        if self.ping_interval.is_zero() {
+            return Err(ConfigError::ZeroPingInterval);
+        }
+        if self.ping_interval >= self.inbound_frame_timeout {
+            return Err(ConfigError::PingIntervalTooLong {
+                ping_interval: self.ping_interval,
+                inbound_frame_timeout: self.inbound_frame_timeout,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// How many streams each side of a connection can have at most.
+///
+/// Stream IDs are 24-bit, the lowest bit tells which side initiated the stream.
+pub const MAX_STREAMS_PER_SIDE: u32 = 1 << 23;
+
+/// Reason why a [`RammuxConfig`] cannot be used.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum ConfigError {
+    /// A stream limit exceeds the number of IDs each side has.
+    #[error("{field} is {value}, which exceeds the maximum of {MAX_STREAMS_PER_SIDE}")]
+    TooManyStreams {
+        /// Name of the offending field.
+        field: &'static str,
+        /// Configured value.
+        value: u32,
+    },
+    /// `ping_interval` is zero: a `PING` would be due all the time.
+    #[error("ping_interval must not be zero")]
+    ZeroPingInterval,
+    /// `PING`s would not be sent often enough to keep `inbound_frame_timeout` from firing on an idle connection.
+    #[error(
+        "ping_interval ({ping_interval:?}) must be shorter than inbound_frame_timeout ({inbound_frame_timeout:?})"
+    )]
+    PingIntervalTooLong {
+        /// Configured ping interval.
+        ping_interval: Duration,
+        /// Configured timeout.
+        inbound_frame_timeout: Duration,
+    },
+}
+
 impl Default for RammuxConfig {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::time::Duration;
+
+    use crate::config::{ConfigError, MAX_STREAMS_PER_SIDE, RammuxConfig};
+
+    #[test]
+    fn default_is_valid() {
+        RammuxConfig::new().validate().unwrap();
+    }
+
+    #[test]
+    fn stream_limits_are_bounded() {
+        let mut config = RammuxConfig::new();
+        config.max_inbound_streams = MAX_STREAMS_PER_SIDE;
+        config.max_outbound_streams = MAX_STREAMS_PER_SIDE;
+        config.validate().unwrap();
+
+        config.max_inbound_streams += 1;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::TooManyStreams {
+                field: "max_inbound_streams",
+                ..
+            })
+        ));
+
+        config.max_inbound_streams = 1;
+        config.max_outbound_streams += 1;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::TooManyStreams {
+                field: "max_outbound_streams",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn ping_interval_is_shorter_than_timeout() {
+        let mut config = RammuxConfig::new();
+        config.ping_interval = config.inbound_frame_timeout;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::PingIntervalTooLong { .. })
+        ));
+        config.ping_interval = config.inbound_frame_timeout - Duration::from_millis(1);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn ping_interval_is_not_zero() {
+        let mut config = RammuxConfig::new();
+        config.ping_interval = Duration::ZERO;
+        assert_eq!(config.validate(), Err(ConfigError::ZeroPingInterval));
     }
 }

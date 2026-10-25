@@ -18,7 +18,7 @@ use crate::{
         decoder::{DecodedFrame, StreamPayload},
         encoder::EncoderItem,
     },
-    config::{RammuxConfig, RammuxRole},
+    config::{ConfigError, RammuxConfig, RammuxRole},
     connection::{
         pings::OutboundPings,
         state::{Active, ConnState},
@@ -82,8 +82,11 @@ where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
     /// Creates a new rammux connection with clean state.
-    pub fn new(role: RammuxRole, io: IO, config: RammuxConfig) -> Self {
-        Self {
+    ///
+    /// Fails if the config is not valid, see [`RammuxConfig::validate`].
+    pub fn new(role: RammuxRole, io: IO, config: RammuxConfig) -> Result<Self, ConfigError> {
+        config.validate()?;
+        Ok(Self {
             state: ConnState::Active(Active {
                 codec: RammuxCodec::new(io, config.frame_limit, config.inbound_frame_timeout),
                 streams: Default::default(),
@@ -96,7 +99,7 @@ where
             }),
             config,
             role,
-        }
+        })
     }
 
     /// Returns the config of this connection.
@@ -459,8 +462,8 @@ mod test {
         config.ping_interval = Duration::from_millis(25);
         config.max_inbound_streams = 16;
         config.max_outbound_streams = 16;
-        let conn_1 = RammuxConnection::new(RammuxRole::Client, io_1, config.clone());
-        let conn_2 = RammuxConnection::new(RammuxRole::Server, io_2, config.clone());
+        let conn_1 = RammuxConnection::new(RammuxRole::Client, io_1, config.clone()).unwrap();
+        let conn_2 = RammuxConnection::new(RammuxRole::Server, io_2, config.clone()).unwrap();
         tokio::join!(
             run_rammux(conn_1, streams, 32 * 1024).then(verify_io_clean),
             run_rammux(conn_2, streams, 32 * 1024).then(verify_io_clean),

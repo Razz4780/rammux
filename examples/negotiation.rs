@@ -56,7 +56,7 @@ async fn negotiate_rammux(role: RammuxRole, mut io: DuplexStream, mut config: Ra
     config.remote_recv_window = peer_config.recv_window;
     println!("[{role}] Negotiated final config: {config:?}");
 
-    let rammux = RammuxConnection::new(role, io, config);
+    let rammux = RammuxConnection::new(role, io, config).expect("config is valid");
     // Now we could use the connection.
 
     println!("[{role}] Starting downgrade.");
