@@ -23,7 +23,7 @@ or QUIC.
 
 - `RammuxConnection<IO>`: the protocol driver that owns the transport
 - `RammuxDuplex`: a virtual bidirectional byte stream
-- per-stream flow control with local receive window autotuning
+- per-stream flow control with a shared pool, fair shares and protection from stalled readers
 - `PING`/`PONG` round trip time measurement
 - fair round-robin scheduling and data framing across ready streams
 - graceful downgrade back to the original transport
@@ -69,19 +69,18 @@ the application must agree on compatible configuration and roles.
 
 ## Flow control
 
-Each stream has two independent receive windows, one on each side.
-As the writer sends bytes, it consumes the receive window on the other side.
-As the reader reads bytes, the rammux driver automatically sends `WINDOW_UPDATE` frames
-that restore the receive window. This lets the peer continue writing.
+Every stream has a fixed base receive window, and all streams of a connection share a pool of receive window on top
+of that. As the reader reads bytes, the rammux driver sends `WINDOW` frames that return credit to the writer.
+The receiver does not tune anything. The *sender* decides how much of the peer's pool each stream uses: in proportion
+to the rate its reader has proven (derived from the credit it gets back and the round trip time measured with
+`PING`/`PONG`), and in turns when streams compete for the pool. A stalled reader stops borrowing, and
+busy streams that write at least `frame_limit` bytes at a time converge to equal shares. A turn moves
+one frame, and a frame holds at most one write, so a stream that writes less gets a proportionally smaller share.
 
-This implementation also maintains a local global receive window pool.
-Streams that sustain high throughput can temporarily borrow from that pool so the peer
-spends less time waiting for window updates. RTT sampled from `PING`/`PONG`
-exchanges is used to tune the receive window toward roughly
-`1.5 * bandwidth-delay-product`.
-
-Those tuning details are local behavior. On the wire, the peer only sees normal
-`WINDOW_UPDATE` frames.
+See [TRANSIT_CONTROL.md](TRANSIT_CONTROL.md) for the rules, the reasons, and the known limits.
+The connection fills the pool when there is enough data, like the autotuning multiplexers do,
+so the pool bounds the queue that the connection builds on the path.
+Size it for the latency you can accept.
 
 ## Shutdown and transport recovery
 

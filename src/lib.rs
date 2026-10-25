@@ -25,6 +25,10 @@
 //! # Protocol
 //!
 //! See [PROTOCOL.md](https://github.com/Razz4780/rammux/blob/main/PROTOCOL.md).
+//! The rules by which the sender decides how much data to put on the path are in
+//! [TRANSIT_CONTROL.md](https://github.com/Razz4780/rammux/blob/main/TRANSIT_CONTROL.md).
+//!
+//! Set `TCP_NODELAY` on the transport if it is a TCP socket: rammux sends small control frames.
 //!
 //! # Examples
 //!

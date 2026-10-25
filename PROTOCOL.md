@@ -19,7 +19,8 @@ Before the first rammux frame is sent, the peers must already agree on:
 - which side is the `client` and which side is the `server`
 - the maximum frame payload size (`frame_limit`, at most 65 535)
 - how many concurrent inbound streams each side is willing to serve (at most 32 768)
-- the initial receive window size each side grants to a new virtual stream
+- the base receive window size each side grants to every virtual stream
+- the size of the pool of receive window that each side shares between all its streams
 
 ## Stream IDs
 
@@ -144,21 +145,32 @@ Sending `WINDOW` or another `FIN_READ` after `FIN_READ` is a protocol violation.
 
 ## Flow control
 
-Each stream has two independent receive windows, one on each side.
-At all times, a receive window size must fit into a 32-bit unsigned integer.
+The flow control is *inverted*: the receiver does not tune anything, and the sender decides how much of the
+receiver's memory each stream uses. See [TRANSIT_CONTROL.md](TRANSIT_CONTROL.md) for the reasons.
+
+Negotiated beforehand: the base window `B` of every stream, and the pool `P`: memory that all streams of the connection
+share on top of their base windows, in each direction.
+
+Each side tracks `unacked_s` for both directions of every stream: bytes sent minus credit received (sending),
+bytes received minus credit sent (receiving). `borrowed_s = max(0, unacked_s - B)`. The sum of `borrowed_s` over the
+streams of one direction is the use of the pool, `U`.
 
 Rules:
 
-1. the sender must not transmit more data than the currently available window
-2. each `DATA` payload decrements that available window
-3. each `WINDOW` with `credit` increments it by `credit`
+1. the sender keeps `U <= P`, and sends at most as much as it is allowed to borrow (the policy is local);
+2. the receiver counts the bytes it receives, and returns credit as the application reads. It must return
+   credit no later than when the bytes of a stream that were read and not yet credited reach `B`: otherwise
+   the sender can be left with a full window and no credit coming, forever. rammux sends `WINDOW(credit)` once
+   the credit reaches `max(1, min(32 KiB, B / 2))`;
+3. `FIN_READ` zeroes the counter of the stream on both sides, and the receiver discards all `DATA` that arrives
+   after it was sent;
+4. no credit comes after `FIN_READ`.
 
-This implementation treats the following as protocol violations:
+These are protocol violations:
 
-- a `DATA` frame that would underflow the remaining receive window
-- a `WINDOW` that would overflow the sender-side window accounting
-
-The window of a stream is autotuned by its receiver, which does not show on the wire.
+- a `DATA` frame that would make `U_rx > P_rx`
+- a `WINDOW` with more credit than the bytes that are unacknowledged on the stream
+- a `WINDOW` after `FIN_READ` of the same peer
 
 ## Downgrade and transport recovery
 
