@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use crate::{
     stream::{StreamRef, waker::WakerSlot},
@@ -91,22 +91,49 @@ impl GlobalPool {
         self.turns.len()
     }
 
-    /// Returns whether the stream may use shared room now.
-    ///
-    /// Every stream may, there is no queue yet.
-    pub fn has_turn(&self, _me: &StreamRef) -> bool {
-        true
+    /// Returns the streams waiting for their turn, first in line first.
+    #[cfg(test)]
+    pub fn turn_order(&self) -> Vec<StreamRef> {
+        self.turns.iter().cloned().collect()
+    }
+
+    /// Returns whether the stream may use shared room now:
+    /// nobody waits, or the stream is first in line.
+    pub fn has_turn(&self, me: &StreamRef) -> bool {
+        self.turns
+            .front()
+            .is_none_or(|front| Arc::ptr_eq(front, me))
     }
 
     /// Puts the stream at the back of the queue. The stream must not be in it.
-    pub fn join_turns(&mut self, _me: &StreamRef) {}
+    pub fn join_turns(&mut self, me: &StreamRef) {
+        self.turns.push_back(me.clone());
+    }
 
     /// Removes the stream from the queue, wherever it is. Does nothing if it is not in it.
-    pub fn leave_turns(&mut self, _me: &StreamRef) {}
+    pub fn leave_turns(&mut self, me: &StreamRef) {
+        if self
+            .turns
+            .front()
+            .is_some_and(|front| Arc::ptr_eq(front, me))
+        {
+            self.turns.pop_front();
+        } else {
+            self.turns.retain(|queued| !Arc::ptr_eq(queued, me));
+        }
+    }
 
     /// Wakes the stream that is first in line.
     ///
     /// The caller may hold the lock of one stream, `me`. It must pass that stream along with its poller,
     /// because the stream may be the one to wake and its lock cannot be taken again.
-    pub fn wake_front(&self, _me: Option<(&StreamRef, &mut WakerSlot)>) {}
+    pub fn wake_front(&self, me: Option<(&StreamRef, &mut WakerSlot)>) {
+        let Some(front) = self.turns.front() else {
+            return;
+        };
+        match me {
+            Some((me, poller)) if Arc::ptr_eq(front, me) => poller.wake(),
+            _ => front.lock().unwrap().updates_poller.wake(),
+        }
+    }
 }

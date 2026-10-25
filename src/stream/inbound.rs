@@ -228,6 +228,11 @@ impl InboundTraffic {
         }
     }
 
+    #[cfg(test)]
+    pub fn unacked(&self) -> u64 {
+        self.unacked.bytes
+    }
+
     pub fn fin_state(&self) -> FinState {
         match &self.state {
             InboundState::Open { .. } | InboundState::HalfClosed { .. } => FinState::default(),

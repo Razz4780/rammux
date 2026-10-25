@@ -279,6 +279,24 @@ impl OutboundTraffic {
             global.wake_front(None);
         }
     }
+
+    #[cfg(test)]
+    pub fn unacked(&self) -> u64 {
+        self.ledger.unacked
+    }
+
+    /// Gives the stream an allowance of the given size, to decay from now.
+    #[cfg(test)]
+    pub fn prime(&mut self, allowance: u32, srtt: f64, now: Instant) {
+        self.ledger
+            .rate
+            .grant_allowance(f64::from(allowance), now, srtt);
+    }
+
+    #[cfg(test)]
+    pub fn is_queued(&self) -> bool {
+        self.ledger.queued
+    }
 }
 
 /// Converts a number of bytes to send, which is never more than the bytes waiting.

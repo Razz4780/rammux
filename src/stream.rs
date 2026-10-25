@@ -13,12 +13,16 @@ use crate::{
 
 pub use duplex::{RammuxDuplex, RammuxSink, RammuxStream};
 
+#[cfg(test)]
+mod accounting_test;
 mod duplex;
 pub(crate) mod handle;
 mod inbound;
 pub(crate) mod outbound;
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod turns_test;
 pub(crate) mod updates;
 pub(crate) mod waker;
 

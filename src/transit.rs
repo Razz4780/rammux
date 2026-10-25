@@ -70,6 +70,12 @@ impl RateEstimate {
         self.rate = self.value(now, tau) + bytes / tau;
         self.at = now;
     }
+
+    /// Makes the allowance (the estimate times `ALLOWANCE_RTTS * tau`) larger by `allowance` bytes.
+    #[cfg(test)]
+    pub fn grant_allowance(&mut self, allowance: f64, now: Instant, tau: f64) {
+        self.add_amount(allowance / ALLOWANCE_RTTS, now, tau);
+    }
 }
 
 #[cfg(test)]
@@ -184,6 +190,17 @@ mod test {
         assert_eq!(credit_threshold(16 * 1024), 8 * 1024);
         assert_eq!(credit_threshold(12), 6);
         assert_eq!(credit_threshold(1), 1);
+    }
+
+    #[test]
+    fn sums_do_not_overflow_u32() {
+        // 32 768 streams that borrow 128 KiB each: 4 GiB.
+        let mut sum = 0;
+        for _ in 0..32_768 {
+            rebalance(&mut sum, 0, borrowed(64 * 1024 + 128 * 1024, 64 * 1024));
+        }
+        assert_eq!(sum, 4 * 1024 * 1024 * 1024);
+        assert!(sum > u64::from(u32::MAX));
     }
 
     #[test]

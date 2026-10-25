@@ -227,12 +227,17 @@ impl Rig {
     /// Starts a bulk upload: the client writes as fast as it can, the server reads
     /// until `stall_at` (never, if [`None`]).
     async fn bulk(&mut self, stall_at: Option<Instant>) {
+        self.bulk_writing(stall_at, 64 * 1024).await;
+    }
+
+    /// Like [`Self::bulk`], with the given size of one write.
+    async fn bulk_writing(&mut self, stall_at: Option<Instant>, write: usize) {
         let (tx, rx) = oneshot::channel();
         self.open.send(tx).unwrap();
         let stream = rx.await.unwrap();
         let (mut sink, _stream) = stream.into_split();
         tokio::spawn(async move {
-            let chunk = Bytes::from(vec![5_u8; 64 * 1024]);
+            let chunk = Bytes::from(vec![5_u8; write]);
             while sink.send(chunk.clone()).await.is_ok() {}
             drop(_stream);
         });
@@ -332,6 +337,26 @@ async fn a_stalled_reader_does_not_hold_up_the_others() {
     tokio::time::sleep(Duration::from_secs(8)).await;
     let rate = rig.rate(1, Duration::from_secs(10)).await;
     assert!(rate > 0.85 * MBIT, "{rate} Mbit/s");
+}
+
+#[tokio::test(start_paused = true)]
+async fn busy_streams_converge_to_equal_shares() {
+    let mut rig = Rig::new(MBIT, RTT, config());
+    // X holds the whole pool before Y starts.
+    rig.bulk(None).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let alone = rig.rate(0, Duration::from_secs(2)).await;
+    assert!(alone > 0.9 * MBIT, "{alone}");
+    rig.bulk(None).await;
+
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    let before = (rig.bytes(0), rig.bytes(1));
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let (x, y) = (rig.bytes(0) - before.0, rig.bytes(1) - before.1);
+    let total = (x + y) as f64 * 8.0 / 1e6 / 10.0;
+    assert!(total > 0.9 * MBIT, "{total}");
+    let (low, high) = (x.min(y) as f64, x.max(y) as f64);
+    assert!(low / high > 0.8, "x {x} y {y}");
 }
 
 /// A new stream starts on its base window and about doubles (at least) its window every loop,
@@ -434,4 +459,22 @@ async fn streams_in_both_directions_complete_with_tiny_windows_and_no_pool(
     let read = read.into_iter().map(Result::unwrap).sum::<usize>();
     // Each side reads `streams` streams of its own and `streams` of the peer's.
     assert_eq!(read, 2 * 2 * streams * bytes);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_shares_of_streams_follow_the_size_of_their_writes() {
+    // A turn moves one frame, and a frame never holds more than what one write left in the stream.
+    // Streams that compete for the pool therefore split it in proportion to their bytes per write
+    // (as long as that is below the frame limit): a known limit, see TRANSIT_CONTROL.md.
+    let mut rig = Rig::new(MBIT, RTT, config());
+    rig.bulk_writing(None, 16 * 1024).await;
+    rig.bulk_writing(None, 2 * 1024).await;
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let before = (rig.bytes(0), rig.bytes(1));
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let (big, small) = (rig.bytes(0) - before.0, rig.bytes(1) - before.1);
+    // 16 KiB against 2 KiB per write: about 8 to 1.
+    let ratio = big as f64 / small as f64;
+    assert!((6.0..10.0).contains(&ratio), "big {big} small {small}");
 }
