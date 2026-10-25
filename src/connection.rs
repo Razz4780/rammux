@@ -37,6 +37,8 @@ pub use crate::connection::downgrade::Downgraded;
 mod downgrade;
 mod pings;
 mod state;
+#[cfg(test)]
+mod wire_test;
 
 /// How many inbound frames are processed in a row before outbound frames get a turn.
 const INBOUND_BATCH: usize = 16;
