@@ -14,7 +14,7 @@ use crate::{
         decoder::{DecodedFrame, InboundFrame},
     },
     config::{RammuxConfig, RammuxRole},
-    connection::RammuxConnection,
+    connection::{RammuxConnection, RammuxProgress},
     header::{ControlFlags, Header, MAX_HEADER_LEN, Pong, StreamHeader},
 };
 
@@ -358,6 +358,146 @@ async fn pings_follow_the_data_and_the_clock() {
     );
 }
 
+fn credit_header(id: u16, flags: ControlFlags, credit: u32) -> Header {
+    Header {
+        stream: Some(StreamHeader {
+            id: StreamId::from_be_bytes(id.to_be_bytes()),
+            flags,
+            credit: NonZeroU32::new(credit),
+            data_len: None,
+        }),
+        ..Default::default()
+    }
+}
+
+fn fin_read() -> ControlFlags {
+    ControlFlags {
+        fin_read: true,
+        ..syn()
+    }
+}
+
+fn fin_write() -> ControlFlags {
+    ControlFlags {
+        fin_write: true,
+        ..Default::default()
+    }
+}
+
+/// Feeds the frames to a server and expects it to fail with a protocol violation at the end of them.
+async fn violation(config: RammuxConfig, frames: Vec<Vec<u8>>) {
+    let mut rig = rig(RammuxRole::Server, config);
+    rig.frames();
+    let mut streams = Vec::new();
+    for frame in &frames[..frames.len() - 1] {
+        rig.peer_out.write_all(frame).await.unwrap();
+        loop {
+            match rig.conn.progress().now_or_never() {
+                Some(Ok(RammuxProgress::Inbound(stream))) => streams.push(stream),
+                Some(Ok(_)) => {},
+                Some(Err(error)) => panic!("failed too early: {error}"),
+                None => break,
+            }
+        }
+    }
+    rig.peer_out
+        .write_all(frames.last().unwrap())
+        .await
+        .unwrap();
+    let error = loop {
+        match rig.conn.progress().now_or_never() {
+            Some(Ok(RammuxProgress::Inbound(stream))) => streams.push(stream),
+            Some(Ok(_)) => {},
+            Some(Err(error)) => break error,
+            None => panic!("the peer got away with it"),
+        }
+    };
+    assert!(error.is_protocol_violation(), "{error}");
+}
+
+fn data(id: u16, flags: ControlFlags, payload: &[u8]) -> Vec<u8> {
+    let header = Header {
+        stream: stream_header(id, flags, payload.len()),
+        ..Default::default()
+    };
+    raw(header, payload)
+}
+
+fn control(id: u16, flags: ControlFlags) -> Vec<u8> {
+    raw(credit_header(id, flags, 0), b"")
+}
+
+#[tokio::test(start_paused = true)]
+async fn stream_lifecycle_violations() {
+    let none = ControlFlags::default();
+    // A stream starts without SYN.
+    violation(config(), vec![data(0, none, b"x")]).await;
+    // A stream starts twice.
+    violation(config(), vec![data(0, syn(), b"x"), data(0, syn(), b"x")]).await;
+    // A stream starts with an ID of the wrong side.
+    violation(config(), vec![data(1, syn(), b"x")]).await;
+    // Too many streams.
+    let mut limited = config();
+    limited.max_inbound_streams = 1;
+    violation(limited, vec![data(0, syn(), b"x"), data(2, syn(), b"x")]).await;
+    // A frame for a stream that does not exist.
+    violation(config(), vec![data(2, none, b"x")]).await;
+    // DATA after FIN_WRITE, a second FIN_WRITE.
+    let fw = ControlFlags {
+        syn: true,
+        ..fin_write()
+    };
+    violation(config(), vec![data(0, fw, b"x"), data(0, none, b"x")]).await;
+    violation(config(), vec![data(0, fw, b"x"), control(0, fin_write())]).await;
+    // A second FIN_READ, WINDOW after FIN_READ.
+    let fr = ControlFlags {
+        fin_read: true,
+        ..none
+    };
+    violation(config(), vec![control(0, fin_read()), control(0, fr)]).await;
+    let window = raw(credit_header(0, none, 1), b"");
+    violation(config(), vec![control(0, fin_read()), window]).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn flow_control_violations() {
+    let none = ControlFlags::default();
+    // More credit than there is data in flight.
+    violation(config(), vec![raw(credit_header(0, syn(), 1), b"")]).await;
+
+    // The base window is 256, the pool 256 bytes.
+    let mut tight = config();
+    tight.local_recv_window = NonZeroU32::new(256).unwrap();
+    tight.local_recv_pool = 256;
+    // Within the base window and the pool, nothing is wrong.
+    let mut rig_ok = rig(RammuxRole::Server, tight.clone());
+    rig_ok.frames();
+    rig_ok.write(data(0, syn(), &[1; 256])).await;
+    rig_ok.write(data(0, none, &[1; 256])).await;
+    drop(rig_ok);
+    // One byte more is a violation.
+    violation(
+        tight.clone(),
+        vec![
+            data(0, syn(), &[1; 256]),
+            data(0, none, &[1; 256]),
+            data(0, none, &[1; 1]),
+        ],
+    )
+    .await;
+    // The pool is shared: two streams cannot both have 200 bytes of it.
+    violation(
+        tight,
+        vec![
+            data(0, syn(), &[1; 256]),
+            data(0, none, &[1; 200]),
+            data(2, syn(), &[1; 256]),
+            data(2, none, &[1; 57]),
+        ],
+    )
+    .await;
+}
+
 /// A transport that reads from one pipe and writes to another, which can have different sizes.
 struct Pipes {
     read: DuplexStream,
@@ -448,4 +588,50 @@ async fn a_flood_of_pings_does_not_grow_the_owed_pongs_without_bound() {
         assert!(owed(&conn) <= super::MAX_OWED_PONGS);
     }
     assert_eq!(owed(&conn), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stream_id_can_be_reused_after_both_sides_closed_it() {
+    let mut rig = rig(RammuxRole::Server, config());
+    rig.frames();
+    let opening = ControlFlags {
+        syn: true,
+        fin_write: true,
+        ..Default::default()
+    };
+    let stops_reading = ControlFlags {
+        fin_read: true,
+        ..Default::default()
+    };
+    for round in 0..3_u8 {
+        // The peer starts the stream, writes and closes its writing half.
+        rig.peer_out
+            .write_all(&data(0, opening, &[round; 3]))
+            .await
+            .unwrap();
+        let stream = loop {
+            match rig.conn.progress().now_or_never() {
+                Some(Ok(RammuxProgress::Inbound(stream))) => break stream,
+                Some(result) => {
+                    result.unwrap();
+                },
+                None => panic!("the stream with a reused ID was not accepted in round {round}"),
+            }
+        };
+        assert_eq!(rig.conn.stats().inbound_streams, 1);
+
+        // We read everything and close our halves.
+        let (sink, mut reader) = stream.into_split();
+        assert_eq!(
+            reader.next().now_or_never().unwrap().unwrap().as_ref(),
+            [round; 3]
+        );
+        assert!(reader.next().now_or_never().unwrap().is_none());
+        drop(sink);
+        drop(reader);
+        // The peer stops reading too.
+        rig.write(control(0, stops_reading)).await;
+        rig.frames();
+        assert_eq!(rig.conn.stats().inbound_streams, 0);
+    }
 }
