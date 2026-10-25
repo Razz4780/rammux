@@ -109,10 +109,7 @@ where
                     clock,
                 ),
                 streams: Default::default(),
-                selector: Selector::new(GlobalPool {
-                    available: config.global_recv_window,
-                    ..Default::default()
-                }),
+                selector: Selector::new(GlobalPool::new(config.local_recv_pool)),
                 pings: PingSchedule::new(config.ping_interval, config.ping_bytes.get()),
                 pongs: Default::default(),
                 clock,
@@ -204,7 +201,13 @@ where
                 })?;
 
             let fin_state = e
-                .received(stream.credit, data, flags.fin_write, flags.fin_read)
+                .received(
+                    stream.credit,
+                    data,
+                    flags.fin_write,
+                    flags.fin_read,
+                    active.selector.strategy_mut(),
+                )
                 .map_err(|error| ErrorKind::Stream {
                     id: stream_id,
                     error,
@@ -247,7 +250,13 @@ where
 
             let fin_state = e
                 .get_mut()
-                .received(stream.credit, data, flags.fin_write, flags.fin_read)
+                .received(
+                    stream.credit,
+                    data,
+                    flags.fin_write,
+                    flags.fin_read,
+                    active.selector.strategy_mut(),
+                )
                 .map_err(|error| ErrorKind::Stream {
                     id: stream_id,
                     error,
@@ -414,7 +423,7 @@ where
 
     /// Returns current statistics of this connection.
     pub fn stats(&self) -> RammuxStats {
-        let (inbound_streams, outbound_streams, rtt, available_global_recv_window) = self
+        let (inbound_streams, outbound_streams, rtt, pool_rx_used) = self
             .state
             .active()
             .map(|active| {
@@ -425,7 +434,7 @@ where
                     u32::try_from(active.streams.outbound.len())
                         .expect("we can't have more than u32 outbound streams"),
                     global.rtt,
-                    global.available,
+                    global.rx_used,
                 )
             })
             .unwrap_or_default();
@@ -434,7 +443,7 @@ where
             inbound_streams,
             outbound_streams,
             rtt,
-            available_global_recv_window,
+            pool_rx_used,
         }
     }
 }
@@ -465,8 +474,13 @@ pub struct RammuxStats {
     ///
     /// Empty if no `PING` response has been received yet.
     pub rtt: Option<Duration>,
-    /// Bytes available in the global receive window pool.
-    pub available_global_recv_window: usize,
+    /// Bytes of the receive pool used by the inbound streams of the peer.
+    ///
+    /// The sum over the inbound streams of the bytes received and not credited back,
+    /// beyond the base window of each stream.
+    /// It never exceeds the configured [`local_recv_pool`](crate::config::RammuxConfig::local_recv_pool):
+    /// a peer that would make it do so violates the protocol, and the connection fails.
+    pub pool_rx_used: u64,
 }
 
 #[cfg(test)]

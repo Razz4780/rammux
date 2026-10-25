@@ -129,14 +129,6 @@ pub struct RammuxConfig {
     ///
     /// This value is a local knob and does not have to be negotiated.
     pub inbound_frame_timeout: Duration,
-    /// Size of the global local receive window shared between all streams.
-    ///
-    /// This pool will be used for autotuning local receive windows of streams
-    /// that are limited by flow control. Such streams will "borrow" window size from the pool,
-    /// allowing the remote peer to spend less time waiting on window updates.
-    ///
-    /// This value is a local knob and does not have to be negotiated.
-    pub global_recv_window: usize,
 }
 
 impl RammuxConfig {
@@ -146,14 +138,13 @@ impl RammuxConfig {
     /// You will need to adjust settings that have to be negotiated with the peer.
     ///
     /// Default values:
-    /// 1. [`Self::frame_limit`] - 16kb
+    /// 1. [`Self::frame_limit`] - 16 KiB
     /// 2. [`Self::max_inbound_streams`] and [`Self::max_outbound_streams`] - 128
-    /// 3. [`Self::local_recv_window`] and [`Self::remote_recv_window`] - 64kb
-    /// 4. [`Self::ping_bytes`] - 32kb
+    /// 3. [`Self::local_recv_window`] and [`Self::remote_recv_window`] - 64 KiB
+    /// 4. [`Self::ping_bytes`] - 32 KiB
     /// 5. [`Self::ping_interval`] - 5s
     /// 6. [`Self::inbound_frame_timeout`] - 10s
-    /// 7. [`Self::global_recv_window`] - 4mb
-    /// 8. [`Self::local_recv_pool`] and [`Self::remote_recv_pool`] - 4mb
+    /// 7. [`Self::local_recv_pool`] and [`Self::remote_recv_pool`] - 4 MiB
     pub const fn new() -> Self {
         Self {
             frame_limit: NonZeroU16::new(16 * 1024).unwrap(),
@@ -166,7 +157,6 @@ impl RammuxConfig {
             ping_bytes: NonZeroU32::new(32 * 1024).unwrap(),
             ping_interval: Duration::from_secs(5),
             inbound_frame_timeout: Duration::from_secs(10),
-            global_recv_window: 4 * 1024 * 1024,
         }
     }
 }

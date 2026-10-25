@@ -27,7 +27,6 @@ const CONFIG: RammuxConfig = RammuxConfig {
     ping_bytes: NonZeroU32::new(32).unwrap(),
     ping_interval: Duration::from_secs(1),
     inbound_frame_timeout: Duration::from_secs(1),
-    global_recv_window: 32,
 };
 
 fn new_stream(
@@ -109,60 +108,170 @@ async fn rammux_stream_drop_closes_reading() {
     );
 }
 
-#[tokio::test(start_paused = true)]
-async fn local_receive_window_is_autotuned() {
-    let (mut handle, mut selector, mut duplex) = new_stream(GlobalPool {
-        available: CONFIG.local_recv_window.get() as usize * 4,
+fn pool(rx_pool: u64) -> GlobalPool {
+    GlobalPool {
+        rx_pool,
         ..Default::default()
-    });
-
-    for _ in 0..5 {
-        let data =
-            std::iter::repeat_n(b'a', CONFIG.local_recv_window.get() as usize).collect::<Vec<_>>();
-        let data = Data::copy_from_slice(&data);
-        handle.received(None, data, false, false).unwrap();
-        duplex.next().await.unwrap();
-        let (update, ..) = selector.next().await.unwrap();
-        assert_eq!(update.window_update, CONFIG.local_recv_window.get());
-    }
-
-    selector.strategy_mut().rtt = Some(Duration::from_secs(1));
-    let mut current_window = CONFIG.local_recv_window.get();
-
-    while selector.strategy().available > 0 {
-        tokio::time::advance(Duration::from_millis(100)).await;
-        let data = std::iter::repeat_n(b'a', current_window as usize).collect::<Vec<_>>();
-        let data = Data::copy_from_slice(&data);
-        handle.received(None, data, false, false).unwrap();
-        duplex.next().await.unwrap();
-        let (update, ..) = selector.next().await.unwrap();
-        assert!(update.window_update > current_window);
-        current_window = update.window_update;
-    }
-
-    while selector.strategy().available < CONFIG.local_recv_window.get() as usize * 4 {
-        tokio::time::advance(Duration::from_secs(5)).await;
-        let data = std::iter::repeat_n(b'a', current_window as usize).collect::<Vec<_>>();
-        let data = Data::copy_from_slice(&data);
-        handle.received(None, data, false, false).unwrap();
-        duplex.next().await.unwrap();
-        let (update, ..) = selector.next().await.unwrap();
-        assert!(update.window_update < current_window);
-        current_window = update.window_update;
     }
 }
 
+fn bytes(n: usize) -> Data {
+    Data::copy_from_slice(&vec![b'a'; n])
+}
+
 #[tokio::test]
-async fn local_receive_window_is_respected() {
-    let (mut handle, _selector, _duplex) = new_stream(GlobalPool::default());
-    for _ in 0..CONFIG.local_recv_window.get() {
+async fn credit_is_returned_at_the_threshold() {
+    // The base window is 12, so the threshold is 6.
+    let (mut handle, mut selector, mut duplex) = new_stream(pool(0));
+    handle
+        .received(None, bytes(8), false, false, selector.strategy_mut())
+        .unwrap();
+    assert_eq!(
+        selector.strategy().rx_used,
+        0,
+        "the base window is not the pool"
+    );
+    duplex.next().await.unwrap();
+    // The whole 8 bytes were read, the threshold is passed.
+    let (update, _) = selector.next().await.unwrap();
+    assert_eq!(update.window_update, 8);
+    assert!(selector.next().now_or_never().is_none());
+
+    // Reads below the threshold do not produce credit.
+    for _ in 0..5 {
         handle
-            .received(None, Data::copy_from_slice(b"a"), false, false)
+            .received(None, bytes(1), false, false, selector.strategy_mut())
             .unwrap();
+        duplex.next().await.unwrap();
+        assert!(selector.next().now_or_never().is_none());
     }
     handle
-        .received(None, Data::copy_from_slice(b"a"), false, false)
+        .received(None, bytes(1), false, false, selector.strategy_mut())
+        .unwrap();
+    duplex.next().await.unwrap();
+    let (update, _) = selector.next().await.unwrap();
+    assert_eq!(update.window_update, 6);
+}
+
+#[tokio::test]
+async fn credit_is_not_sent_for_unread_data() {
+    let (mut handle, mut selector, mut duplex) = new_stream(pool(0));
+    handle
+        .received(None, bytes(12), false, false, selector.strategy_mut())
+        .unwrap();
+    assert!(selector.next().now_or_never().is_none());
+    duplex.next().await.unwrap();
+    assert_eq!(selector.next().await.unwrap().0.window_update, 12);
+}
+
+#[tokio::test]
+async fn base_window_and_pool_are_respected() {
+    // B = 12 and the pool is 32.
+    let (mut handle, mut selector, _duplex) = new_stream(pool(32));
+    for _ in 0..(12 + 32) {
+        handle
+            .received(None, bytes(1), false, false, selector.strategy_mut())
+            .unwrap();
+    }
+    assert_eq!(selector.strategy().rx_used, 32);
+    handle
+        .received(None, bytes(1), false, false, selector.strategy_mut())
         .unwrap_err();
+}
+
+#[tokio::test]
+async fn the_pool_is_shared_between_streams() {
+    let (mut handle_1, mut selector, _duplex_1) = new_stream(pool(10));
+    let (handle_2, updates_2, _duplex_2) =
+        super::new(StreamId::from_be_bytes([0, 2]), true, &CONFIG);
+    selector.push(updates_2);
+    let mut handle_2 = handle_2;
+
+    // The first stream takes 8 of the pool.
+    handle_1
+        .received(None, bytes(12 + 8), false, false, selector.strategy_mut())
+        .unwrap();
+    // The second stream has its base window regardless.
+    handle_2
+        .received(None, bytes(12), false, false, selector.strategy_mut())
+        .unwrap();
+    assert_eq!(selector.strategy().rx_used, 8);
+    // But only 2 bytes of the pool are left.
+    handle_2
+        .received(None, bytes(2), false, false, selector.strategy_mut())
+        .unwrap();
+    handle_2
+        .received(None, bytes(1), false, false, selector.strategy_mut())
+        .unwrap_err();
+}
+
+#[tokio::test]
+async fn credit_returns_the_pool_share() {
+    let (mut handle, mut selector, mut duplex) = new_stream(pool(32));
+    handle
+        .received(None, bytes(12 + 10), false, false, selector.strategy_mut())
+        .unwrap();
+    assert_eq!(selector.strategy().rx_used, 10);
+    duplex.next().await.unwrap();
+    let (update, _) = selector.next().await.unwrap();
+    assert_eq!(update.window_update, 22);
+    assert_eq!(selector.strategy().rx_used, 0);
+}
+
+#[tokio::test]
+async fn fin_read_releases_the_pool_share_and_data_after_it_is_discarded() {
+    let (mut handle, mut selector, duplex) = new_stream(pool(32));
+    handle
+        .received(None, bytes(12 + 10), false, false, selector.strategy_mut())
+        .unwrap();
+    assert_eq!(selector.strategy().rx_used, 10);
+    drop(duplex);
+
+    // The data that arrives before FIN_READ is written still counts.
+    handle
+        .received(None, bytes(5), false, false, selector.strategy_mut())
+        .unwrap();
+    assert_eq!(selector.strategy().rx_used, 15);
+    let (update, fin_state) = selector.next().await.unwrap();
+    assert!(update.flags.fin_read);
+    assert_eq!(update.window_update, 0);
+    assert!(fin_state.sent);
+    assert_eq!(selector.strategy().rx_used, 0);
+
+    // After it, the data is discarded without a fuss, however much of it.
+    for _ in 0..10 {
+        handle
+            .received(None, bytes(8), false, false, selector.strategy_mut())
+            .unwrap();
+    }
+    assert_eq!(selector.strategy().rx_used, 0);
+    assert!(!matches!(selector.next().now_or_never(), Some(Some(_))));
+}
+
+#[tokio::test]
+async fn data_after_fin_write_is_a_violation() {
+    let (mut handle, mut selector, _duplex) = new_stream(pool(0));
+    handle
+        .received(None, bytes(1), true, false, selector.strategy_mut())
+        .unwrap();
+    handle
+        .received(None, bytes(1), false, false, selector.strategy_mut())
+        .unwrap_err();
+}
+
+#[tokio::test]
+async fn pool_is_returned_when_the_reader_drains_after_fin_write() {
+    let (mut handle, mut selector, mut duplex) = new_stream(pool(32));
+    handle
+        .received(None, bytes(12 + 10), true, false, selector.strategy_mut())
+        .unwrap();
+    assert_eq!(selector.strategy().rx_used, 10);
+    duplex.next().await.unwrap();
+    // The reader is done, so FIN_READ zeroes the counter.
+    let (update, _) = selector.next().await.unwrap();
+    assert!(update.flags.fin_read || update.window_update > 0);
+    while let Some(Some((_update, _))) = selector.next().now_or_never() {}
+    assert_eq!(selector.strategy().rx_used, 0);
 }
 
 #[tokio::test]
@@ -187,7 +296,13 @@ async fn remote_receive_window_is_respected() {
     assert!(duplex.flush().now_or_never().is_none());
     assert!(selector.next().now_or_never().is_none());
     handle
-        .received(NonZeroU32::new(8), Data::default(), false, false)
+        .received(
+            NonZeroU32::new(8),
+            Data::default(),
+            false,
+            false,
+            &mut GlobalPool::default(),
+        )
         .unwrap();
     let (update, fin_state) = selector.next().await.unwrap();
     assert_eq!(update.data.len(), 1);
@@ -204,14 +319,30 @@ async fn remote_receive_window_is_respected() {
 #[tokio::test]
 async fn fin_read_closes_writing() {
     let (mut handle, _selector, mut duplex) = new_stream(GlobalPool::default());
-    handle.received(None, Data::default(), false, true).unwrap();
+    handle
+        .received(
+            None,
+            Data::default(),
+            false,
+            true,
+            &mut GlobalPool::default(),
+        )
+        .unwrap();
     duplex.send(Bytes::from_static(b"a")).await.unwrap_err();
 }
 
 #[tokio::test]
 async fn fin_write_closes_reading() {
     let (mut handle, _selector, mut duplex) = new_stream(GlobalPool::default());
-    handle.received(None, Data::default(), true, false).unwrap();
+    handle
+        .received(
+            None,
+            Data::default(),
+            true,
+            false,
+            &mut GlobalPool::default(),
+        )
+        .unwrap();
     assert!(duplex.next().await.is_none());
 }
 
@@ -220,7 +351,13 @@ async fn parts_of_a_frame_are_processed_in_protocol_order() {
     // DATA is processed before FIN_WRITE.
     let (mut handle, _selector, mut duplex) = new_stream(GlobalPool::default());
     handle
-        .received(None, Data::copy_from_slice(b"a"), true, false)
+        .received(
+            None,
+            Data::copy_from_slice(b"a"),
+            true,
+            false,
+            &mut GlobalPool::default(),
+        )
         .unwrap();
     assert_eq!(duplex.next().await.unwrap(), Bytes::from_static(b"a"));
     assert!(duplex.next().await.is_none());
@@ -228,10 +365,22 @@ async fn parts_of_a_frame_are_processed_in_protocol_order() {
     // WINDOW is processed before FIN_READ.
     let (mut handle, _selector, _duplex) = new_stream(GlobalPool::default());
     handle
-        .received(NonZeroU32::new(8), Data::default(), false, true)
+        .received(
+            NonZeroU32::new(8),
+            Data::default(),
+            false,
+            true,
+            &mut GlobalPool::default(),
+        )
         .unwrap();
     // And a WINDOW after FIN_READ is a violation.
     handle
-        .received(NonZeroU32::new(8), Data::default(), false, false)
+        .received(
+            NonZeroU32::new(8),
+            Data::default(),
+            false,
+            false,
+            &mut GlobalPool::default(),
+        )
         .unwrap_err();
 }

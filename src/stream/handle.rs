@@ -6,6 +6,7 @@ use std::{
 use crate::{
     buffer::Data,
     error::StreamError,
+    global_pool::GlobalPool,
     stream::{FinState, SharedStreamState},
 };
 
@@ -25,6 +26,7 @@ impl StreamHandle {
         data: Data,
         fin_write: bool,
         fin_read: bool,
+        global: &mut GlobalPool,
     ) -> Result<FinState, StreamError> {
         let mut guard = self.0.lock().unwrap();
         let SharedStreamState {
@@ -35,7 +37,7 @@ impl StreamHandle {
         if let Some(credit) = credit {
             outbound.received_window_update(credit.get(), updates_poller)?;
         }
-        inbound.received_data(data)?;
+        inbound.received_data(data, global)?;
         if fin_write {
             inbound.received_fin_write(updates_poller)?;
         }
