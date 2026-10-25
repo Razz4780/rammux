@@ -36,6 +36,8 @@ pub use crate::connection::downgrade::Downgraded;
 
 mod downgrade;
 mod pings;
+#[cfg(test)]
+mod sim_test;
 mod state;
 #[cfg(test)]
 mod wire_test;
@@ -109,7 +111,10 @@ where
                     clock,
                 ),
                 streams: Default::default(),
-                selector: Selector::new(GlobalPool::new(config.local_recv_pool)),
+                selector: Selector::new(GlobalPool::new(
+                    config.local_recv_pool,
+                    config.remote_recv_pool,
+                )),
                 pings: PingSchedule::new(config.ping_interval, config.ping_bytes.get()),
                 pongs: Default::default(),
                 clock,
@@ -426,27 +431,21 @@ where
 
     /// Returns current statistics of this connection.
     pub fn stats(&self) -> RammuxStats {
-        let (inbound_streams, outbound_streams, srtt, pool_rx_used) = self
-            .state
-            .active()
-            .map(|active| {
-                let global = active.selector.strategy();
-                (
-                    u32::try_from(active.streams.inbound.len())
-                        .expect("we can't have more than u32 inbound streams"),
-                    u32::try_from(active.streams.outbound.len())
-                        .expect("we can't have more than u32 outbound streams"),
-                    global.srtt,
-                    global.rx_used,
-                )
-            })
-            .unwrap_or_default();
-
+        let Ok(active) = self.state.active() else {
+            return RammuxStats::default();
+        };
+        let global = active.selector.strategy();
         RammuxStats {
-            inbound_streams,
-            outbound_streams,
-            srtt,
-            pool_rx_used,
+            inbound_streams: u32::try_from(active.streams.inbound.len())
+                .expect("we can't have more than u32 inbound streams"),
+            outbound_streams: u32::try_from(active.streams.outbound.len())
+                .expect("we can't have more than u32 outbound streams"),
+            srtt: global.srtt,
+            pool_tx_used: global.tx_used,
+            pool_rx_used: global.rx_used,
+            turn_queue_len: u32::try_from(global.turns_len()).expect(
+                "at most one queue entry per stream, and there are fewer than u32::MAX streams",
+            ),
         }
     }
 }
@@ -466,7 +465,7 @@ pub enum RammuxProgress<IO> {
 }
 
 /// Statistics of a [`RammuxConnection`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct RammuxStats {
     /// Count of currently active inbound streams.
@@ -478,13 +477,19 @@ pub struct RammuxStats {
     /// It includes the queues on the path in both directions, and the delay in the peer's muxer.
     /// Empty if no `PONG` has been received yet.
     pub srtt: Option<Duration>,
-    /// Bytes of the receive pool used by the inbound streams of the peer.
+    /// Bytes of the peer's receive pool used by our outbound data.
     ///
-    /// The sum over the inbound streams of the bytes received and not credited back,
-    /// beyond the base window of each stream.
+    /// The sum over the streams of the bytes sent and not credited back, beyond the base window of each stream.
+    /// It never exceeds the configured [`remote_recv_pool`](crate::config::RammuxConfig::remote_recv_pool).
+    pub pool_tx_used: u64,
+    /// Bytes of our receive pool used by the inbound data of the peer.
+    ///
+    /// The sum over the streams of the bytes received and not credited back, beyond the base window of each stream.
     /// It never exceeds the configured [`local_recv_pool`](crate::config::RammuxConfig::local_recv_pool):
     /// a peer that would make it do so violates the protocol, and the connection fails.
     pub pool_rx_used: u64,
+    /// Count of streams waiting for their turn to use the shared pool.
+    pub turn_queue_len: u32,
 }
 
 #[cfg(test)]

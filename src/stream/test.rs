@@ -44,7 +44,7 @@ fn new_stream(
 
 #[tokio::test]
 async fn rammux_duplex_drop_closes_both() {
-    let (_, mut selector, duplex) = new_stream(GlobalPool::default());
+    let (_, mut selector, duplex) = new_stream(pool(0));
     drop(duplex);
     let (update, fin_state) = selector.next().await.unwrap();
     assert_eq!(
@@ -66,7 +66,7 @@ async fn rammux_duplex_drop_closes_both() {
 
 #[tokio::test]
 async fn rammux_sink_drop_closes_writing() {
-    let (_, mut selector, duplex) = new_stream(GlobalPool::default());
+    let (_, mut selector, duplex) = new_stream(pool(0));
     let _stream = duplex.into_split().1;
     let (update, fin_state) = selector.next().await.unwrap();
     assert_eq!(
@@ -88,7 +88,7 @@ async fn rammux_sink_drop_closes_writing() {
 
 #[tokio::test]
 async fn rammux_stream_drop_closes_reading() {
-    let (_, mut selector, duplex) = new_stream(GlobalPool::default());
+    let (_, mut selector, duplex) = new_stream(pool(0));
     let _sink = duplex.into_split().0;
     let (update, fin_state) = selector.next().await.unwrap();
     assert_eq!(
@@ -108,11 +108,8 @@ async fn rammux_stream_drop_closes_reading() {
     );
 }
 
-fn pool(rx_pool: u64) -> GlobalPool {
-    GlobalPool {
-        rx_pool,
-        ..Default::default()
-    }
+fn pool(rx_pool: u32) -> GlobalPool {
+    GlobalPool::new(rx_pool, 0)
 }
 
 fn bytes(n: usize) -> Data {
@@ -276,7 +273,7 @@ async fn pool_is_returned_when_the_reader_drains_after_fin_write() {
 
 #[tokio::test]
 async fn remote_receive_window_is_respected() {
-    let (mut handle, mut selector, mut duplex) = new_stream(GlobalPool::default());
+    let (mut handle, mut selector, mut duplex) = new_stream(pool(0));
     for _ in 0..CONFIG.remote_recv_window.get() {
         duplex.feed(Bytes::from_static(b"a")).await.unwrap();
         assert!(duplex.flush().now_or_never().is_none());
@@ -318,7 +315,7 @@ async fn remote_receive_window_is_respected() {
 
 #[tokio::test]
 async fn fin_read_closes_writing() {
-    let (mut handle, _selector, mut duplex) = new_stream(GlobalPool::default());
+    let (mut handle, _selector, mut duplex) = new_stream(pool(0));
     handle
         .received(
             None,
@@ -333,7 +330,7 @@ async fn fin_read_closes_writing() {
 
 #[tokio::test]
 async fn fin_write_closes_reading() {
-    let (mut handle, _selector, mut duplex) = new_stream(GlobalPool::default());
+    let (mut handle, _selector, mut duplex) = new_stream(pool(0));
     handle
         .received(
             None,
@@ -349,7 +346,7 @@ async fn fin_write_closes_reading() {
 #[tokio::test]
 async fn parts_of_a_frame_are_processed_in_protocol_order() {
     // DATA is processed before FIN_WRITE.
-    let (mut handle, _selector, mut duplex) = new_stream(GlobalPool::default());
+    let (mut handle, _selector, mut duplex) = new_stream(pool(0));
     handle
         .received(
             None,
@@ -363,14 +360,16 @@ async fn parts_of_a_frame_are_processed_in_protocol_order() {
     assert!(duplex.next().await.is_none());
 
     // WINDOW is processed before FIN_READ.
-    let (mut handle, _selector, _duplex) = new_stream(GlobalPool::default());
+    let (mut handle, mut selector, mut duplex) = new_stream(pool(0));
+    duplex.feed(Bytes::from_static(b"12345678")).await.unwrap();
+    assert_eq!(selector.next().await.unwrap().0.data.len(), 8);
     handle
         .received(
             NonZeroU32::new(8),
             Data::default(),
             false,
             true,
-            &mut GlobalPool::default(),
+            selector.strategy_mut(),
         )
         .unwrap();
     // And a WINDOW after FIN_READ is a violation.
@@ -380,7 +379,7 @@ async fn parts_of_a_frame_are_processed_in_protocol_order() {
             Data::default(),
             false,
             false,
-            &mut GlobalPool::default(),
+            selector.strategy_mut(),
         )
         .unwrap_err();
 }

@@ -16,11 +16,11 @@ pub use duplex::{RammuxDuplex, RammuxSink, RammuxStream};
 mod duplex;
 pub(crate) mod handle;
 mod inbound;
-mod outbound;
+pub(crate) mod outbound;
 #[cfg(test)]
 mod test;
 pub(crate) mod updates;
-mod waker;
+pub(crate) mod waker;
 
 pub(crate) fn new(
     id: StreamId,
@@ -54,14 +54,19 @@ pub(crate) fn new(
     )
 }
 
+/// Reference to the state of a virtual stream.
+///
+/// Its identity is the identity of the stream: IDs are reused, this is not.
+pub(crate) type StreamRef = Arc<Mutex<SharedStreamState>>;
+
 /// State of a virtual stream, shared under [`Mutex`] by [`StreamHandle`], [`StreamUpdates`] and [`RammuxDuplex`].
-struct SharedStreamState {
+pub(crate) struct SharedStreamState {
     /// State of the inbound traffic direction.
     inbound: InboundTraffic,
     /// State of the outbound traffic direction.
     outbound: OutboundTraffic,
     /// Waker for the task that polls [`StreamUpdates`].
-    updates_poller: WakerSlot,
+    pub(crate) updates_poller: WakerSlot,
 }
 
 /// Represents the current `FIN_*` state of a virtual stream or one of its traffic directions.

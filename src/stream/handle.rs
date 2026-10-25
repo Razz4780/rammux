@@ -3,11 +3,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use tokio::time::Instant;
+
 use crate::{
     buffer::Data,
     error::StreamError,
     global_pool::GlobalPool,
-    stream::{FinState, SharedStreamState},
+    stream::{FinState, SharedStreamState, outbound::Ctx},
 };
 
 /// Handle to a virtual rammux stream.
@@ -34,15 +36,22 @@ impl StreamHandle {
             outbound,
             updates_poller,
         } = &mut *guard;
+        // Credit and FIN_READ release a part of the peer's pool, and the queue for it gets a turn.
+        let mut ctx = Ctx {
+            global,
+            me: &self.0,
+            poller: updates_poller,
+            now: Instant::now(),
+        };
         if let Some(credit) = credit {
-            outbound.received_window_update(credit.get(), updates_poller)?;
+            outbound.received_window_update(credit.get(), &mut ctx)?;
         }
-        inbound.received_data(data, global)?;
+        inbound.received_data(data, ctx.global)?;
         if fin_write {
-            inbound.received_fin_write(updates_poller)?;
+            inbound.received_fin_write(ctx.poller)?;
         }
         if fin_read {
-            outbound.received_fin_read(updates_poller)?;
+            outbound.received_fin_read(&mut ctx)?;
         }
         Ok(inbound.fin_state().and(outbound.fin_state()))
     }
@@ -60,6 +69,6 @@ impl StreamHandle {
             updates_poller,
         } = &mut *guard;
         let _ = inbound.received_fin_write(updates_poller);
-        let _ = outbound.received_fin_read(updates_poller);
+        outbound.abort(updates_poller);
     }
 }

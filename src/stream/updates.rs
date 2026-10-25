@@ -5,6 +5,8 @@ use std::{
     task::{Context, Poll},
 };
 
+use tokio::time::Instant;
+
 use async_selector::{
     selector::{BorrowedMut, Removed},
     task::Task,
@@ -16,7 +18,7 @@ use crate::{
     codec::encoder::OutStream,
     global_pool::GlobalPool,
     header::ControlFlags,
-    stream::{FinState, SharedStreamState},
+    stream::{FinState, SharedStreamState, outbound::Ctx},
 };
 
 pub(crate) struct StreamUpdates {
@@ -45,22 +47,34 @@ impl Task<GlobalPool> for StreamUpdates {
         let mut is_pending = true;
 
         let mut guard = this.state.lock().unwrap();
-        if let Poll::Ready((window_update, fin_read)) = guard.inbound.poll_update(global) {
+        let SharedStreamState {
+            inbound,
+            outbound,
+            updates_poller,
+        } = &mut *guard;
+        // Credit and FIN_READ never wait for data, or for a turn.
+        if let Poll::Ready((window_update, fin_read)) = inbound.poll_update(global) {
             update.window_update = window_update;
             update.flags.fin_read = fin_read;
             is_pending = false;
         }
-        if let Poll::Ready((data, fin_write)) = guard.outbound.poll_update() {
+        let mut ctx = Ctx {
+            global,
+            me: &this.state,
+            poller: updates_poller,
+            now: Instant::now(),
+        };
+        if let Poll::Ready((data, fin_write)) = outbound.poll_update(&mut ctx) {
             update.data = data;
             update.flags.fin_write = fin_write;
             is_pending = false;
         }
         if is_pending {
-            guard.updates_poller.register(cx.waker());
+            updates_poller.register(cx.waker());
             return Poll::Pending;
         }
-        let inbound_fin = guard.inbound.fin_state();
-        let outbound_fin = guard.outbound.fin_state();
+        let inbound_fin = inbound.fin_state();
+        let outbound_fin = outbound.fin_state();
         drop(guard);
 
         // At this point, `update` cannot be empty.
@@ -86,10 +100,14 @@ impl Task<GlobalPool> for StreamUpdates {
     }
 
     fn transform_break(
-        _: Removed<Self>,
-        _: &mut GlobalPool,
+        removed: Removed<Self>,
+        global: &mut GlobalPool,
         value: Self::Break,
     ) -> Option<Self::Output> {
+        // A closed stream waits for nothing, and nobody waits for it.
+        let mut guard = removed.state.lock().unwrap();
+        guard.outbound.leave_turns(global, &removed.state);
+        drop(guard);
         Some(value)
     }
 }
