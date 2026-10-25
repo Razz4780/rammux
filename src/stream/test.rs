@@ -212,3 +212,24 @@ async fn fin_write_closes_reading() {
     handle.received(None, Data::default(), true, false).unwrap();
     assert!(duplex.next().await.is_none());
 }
+
+#[tokio::test]
+async fn parts_of_a_frame_are_processed_in_protocol_order() {
+    // DATA is processed before FIN_WRITE.
+    let (mut handle, _selector, mut duplex) = new_stream(GlobalPool::default());
+    handle
+        .received(None, Data::copy_from_slice(b"a"), true, false)
+        .unwrap();
+    assert_eq!(duplex.next().await.unwrap(), Bytes::from_static(b"a"));
+    assert!(duplex.next().await.is_none());
+
+    // WINDOW is processed before FIN_READ.
+    let (mut handle, _selector, _duplex) = new_stream(GlobalPool::default());
+    handle
+        .received(NonZeroU32::new(8), Data::default(), false, true)
+        .unwrap();
+    // And a WINDOW after FIN_READ is a violation.
+    handle
+        .received(NonZeroU32::new(8), Data::default(), false, false)
+        .unwrap_err();
+}
