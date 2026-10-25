@@ -16,7 +16,7 @@ control, keepalive, and shutdown in one place.
 When you need to handle multiple independent data streams within one byte stream transport,
 and that transport is **not** prone to [HOL blocking](https://en.wikipedia.org/wiki/Head-of-line_blocking).
 HOL blocking on the transport level can become a serious performance bottleneck.
-Instead of running ramux over a single TCP connection, you should probably rather use multiple TCP connections
+Instead of running rammux over a single TCP connection, you should probably rather use multiple TCP connections
 or QUIC.
 
 ## What this crate provides
@@ -24,6 +24,7 @@ or QUIC.
 - `RammuxConnection<IO>`: the protocol driver that owns the transport
 - `RammuxDuplex`: a virtual bidirectional byte stream
 - per-stream flow control with local receive window autotuning
+- `PING`/`PONG` round trip time measurement
 - fair round-robin scheduling and data framing across ready streams
 - graceful downgrade back to the original transport
 
@@ -51,6 +52,16 @@ If the connection stops being polled, all stream IO stalls with it.
 
 ## Connection setup
 
+Set `TCP_NODELAY` on the transport if it is a TCP socket. rammux sends small control frames
+(window credit, `PING`s), and Nagle's algorithm and delayed ACKs would hold them back.
+
+rammux writes each frame (its header and its payload) with one vectored write. A transport that does not
+implement vectored writes natively (`is_write_vectored()` is false) gets two writes per frame, the header and then the
+payload, which costs a system call or a packet more. Wrap such a transport in a buffered writer
+(`tokio::io::BufWriter`, or `BufStream` for both directions): rammux flushes after the last frame it has ready,
+so nothing is held back. A buffered reader is fine too: its buffered bytes stay in the transport that the
+downgrade returns.
+
 rammux does not define an in-band handshake. Before running the protocol,
 the application must agree on compatible configuration and roles.
 
@@ -65,8 +76,8 @@ that restore the receive window. This lets the peer continue writing.
 
 This implementation also maintains a local global receive window pool.
 Streams that sustain high throughput can temporarily borrow from that pool so the peer
-spends less time waiting for window updates. RTT sampled from `PING`
-request/response frames is used to tune the receive window toward roughly
+spends less time waiting for window updates. RTT sampled from `PING`/`PONG`
+exchanges is used to tune the receive window toward roughly
 `1.5 * bandwidth-delay-product`.
 
 Those tuning details are local behavior. On the wire, the peer only sees normal
