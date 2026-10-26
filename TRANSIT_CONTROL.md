@@ -279,7 +279,7 @@ no reports, and must not open the window. Bursts are the pacer's business.
   queue that the window then measured (about half of the link was data). Waiting cannot block for good: a frame is at
   most `frame_limit`, which is the floor of `W`, so a drained window always has room for it.
 - **Pacing** (Copa's rule): DATA leaves at most at `2 * W / srtt`. A burst is at most two frames plus 2 ms of that rate
-  (`2 * frame_limit + pace_rate * max(2 ms, timer_lateness)`), where `timer_lateness` is the smoothed lateness of the
+  (`2 * frame_limit + pace_rate * max(2 ms, lateness)`), where `lateness` is the smoothed lateness of the
   pacer's own timer: on a platform whose timer wakes the sender every 15.6 ms (Windows), 2 ms of burst would cap the
   rate at a fraction of the link, so the burst follows the timer. Without pacing, data leaves when delivery reports
   arrive. With bulk both ways the reports wait behind the peer's data and arrive in clumps (the ACK compression of

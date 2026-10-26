@@ -83,6 +83,19 @@ impl RateEstimate {
     }
 }
 
+/// A non-negative number of bytes, rounded down.
+pub(crate) fn to_bytes(value: f64) -> u64 {
+    if value.is_nan() || value <= 0.0 {
+        0
+    } else {
+        // Saturates for values beyond u64.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        {
+            value as u64
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::time::Duration;

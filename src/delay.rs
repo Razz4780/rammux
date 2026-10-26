@@ -18,7 +18,7 @@ use tokio::time::Instant;
 use crate::{
     clock::diff,
     pacer::Pacer,
-    transit::{RateEstimate, SRTT_MIN},
+    transit::{RateEstimate, SRTT_MIN, to_bytes},
 };
 
 /// How many round trips of raw one-way delay samples the re-baseline test looks at.
@@ -555,7 +555,7 @@ impl DelayControl {
 
     /// Takes `n` bytes of DATA that were sent out of the pacer's room.
     pub fn on_sent(&mut self, now: Instant, n: u64) {
-        self.pacer.take(now, n, self.pace_rate(), self.frame_limit);
+        self.pacer.spend(now, n, self.pace_rate(), self.frame_limit);
     }
 
     /// Records that the pacer kept `wanted` bytes from being sent: they fit at the deadline.
@@ -630,19 +630,6 @@ impl DelayControl {
     #[cfg(test)]
     pub fn set_growth(&mut self, growth: u64) {
         self.growth = growth;
-    }
-}
-
-/// A non-negative number of bytes, rounded down.
-pub(crate) fn to_bytes(value: f64) -> u64 {
-    if value.is_nan() || value <= 0.0 {
-        0
-    } else {
-        // Saturates for values beyond u64.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        {
-            value as u64
-        }
     }
 }
 

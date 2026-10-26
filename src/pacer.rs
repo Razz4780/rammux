@@ -8,7 +8,7 @@ use std::{future::Future, pin::Pin, task::Context, time::Duration};
 
 use tokio::time::{Instant, Sleep};
 
-use crate::delay::to_bytes;
+use crate::transit::to_bytes;
 
 /// The pacer lets out at least what it releases in this time at once, see [`Pacer::cap`].
 const PACING_BURST: Duration = Duration::from_millis(2);
@@ -75,7 +75,7 @@ impl Pacer {
     }
 
     /// Takes `n` bytes of DATA that were sent out of the pacer's room.
-    pub fn take(&mut self, now: Instant, n: u64, rate: f64, frame_limit: u64) {
+    pub fn spend(&mut self, now: Instant, n: u64, rate: f64, frame_limit: u64) {
         let tokens = self.tokens_at(now, rate, frame_limit);
         self.tokens = (tokens - n as f64).max(0.0);
         self.at = now;
