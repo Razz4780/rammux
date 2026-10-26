@@ -52,6 +52,7 @@ mod clock;
 mod codec;
 pub mod config;
 pub mod connection;
+mod delay;
 mod error;
 mod global_pool;
 mod header;

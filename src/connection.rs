@@ -20,11 +20,12 @@ use crate::{
         decoder::{DecodedFrame, InboundFrame},
         encoder::OutFrame,
     },
-    config::{ConfigError, RammuxConfig, RammuxRole},
+    config::{ConfigError, RammuxConfig, RammuxRole, TransitControl},
     connection::{
         pings::PingSchedule,
         state::{Active, ConnState},
     },
+    delay::{DelayControl, PongSample},
     error::{ErrorKind, RammuxError},
     global_pool::GlobalPool,
     header::Pong,
@@ -92,8 +93,24 @@ where
     ///
     /// Fails if the config is not valid, see [`RammuxConfig::validate`].
     pub fn new(role: RammuxRole, io: IO, config: RammuxConfig) -> Result<Self, ConfigError> {
+        Self::with_clock(role, io, config, Clock::new())
+    }
+
+    /// Like [`Self::new`], with the given private clock.
+    pub(crate) fn with_clock(
+        role: RammuxRole,
+        io: IO,
+        config: RammuxConfig,
+        clock: Clock,
+    ) -> Result<Self, ConfigError> {
         config.validate()?;
-        let clock = Clock::new();
+        let mut global = GlobalPool::new(config.local_recv_pool, config.remote_recv_pool);
+        if config.transit_control == TransitControl::DelayControl {
+            global = global.with_delay_control(DelayControl::new(
+                config.queue_target_bytes.get(),
+                config.frame_limit.get(),
+            ));
+        }
         Ok(Self {
             state: ConnState::Active(Active {
                 codec: RammuxCodec::new(
@@ -103,13 +120,13 @@ where
                     clock,
                 ),
                 streams: Default::default(),
-                selector: Selector::new(GlobalPool::new(
-                    config.local_recv_pool,
-                    config.remote_recv_pool,
-                )),
+                selector: Selector::new(global),
                 pings: PingSchedule::new(config.ping_interval, config.ping_bytes.get()),
                 pong: None,
                 last_echo: None,
+                pacer: Box::pin(tokio::time::sleep(Duration::ZERO)),
+                pacer_armed: false,
+                pacer_deadline: tokio::time::Instant::now(),
                 clock,
             }),
             config,
@@ -167,7 +184,20 @@ where
                 && let Some(rtt) = clock::elapsed(now, pong.t_echo)
             {
                 active.last_echo = Some(pong.t_echo);
-                global.observe_rtt(rtt);
+                global.on_pong(
+                    PongSample {
+                        now: header_at,
+                        now_us: now,
+                        t_echo: pong.t_echo,
+                        t_read: pong.t_read,
+                        rx_bytes: pong.rx_bytes,
+                    },
+                    rtt,
+                );
+                if global.dc.is_some() {
+                    // The window may have grown, and the delivered bytes may have left it.
+                    global.wake_front(None);
+                }
             }
         }
         if let Some(t_ping) = header.ping {
@@ -279,6 +309,31 @@ where
         Poll::Ready(Ok(progress))
     }
 
+    /// Decides whether a `PING` goes out now, and if so, accounts for it.
+    ///
+    /// With `DelayControl`, the window needs a sample every round trip: a `PING` is due after
+    /// `W / 4` bytes, and when the window keeps a frame from being sent.
+    fn poll_ping(active: &mut Active<IO>, cx: &mut Context<'_>) -> bool {
+        let global = active.selector.strategy_mut();
+        let tx_bytes = global.tx_bytes;
+        let (cap, blocked) = global.dc.as_ref().map_or((u32::MAX, false), |dc| {
+            let cap = u32::try_from(dc.window() / 4).unwrap_or(u32::MAX);
+            (cap, dc.peek_ping_wanted())
+        });
+        if active
+            .pings
+            .poll_due(cx, tx_bytes, cap, blocked)
+            .is_pending()
+        {
+            return false;
+        }
+        active.pings.sent(tx_bytes);
+        if let Some(dc) = &mut global.dc {
+            dc.take_ping_wanted();
+        }
+        true
+    }
+
     fn make_outbound_progress(
         &mut self,
         cx: &mut Context<'_>,
@@ -295,14 +350,11 @@ where
             // 4. stream data.
             // What goes first cannot wait behind what goes later,
             // but it rides along if the later frame is going out anyway.
-            let mut frame = OutFrame::default();
-            let tx_bytes = active.selector.strategy().tx_bytes;
-
-            frame.pong = active.pong.take();
-            if active.pings.poll_due(cx, tx_bytes).is_ready() {
-                active.pings.sent(tx_bytes);
-                frame.ping = true;
-            }
+            let mut frame = OutFrame {
+                pong: active.pong.take(),
+                ping: Self::poll_ping(active, cx),
+                ..Default::default()
+            };
 
             let mut finished = None;
             if let Poll::Ready(Some((update, fin_state))) = active.selector.poll_next_unpin(cx) {
@@ -310,12 +362,41 @@ where
                 frame.stream = Some(update.into());
             }
 
+            if !frame.ping {
+                // The streams may have found the window in the way, which makes a PING due.
+                frame.ping = Self::poll_ping(active, cx);
+            }
             if frame.is_empty() {
+                // The pacer kept a frame back: wake the streams when it has room for it.
+                let global = active.selector.strategy_mut();
+                if let Some(deadline) = global
+                    .dc
+                    .as_mut()
+                    .and_then(DelayControl::take_pace_deadline)
+                {
+                    active.pacer.as_mut().reset(deadline);
+                    active.pacer_deadline = deadline;
+                    active.pacer_armed = true;
+                }
+                if active.pacer_armed && active.pacer.as_mut().poll(cx).is_ready() {
+                    active.pacer_armed = false;
+                    let global = active.selector.strategy_mut();
+                    if let Some(dc) = &mut global.dc {
+                        dc.note_timer(active.pacer_deadline, tokio::time::Instant::now());
+                    }
+                    global.wake_front(None);
+                    continue;
+                }
                 let _ = active.codec.poll_flush_unpin(cx)?;
                 break Poll::Pending;
             }
 
             let global = active.selector.strategy_mut();
+            if let Some(dc) = &mut global.dc
+                && frame.data_len() > 0
+            {
+                dc.on_sent(tokio::time::Instant::now(), frame.data_len() as u64);
+            }
             global.tx_bytes = global.tx_bytes.wrapping_add(
                 u32::try_from(frame.data_len()).expect("a frame carries at most u16::MAX bytes"),
             );
@@ -422,6 +503,11 @@ where
             return RammuxStats::default();
         };
         let global = active.selector.strategy();
+        let delay = global
+            .dc
+            .as_ref()
+            .map(|dc| dc.stats(tokio::time::Instant::now(), global.tx_bytes))
+            .unwrap_or_default();
         RammuxStats {
             inbound_streams: u32::try_from(active.streams.inbound.len())
                 .expect("we can't have more than u32 inbound streams"),
@@ -433,6 +519,14 @@ where
             turn_queue_len: u32::try_from(global.turns_len()).expect(
                 "at most one queue entry per stream, and there are fewer than u32::MAX streams",
             ),
+            q_fwd: delay.q_fwd,
+            q_back: delay.q_back,
+            own: delay.own,
+            rate: delay.rate,
+            fwd_in_flight: delay.fwd_in_flight,
+            window: delay.window,
+            rebaselines_fwd: delay.rebaselines_fwd,
+            rebaselines_back: delay.rebaselines_back,
         }
     }
 }
@@ -477,6 +571,22 @@ pub struct RammuxStats {
     pub pool_rx_used: u64,
     /// Count of streams waiting for their turn to use the shared pool.
     pub turn_queue_len: u32,
+    /// The queue on our forward path, from the one-way delay of `PING`s. Only with `DelayControl`.
+    pub q_fwd: Duration,
+    /// How long the reports of the peer currently wait on their way back to us. `DelayControl`.
+    pub q_back: Duration,
+    /// Bytes of ours in the queue of the bottleneck, `rate * q_fwd`. `DelayControl`.
+    pub own: u64,
+    /// The delivery rate, in bytes per second, from the bytes the peer reports. `DelayControl`.
+    pub rate: f64,
+    /// Bytes on the forward path, as the connection window counts them. `DelayControl`.
+    pub fwd_in_flight: u64,
+    /// The connection window, in bytes. `DelayControl`.
+    pub window: u64,
+    /// How many times the base delay of the forward path was raised. `DelayControl`.
+    pub rebaselines_fwd: u64,
+    /// How many times the base delay of the way back was raised. `DelayControl`.
+    pub rebaselines_back: u64,
 }
 
 #[cfg(test)]

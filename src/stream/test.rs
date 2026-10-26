@@ -10,7 +10,7 @@ use futures::{FutureExt, SinkExt, StreamExt};
 use crate::{
     StreamId,
     buffer::Data,
-    config::RammuxConfig,
+    config::{RammuxConfig, TransitControl},
     global_pool::GlobalPool,
     header::ControlFlags,
     stream::{FinState, RammuxDuplex, handle::StreamHandle, updates::StreamUpdates},
@@ -24,7 +24,9 @@ const CONFIG: RammuxConfig = RammuxConfig {
     remote_recv_window: NonZeroU32::new(14).unwrap(),
     local_recv_pool: 32,
     remote_recv_pool: 32,
+    transit_control: TransitControl::Bufferbloat,
     ping_bytes: NonZeroU32::new(32).unwrap(),
+    queue_target_bytes: NonZeroU32::new(64).unwrap(),
     ping_interval: Duration::from_secs(1),
     inbound_frame_timeout: Duration::from_secs(1),
 };

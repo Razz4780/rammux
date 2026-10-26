@@ -13,6 +13,9 @@ use tokio::time::Instant;
 #[derive(Clone, Copy, Debug)]
 pub struct Clock {
     epoch: Instant,
+    /// How much faster this clock runs than time, in parts per million. Tests only.
+    #[cfg(test)]
+    skew_ppm: i64,
 }
 
 impl Clock {
@@ -20,12 +23,25 @@ impl Clock {
     pub fn new() -> Self {
         Self {
             epoch: Instant::now(),
+            #[cfg(test)]
+            skew_ppm: 0,
+        }
+    }
+
+    /// A clock that runs fast (positive `ppm`) or slow, like the crystal of another machine.
+    #[cfg(test)]
+    pub fn skewed(ppm: i64) -> Self {
+        Self {
+            skew_ppm: ppm,
+            ..Self::new()
         }
     }
 
     /// Returns the timestamp of the given instant.
     pub fn micros(&self, at: Instant) -> u32 {
         let micros = at.saturating_duration_since(self.epoch).as_micros();
+        #[cfg(test)]
+        let micros = micros * u128::try_from(1_000_000 + self.skew_ppm).unwrap() / 1_000_000;
         // Truncation to 32 bits is the point of the wire clock.
         u32::try_from(micros & u128::from(u32::MAX)).unwrap_or(0)
     }

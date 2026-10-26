@@ -275,7 +275,7 @@ impl OutboundTraffic {
 
     /// Takes the stream out of the turn queue. The stream is gone.
     pub fn leave_turns(&mut self, global: &mut GlobalPool, me: &StreamRef) {
-        if self.ledger.leave_turns(global, me) && global.room_left() {
+        if self.ledger.leave_turns(global, me) && global.room_left(Instant::now()) {
             global.wake_front(None);
         }
     }
@@ -347,9 +347,32 @@ impl Ledger {
 
         let base_room = self.base_window.saturating_sub(self.unacked);
         let full = self.frame_limit.min(waiting);
+        let has_turn = ctx.global.has_turn(ctx.me);
+        // The connection window of DelayControl applies to every byte, and needs the turn.
+        let window_room = ctx.global.window_room(ctx.now);
+        let conn_room = match window_room {
+            None => u64::MAX,
+            Some(room) if has_turn => room,
+            Some(_) => 0,
+        };
+
         if base_room >= full {
-            self.sent(ctx.global, full);
-            return Some(len(full));
+            // A frame within the base window does not wait for the turn: the turns share the window
+            // between streams that borrow, and a stream within its base window is a sparse flow
+            // (fq_codel's idea), at most a base window per round trip. If the window has no room,
+            // it waits at the front of the queue. The window never splits a frame (see `fits`).
+            let n = fits(full, window_room.unwrap_or(u64::MAX));
+            if n == 0 {
+                self.note_window_limit(ctx, window_room, full);
+                self.join_turns_front(ctx);
+                return None;
+            }
+            self.note_window_limit(ctx, window_room, full);
+            self.sent(ctx.global, n);
+            if window_room.is_some() && self.queued {
+                self.after_turn(ctx, waiting, n);
+            }
+            return Some(len(n));
         }
 
         let borrowed = transit::borrowed(self.unacked, self.base_window);
@@ -362,14 +385,20 @@ impl Ledger {
         // Whole bytes of the allowance that are not borrowed yet.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let borrow_allow = (allowance - borrowed as f64).max(0.0) as u64;
-        let shared = if ctx.global.has_turn(ctx.me) {
+        let shared = if has_turn {
             borrow_allow.min(ctx.global.pool_room())
         } else {
             0
         };
-        let n = full.min(base_room + shared);
+        // What the stream could send, if not for the connection window.
+        let wanted = full.min(base_room + shared);
+        let n = fits(wanted, conn_room);
+        self.note_window_limit(ctx, window_room, wanted);
         if n == 0 {
-            if borrow_allow == 0 {
+            if wanted > 0 {
+                // The window or the turn is what stops it.
+                self.join_turns(ctx);
+            } else if borrow_allow == 0 {
                 self.pass_turn(ctx);
             } else {
                 self.join_turns(ctx);
@@ -378,23 +407,45 @@ impl Ledger {
         }
 
         self.sent(ctx.global, n);
-        if n > base_room {
-            self.leave_turns(ctx.global, ctx.me);
-            if waiting > n {
-                self.join_turns(ctx);
-            }
-            if ctx.global.room_left() {
-                ctx.global.wake_front(Some((ctx.me, &mut *ctx.poller)));
-            }
+        if n > base_room || (window_room.is_some() && self.queued) {
+            self.after_turn(ctx, waiting, n);
         }
         Some(len(n))
     }
 
-    /// Gives the turn away, if the stream waits for it.
-    fn pass_turn(&mut self, ctx: &mut Ctx<'_>) {
-        if self.leave_turns(ctx.global, ctx.me) && ctx.global.room_left() {
+    /// The stream sent `n` of its `waiting` bytes in its turn: it gives the turn away,
+    /// takes another one if it has more to send, and wakes the next stream while there is room.
+    fn after_turn(&mut self, ctx: &mut Ctx<'_>, waiting: u64, n: u64) {
+        self.leave_turns(ctx.global, ctx.me);
+        if waiting > n {
+            self.join_turns(ctx);
+        }
+        if ctx.global.room_left(ctx.now) {
             ctx.global.wake_front(Some((ctx.me, &mut *ctx.poller)));
         }
+    }
+
+    /// Tells the window that it kept `wanted` bytes from being sent, if it did.
+    fn note_window_limit(&self, ctx: &mut Ctx<'_>, window_room: Option<u64>, wanted: u64) {
+        if window_room.is_some_and(|room| room < wanted) {
+            ctx.global.note_window_limit(ctx.now, wanted);
+        }
+    }
+
+    /// Gives the turn away, if the stream waits for it.
+    fn pass_turn(&mut self, ctx: &mut Ctx<'_>) {
+        if self.leave_turns(ctx.global, ctx.me) && ctx.global.room_left(ctx.now) {
+            ctx.global.wake_front(Some((ctx.me, &mut *ctx.poller)));
+        }
+    }
+
+    /// Puts the stream at the front of the queue, or moves it there.
+    fn join_turns_front(&mut self, ctx: &mut Ctx<'_>) {
+        if self.queued {
+            ctx.global.leave_turns(ctx.me);
+        }
+        self.queued = true;
+        ctx.global.join_turns_front(ctx.me);
     }
 
     fn join_turns(&mut self, ctx: &mut Ctx<'_>) {
@@ -445,4 +496,16 @@ enum OutboundState {
     },
     /// One of the sides closed and there's no pending data.
     Closed { fin_state: FinState },
+}
+
+/// What the connection window lets a stream send of the `wanted` bytes: all of them, or nothing.
+///
+/// Silly window avoidance (RFC 813, RFC 1122 4.2.3.4). Room in the window opens a few bytes at a
+/// time, with every delivery report. A sender that fills every opening sends a frame per report,
+/// and with a `PING` on every frame that is blocked (`TRANSIT_CONTROL.md`) also a report per
+/// frame: frames of a few bytes, hundreds of thousands per second, whose headers and reports
+/// fill the link. Waiting for the whole frame cannot block for good: `wanted` is at most
+/// `frame_limit`, and so is the floor of the window, so a drained window always has room for it.
+fn fits(wanted: u64, conn_room: u64) -> u64 {
+    if conn_room >= wanted { wanted } else { 0 }
 }

@@ -1,6 +1,9 @@
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
+use tokio::time::Instant;
+
 use crate::{
+    delay::{DelayControl, PongSample},
     stream::{StreamRef, waker::WakerSlot},
     transit::{ALLOWANCE_RTTS, SRTT_GAIN, SRTT_MIN},
 };
@@ -35,6 +38,8 @@ pub struct GlobalPool {
     ///
     /// Each queued stream has its `queued` flag set.
     turns: VecDeque<StreamRef>,
+    /// The connection window, with `TransitControl::DelayControl`.
+    pub dc: Option<DelayControl>,
 }
 
 impl GlobalPool {
@@ -44,6 +49,42 @@ impl GlobalPool {
             rx_pool: u64::from(rx_pool),
             tx_pool: u64::from(tx_pool),
             ..Default::default()
+        }
+    }
+
+    /// Turns on the connection window of `TransitControl::DelayControl`.
+    pub fn with_delay_control(mut self, dc: DelayControl) -> Self {
+        self.dc = Some(dc);
+        self
+    }
+
+    /// Takes a `PONG` into account: the round trip time, and the window.
+    pub fn on_pong(&mut self, pong: PongSample, rtt: Duration) {
+        self.observe_rtt(rtt);
+        if let (Some(dc), Some(srtt)) = (&mut self.dc, self.srtt) {
+            dc.on_pong(pong, srtt, self.tx_bytes);
+        }
+    }
+
+    /// The room in the connection window, [`None`] if there is no window.
+    ///
+    /// It includes the pacer: what the window allows and the pacer has released.
+    pub fn window_room(&self, now: Instant) -> Option<u64> {
+        self.dc
+            .as_ref()
+            .map(|dc| dc.room(now, self.tx_bytes).min(dc.pace_room(now)))
+    }
+
+    /// Tells the window or the pacer that it kept `wanted` bytes from being sent.
+    /// Only the window counts as limiting for the growth of `W`.
+    pub fn note_window_limit(&mut self, now: Instant, wanted: u64) {
+        let tx_bytes = self.tx_bytes;
+        if let Some(dc) = &mut self.dc {
+            if dc.room(now, tx_bytes) < wanted {
+                dc.note_limited(now);
+            } else if dc.pace_room(now) < wanted {
+                dc.note_paced(now, wanted);
+            }
         }
     }
 
@@ -81,9 +122,9 @@ impl GlobalPool {
         self.tx_pool.saturating_sub(self.tx_used)
     }
 
-    /// Returns whether there is room in the peer's pool.
-    pub fn room_left(&self) -> bool {
-        self.pool_room() > 0
+    /// Returns whether there is room in the peer's pool and in the connection window.
+    pub fn room_left(&self, now: Instant) -> bool {
+        self.pool_room() > 0 && self.window_room(now).is_none_or(|room| room > 0)
     }
 
     /// Returns the number of streams waiting for their turn.
@@ -108,6 +149,11 @@ impl GlobalPool {
     /// Puts the stream at the back of the queue. The stream must not be in it.
     pub fn join_turns(&mut self, me: &StreamRef) {
         self.turns.push_back(me.clone());
+    }
+
+    /// Puts the stream at the front of the queue. The stream must not be in it.
+    pub fn join_turns_front(&mut self, me: &StreamRef) {
+        self.turns.push_front(me.clone());
     }
 
     /// Removes the stream from the queue, wherever it is. Does nothing if it is not in it.

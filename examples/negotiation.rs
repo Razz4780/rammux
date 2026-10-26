@@ -66,6 +66,7 @@ async fn negotiate_rammux(role: RammuxRole, mut io: DuplexStream, mut config: Ra
     config.remote_recv_window =
         NonZeroU32::new(peer_config.recv_window).expect("received non-positive window");
     config.remote_recv_pool = peer_config.recv_pool;
+    // `transit_control` and `queue_target_bytes` are local knobs: nothing to agree on.
     println!("[{role}] Negotiated final config: {config:?}");
 
     let rammux = RammuxConnection::new(role, io, config).expect("config is valid");

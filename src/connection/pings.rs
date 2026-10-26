@@ -36,9 +36,20 @@ impl PingSchedule {
     /// Polls until a `PING` should be sent.
     ///
     /// `tx_bytes` is the counter of `DATA` bytes written so far.
+    /// `ping_bytes_cap` lowers the number of bytes that trigger a `PING` (the window of
+    /// `DelayControl` needs samples more often than that when it is small).
+    /// `blocked` tells that the window keeps a frame from being sent: a `PING` is then due as
+    /// soon as any data was sent since the last one, as its answer may free the window.
     /// When this returns [`Poll::Ready`], the caller must send the `PING` and call [`Self::sent`].
-    pub fn poll_due(&mut self, cx: &mut Context<'_>, tx_bytes: u32) -> Poll<()> {
-        if tx_bytes.wrapping_sub(self.tx_bytes_at_ping) >= self.ping_bytes {
+    pub fn poll_due(
+        &mut self,
+        cx: &mut Context<'_>,
+        tx_bytes: u32,
+        ping_bytes_cap: u32,
+        blocked: bool,
+    ) -> Poll<()> {
+        let since = tx_bytes.wrapping_sub(self.tx_bytes_at_ping);
+        if since >= self.ping_bytes.min(ping_bytes_cap.max(1)) || (blocked && since > 0) {
             return Poll::Ready(());
         }
         self.sleep.poll_unpin(cx)
@@ -69,7 +80,7 @@ mod test {
             now + Duration::from_secs(5),
             now + Duration::from_secs(10),
         ] {
-            poll_fn(|cx| schedule.poll_due(cx, 0)).await;
+            poll_fn(|cx| schedule.poll_due(cx, 0, u32::MAX, false)).await;
             assert_eq!(Instant::now(), ready_at);
             schedule.sent(0);
         }
@@ -78,24 +89,54 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn pings_on_bytes() {
         let mut schedule = PingSchedule::new(Duration::from_secs(5), 1000);
-        poll_fn(|cx| schedule.poll_due(cx, 0)).await;
+        poll_fn(|cx| schedule.poll_due(cx, 0, u32::MAX, false)).await;
         schedule.sent(0);
 
         let now = Instant::now();
-        assert!(!poll_fn(|cx| std::task::Poll::Ready(schedule.poll_due(cx, 999).is_ready())).await);
-        poll_fn(|cx| schedule.poll_due(cx, 1000)).await;
+        assert!(
+            !poll_fn(|cx| std::task::Poll::Ready(
+                schedule.poll_due(cx, 999, u32::MAX, false).is_ready()
+            ))
+            .await
+        );
+        poll_fn(|cx| schedule.poll_due(cx, 1000, u32::MAX, false)).await;
         assert_eq!(Instant::now(), now);
         schedule.sent(1000);
 
         // The counter wraps.
         schedule.sent(u32::MAX - 10);
-        assert!(!poll_fn(|cx| std::task::Poll::Ready(schedule.poll_due(cx, 500).is_ready())).await);
-        poll_fn(|cx| schedule.poll_due(cx, 989)).await;
+        assert!(
+            !poll_fn(|cx| std::task::Poll::Ready(
+                schedule.poll_due(cx, 500, u32::MAX, false).is_ready()
+            ))
+            .await
+        );
+        poll_fn(|cx| schedule.poll_due(cx, 989, u32::MAX, false)).await;
         assert_eq!(Instant::now(), now);
 
         // Sending a ping postpones the next one on the clock.
         schedule.sent(989);
-        poll_fn(|cx| schedule.poll_due(cx, 989)).await;
+        poll_fn(|cx| schedule.poll_due(cx, 989, u32::MAX, false)).await;
         assert_eq!(Instant::now(), now + Duration::from_secs(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pings_on_a_smaller_window_and_when_blocked() {
+        let ready = |schedule: &mut PingSchedule, tx, cap, blocked| {
+            futures::FutureExt::now_or_never(poll_fn(|cx| schedule.poll_due(cx, tx, cap, blocked)))
+                .is_some()
+        };
+        let mut schedule = PingSchedule::new(Duration::from_secs(5), 1000);
+        poll_fn(|cx| schedule.poll_due(cx, 0, u32::MAX, false)).await;
+        schedule.sent(0);
+
+        // A cap lowers the bytes that make a PING due.
+        assert!(!ready(&mut schedule, 300, u32::MAX, false));
+        assert!(ready(&mut schedule, 300, 250, false));
+        assert!(!ready(&mut schedule, 200, 250, false));
+        // Blocked: due as soon as some data was sent since the last PING, and not before.
+        assert!(!ready(&mut schedule, 0, u32::MAX, true));
+        assert!(ready(&mut schedule, 1, u32::MAX, true));
+        assert!(!ready(&mut schedule, 1, u32::MAX, false));
     }
 }

@@ -30,6 +30,29 @@ impl fmt::Display for RammuxRole {
     }
 }
 
+/// How a connection decides how much data it puts on the path.
+///
+/// This is a local choice: the receiving side behaves the same in both modes, so the peers need
+/// not agree on it. See `TRANSIT_CONTROL.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum TransitControl {
+    /// Streams are limited by their base windows and by their share of the receive pool,
+    /// which each stream may use in proportion to the rate its reader has proven.
+    /// The connection fills the pool when the application sends enough data.
+    /// This is what autotuning multiplexers (yamux, HTTP/2 stacks) do.
+    Bufferbloat,
+    /// On top of the rules of `Bufferbloat`, a connection-wide window on the bytes on the
+    /// forward path keeps the queue of the connection near [`RammuxConfig::queue_target_bytes`]
+    /// (the idea of Copa), from the one-way delay of `PING`s. Connections of ours that share a
+    /// bottleneck share it equally, and the queue stays short. The window does not compete with
+    /// buffer-filling traffic such as CUBIC: against it, the connection yields most of the link.
+    ///
+    /// The pool of the receiver is only a memory limit then, and
+    /// must hold what the path needs in flight, or it limits the throughput first.
+    DelayControl,
+}
+
 /// Configuration for a [`RammuxConnection`](crate::connection::RammuxConnection).
 ///
 /// rammux does not define an in-band handshake for transport parameters.
@@ -93,8 +116,8 @@ pub struct RammuxConfig {
     /// The pool is the responsibility of the user, rammux uses the configured value as it is.
     /// Any size works, 0 included (streams run on their base windows). A pool or a window smaller than
     /// [`Self::frame_limit`] is used with smaller frames.
-    /// The pool bounds the queue that the connection can build on the path, at about
-    /// `(streams * window + pool) / bandwidth`.
+    /// With [`TransitControl::Bufferbloat`], the pool bounds the queue that
+    /// the connection can build on the path, at about `(streams * window + pool) / bandwidth`.
     ///
     /// # Negotiation
     ///
@@ -108,6 +131,12 @@ pub struct RammuxConfig {
     /// This value has to be negotiated beforehand and
     /// must match the peer's [`RammuxConfig::local_recv_pool`].
     pub remote_recv_pool: u32,
+    /// How the connection controls the amount of data in transit.
+    ///
+    /// This value is a local knob and does not have to be negotiated: it only decides what our
+    /// sender may put on the path. The receiver grants the same windows and answers `PING`s the
+    /// same way in both modes.
+    pub transit_control: TransitControl,
     /// A `PING` is sent when this much `DATA` was written since the last one.
     ///
     /// The latest `PING` read is answered with a `PONG`, which gives the peer a round trip time sample.
@@ -115,6 +144,20 @@ pub struct RammuxConfig {
     ///
     /// This value is a local knob and does not have to be negotiated.
     pub ping_bytes: NonZeroU32,
+    /// The bytes that a connection with [`TransitControl::DelayControl`] keeps queued in the
+    /// bottleneck, `alpha` in `TRANSIT_CONTROL.md`.
+    ///
+    /// The connection adjusts its window to hold this much in the queue, so a path with the
+    /// capacity `C` gets a queue of `alpha / C` per connection of ours (3.5 ms at 150 Mbit/s,
+    /// 52 ms at 10 Mbit/s for the default). Connections that share a bottleneck share it equally
+    /// whatever their round trip time. Larger values keep the links of the path fed better and
+    /// make the queue longer.
+    ///
+    /// Ignored with [`TransitControl::Bufferbloat`]. With [`TransitControl::DelayControl`] it must
+    /// not be smaller than [`RammuxConfig::frame_limit`]: a frame that large must fit into the
+    /// standing queue the window aims for. This value is a local knob and does not have to be
+    /// negotiated.
+    pub queue_target_bytes: NonZeroU32,
     /// A `PING` is sent when this much time passed since the last one, no matter how much data was written.
     ///
     /// This keeps an idle connection alive (see [`RammuxConfig::inbound_frame_timeout`]),
@@ -141,10 +184,11 @@ impl RammuxConfig {
     /// 1. [`Self::frame_limit`] - 16 KiB
     /// 2. [`Self::max_inbound_streams`] and [`Self::max_outbound_streams`] - 128
     /// 3. [`Self::local_recv_window`] and [`Self::remote_recv_window`] - 64 KiB
-    /// 4. [`Self::ping_bytes`] - 32 KiB
+    /// 4. [`Self::ping_bytes`] - 32 KiB, [`Self::queue_target_bytes`] - 64 KiB
     /// 5. [`Self::ping_interval`] - 5s
     /// 6. [`Self::inbound_frame_timeout`] - 10s
     /// 7. [`Self::local_recv_pool`] and [`Self::remote_recv_pool`] - 4 MiB
+    /// 8. [`Self::transit_control`] - [`TransitControl::Bufferbloat`]
     pub const fn new() -> Self {
         Self {
             frame_limit: NonZeroU16::new(16 * 1024).unwrap(),
@@ -154,7 +198,9 @@ impl RammuxConfig {
             remote_recv_window: NonZeroU32::new(64 * 1024).unwrap(),
             local_recv_pool: 4 * 1024 * 1024,
             remote_recv_pool: 4 * 1024 * 1024,
+            transit_control: TransitControl::Bufferbloat,
             ping_bytes: NonZeroU32::new(32 * 1024).unwrap(),
+            queue_target_bytes: NonZeroU32::new(64 * 1024).unwrap(),
             ping_interval: Duration::from_secs(5),
             inbound_frame_timeout: Duration::from_secs(10),
         }
@@ -185,6 +231,14 @@ impl RammuxConfig {
             return Err(ConfigError::PingIntervalTooLong {
                 ping_interval: self.ping_interval,
                 inbound_frame_timeout: self.inbound_frame_timeout,
+            });
+        }
+        if self.transit_control == TransitControl::DelayControl
+            && self.queue_target_bytes.get() < u32::from(self.frame_limit.get())
+        {
+            return Err(ConfigError::QueueTargetBelowFrameLimit {
+                queue_target_bytes: self.queue_target_bytes.get(),
+                frame_limit: self.frame_limit.get(),
             });
         }
         Ok(())
@@ -221,6 +275,16 @@ pub enum ConfigError {
         /// Configured timeout.
         inbound_frame_timeout: Duration,
     },
+    /// With `DelayControl`, `queue_target_bytes` is smaller than `frame_limit`.
+    #[error(
+        "queue_target_bytes ({queue_target_bytes}) must not be smaller than frame_limit ({frame_limit})"
+    )]
+    QueueTargetBelowFrameLimit {
+        /// Configured queue target.
+        queue_target_bytes: u32,
+        /// Configured frame limit.
+        frame_limit: u16,
+    },
 }
 
 impl Default for RammuxConfig {
@@ -231,9 +295,12 @@ impl Default for RammuxConfig {
 
 #[cfg(test)]
 mod test {
-    use std::time::Duration;
+    use std::{
+        num::{NonZeroU16, NonZeroU32},
+        time::Duration,
+    };
 
-    use crate::config::{ConfigError, MAX_STREAMS_PER_SIDE, RammuxConfig};
+    use crate::config::{ConfigError, MAX_STREAMS_PER_SIDE, RammuxConfig, TransitControl};
 
     #[test]
     fn default_is_valid() {
@@ -265,6 +332,34 @@ mod test {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn delay_control_is_valid() {
+        let mut config = RammuxConfig::new();
+        config.transit_control = TransitControl::DelayControl;
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn delay_control_queue_target_holds_a_frame() {
+        let mut config = RammuxConfig::new();
+        config.transit_control = TransitControl::DelayControl;
+        config.frame_limit = NonZeroU16::new(4096).unwrap();
+        config.queue_target_bytes = NonZeroU32::new(4095).unwrap();
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::QueueTargetBelowFrameLimit {
+                queue_target_bytes: 4095,
+                frame_limit: 4096
+            })
+        ));
+        config.queue_target_bytes = NonZeroU32::new(4096).unwrap();
+        config.validate().unwrap();
+        // The target is ignored without DelayControl.
+        config.queue_target_bytes = NonZeroU32::new(1).unwrap();
+        config.transit_control = TransitControl::Bufferbloat;
+        config.validate().unwrap();
     }
 
     #[test]

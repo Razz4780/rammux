@@ -22,7 +22,8 @@ use tokio::time::Instant;
 use crate::{
     StreamId,
     buffer::Data,
-    config::RammuxConfig,
+    config::{RammuxConfig, TransitControl},
+    delay::{DelayControl, PongSample},
     global_pool::GlobalPool,
     stream::{RammuxDuplex, StreamRef, handle::StreamHandle, updates::StreamUpdates},
 };
@@ -35,7 +36,9 @@ const CONFIG: RammuxConfig = RammuxConfig {
     remote_recv_window: NonZeroU32::new(16).unwrap(),
     local_recv_pool: 1 << 20,
     remote_recv_pool: 8,
+    transit_control: TransitControl::Bufferbloat,
     ping_bytes: NonZeroU32::new(32).unwrap(),
+    queue_target_bytes: NonZeroU32::new(64).unwrap(),
     ping_interval: Duration::from_secs(1),
     inbound_frame_timeout: Duration::from_secs(2),
 };
@@ -73,6 +76,34 @@ impl Bed {
             selector: Selector::new(global),
             streams: Vec::new(),
         }
+    }
+
+    /// Like [`Self::new`], with the connection window of DelayControl: `alpha` is 100 bytes.
+    fn new_dc(tx_pool: u32) -> Self {
+        let mut bed = Self::new(tx_pool);
+        let dc = DelayControl::new(100, CONFIG.frame_limit.get());
+        let global = std::mem::take(bed.selector.strategy_mut());
+        *bed.selector.strategy_mut() = global.with_delay_control(dc);
+        bed
+    }
+
+    /// The first `PONG` of the connection: the peer had received `rx_bytes`.
+    /// The path is idle, 100 ms there and back.
+    fn pong(&mut self, rx_bytes: u32) {
+        let now = Instant::now();
+        let global = self.selector.strategy_mut();
+        let rtt = Duration::from_millis(100);
+        global.on_pong(
+            PongSample {
+                now,
+                now_us: 1_000_000,
+                t_echo: 1_000_000 - 100_000,
+                t_read: 1_000_000 - 50_000,
+                rx_bytes,
+            },
+            rtt,
+        );
+        global.wake_front(None);
     }
 
     /// Adds a stream, returns its index.
@@ -145,6 +176,9 @@ impl Bed {
             flag.0.store(false, Ordering::SeqCst);
             match self.selector.poll_next_unpin(&mut cx) {
                 Poll::Ready(Some((update, _))) => {
+                    let sent = u32::try_from(update.data.len()).unwrap();
+                    let global = self.selector.strategy_mut();
+                    global.tx_bytes = global.tx_bytes.wrapping_add(sent);
                     let n = self
                         .streams
                         .iter()
@@ -538,4 +572,98 @@ async fn a_base_window_smaller_than_a_frame_works() {
         .unwrap();
     let (update, _) = selector.next().await.unwrap();
     assert_eq!(update.data.len(), 5);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_connection_window_caps_every_byte_and_needs_the_turn() {
+    // The window starts at 4 frames: 32 bytes. Pool and allowance are no limit.
+    let mut bed = Bed::new_dc(1000);
+    let [x, y] = [bed.add(), bed.add()];
+    bed.prime(x, 1000);
+    bed.prime(y, 1000);
+    bed.write(x, 100);
+    bed.write(y, 100);
+    let sent = bed.drain();
+    // 32 bytes in flight at most, from the base windows too: four frames.
+    assert_eq!(sent.iter().map(|(_, n)| n).sum::<usize>(), 32, "{sent:?}");
+    // Both wait for room, in turns. The window is what stopped them.
+    assert_eq!(bed.queue().len(), 2);
+    assert!(bed.global().dc.as_ref().unwrap().peek_ping_wanted());
+
+    // The first PONG only sets the baseline of the delivery rate: the peer got 16 bytes, and 32 - 16
+    // bytes fit, in frames that go to the streams in turns.
+    bed.pong(16);
+    let sent = bed.drain();
+    assert_eq!(sent.iter().map(|(_, n)| n).sum::<usize>(), 16, "{sent:?}");
+    assert!(sent.windows(2).all(|w| w[0].0 != w[1].0), "{sent:?}");
+    // The second: the peer got 16 more, and the window, which limited sending, grows by its share
+    // of `g` (startup is the growth `g = alpha = 100`): 16 / 32 of it. 32 + 50 - 16 bytes fit.
+    bed.pong(32);
+    let sent = bed.drain();
+    assert_eq!(sent.iter().map(|(_, n)| n).sum::<usize>(), 64, "{sent:?}");
+    assert!(sent.windows(2).all(|w| w[0].0 != w[1].0), "{sent:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_window_does_not_stop_a_stream_that_has_nothing_to_send() {
+    let mut bed = Bed::new_dc(1000);
+    let x = bed.add();
+    bed.write(x, 8);
+    assert_eq!(bed.drain(), [(x, 8)]);
+    assert!(bed.queue().is_empty());
+    assert!(!bed.global().dc.as_ref().unwrap().peek_ping_wanted());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stream_in_its_base_window_still_waits_for_the_window() {
+    let mut bed = Bed::new_dc(0);
+    let x = bed.add();
+    // The base window is 16, but the window is 32: with 16 in flight from y, x gets the rest only.
+    let y = bed.add();
+    bed.write(y, 16);
+    bed.write(x, 24);
+    let sent = bed.drain_grouped();
+    assert_eq!(sent.iter().map(|(_, n)| n).sum::<usize>(), 32, "{sent:?}");
+    assert_eq!(sent.last().unwrap().0, y.max(x));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_window_never_splits_a_frame() {
+    // Silly window avoidance: a frame waits until the window has room for all of it.
+    let mut bed = Bed::new_dc(1000);
+    let x = bed.add();
+    bed.prime(x, 1000);
+    bed.write(x, 100);
+    // The window starts at 4 frames: 32 bytes.
+    assert_eq!(bed.drain(), [(x, 8); 4]);
+    // The peer got 3 bytes (the baseline of the rate): 3 bytes of room, which wait for more room
+    // instead of going as a frame.
+    bed.pong(3);
+    assert_eq!(bed.drain(), []);
+    // The peer got 4 more, and the window grows by its share of `g` (startup): 32 + 100 * 4 / 32 =
+    // 44 bytes, 44 - 25 = 19 bytes of room. Two whole frames fit; the 3 bytes left wait for more
+    // room instead of going as a frame.
+    bed.pong(7);
+    assert_eq!(bed.drain(), [(x, 8); 2]);
+    assert_eq!(bed.queue(), [x]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stream_within_its_base_window_goes_before_the_streams_that_borrow() {
+    // Sparse flows: x borrows from the pool and waits for the window; y writes a little, within
+    // its base window, and goes first when the window has room.
+    let mut bed = Bed::new_dc(1000);
+    let [x, y] = [bed.add(), bed.add()];
+    bed.prime(x, 1000);
+    bed.write(x, 100);
+    // The window starts at 4 frames: 32 bytes.
+    assert_eq!(bed.drain(), [(x, 8); 4]);
+    assert_eq!(bed.queue(), [x]);
+    bed.write(y, 8);
+    assert_eq!(bed.drain(), []);
+    assert_eq!(bed.queue(), [y, x]);
+    // The peer got 32 bytes, and the window doubles (startup): y's frame goes first.
+    bed.pong(32);
+    let sent = bed.drain();
+    assert_eq!(sent.first(), Some(&(y, 8)), "{sent:?}");
 }
