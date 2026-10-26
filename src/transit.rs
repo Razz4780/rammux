@@ -88,7 +88,7 @@ mod test {
     use std::time::Duration;
 
     use crate::{
-        global_pool::GlobalPool,
+        conn_shared::ConnShared,
         transit::{RateEstimate, SRTT_MIN, borrowed, credit_threshold, rebalance},
     };
     use tokio::time::Instant;
@@ -176,7 +176,7 @@ mod test {
 
     #[test]
     fn srtt_is_an_ewma_and_never_zero() {
-        let mut global = GlobalPool::default();
+        let mut global = ConnShared::default();
         assert_eq!(global.srtt, None);
         global.observe_rtt(Duration::from_millis(80));
         assert_eq!(global.srtt, Some(Duration::from_millis(80)));

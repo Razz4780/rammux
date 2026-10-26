@@ -2,8 +2,8 @@ use std::task::{Poll, Waker};
 
 use crate::{
     buffer::{Data, DataList},
+    conn_shared::ConnShared,
     error::StreamError,
-    global_pool::GlobalPool,
     stream::{FinState, waker::WakerSlot},
     transit,
 };
@@ -51,7 +51,7 @@ impl InboundTraffic {
     /// Notes:
     /// 1. If `FIN_READ` has already been sent, this method will return [`Poll::Pending`].
     /// 2. This method is not responsible for registering the [`Waker`].
-    pub fn poll_update(&mut self, global: &mut GlobalPool) -> Poll<(u32, bool)> {
+    pub fn poll_update(&mut self, global: &mut ConnShared) -> Poll<(u32, bool)> {
         match &mut self.state {
             InboundState::Open { .. } | InboundState::HalfClosed { .. } => {
                 if self.credit < self.credit_threshold {
@@ -183,7 +183,7 @@ impl InboundTraffic {
     pub fn received_data(
         &mut self,
         data: Data,
-        global: &mut GlobalPool,
+        global: &mut ConnShared,
     ) -> Result<(), StreamError> {
         let len = data.as_ref().len() as u64;
         if len == 0 {
@@ -250,7 +250,7 @@ struct Unacked {
 
 impl Unacked {
     /// Accounts for received data, and checks that the sender stays within the pool.
-    fn count(&mut self, global: &mut GlobalPool, len: u64) -> Result<(), StreamError> {
+    fn count(&mut self, global: &mut ConnShared, len: u64) -> Result<(), StreamError> {
         self.set(global, self.bytes + len);
         if global.rx_used > global.rx_pool {
             return Err(StreamError("exceeded the receive pool"));
@@ -259,7 +259,7 @@ impl Unacked {
     }
 
     /// Sets the counter, and keeps the pool usage in sync.
-    fn set(&mut self, global: &mut GlobalPool, bytes: u64) {
+    fn set(&mut self, global: &mut ConnShared, bytes: u64) {
         let old = transit::borrowed(self.bytes, self.base_window);
         let new = transit::borrowed(bytes, self.base_window);
         transit::rebalance(&mut global.rx_used, old, new);

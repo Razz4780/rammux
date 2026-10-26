@@ -9,8 +9,8 @@ use bytes::Bytes;
 use tokio::time::Instant;
 
 use crate::{
+    conn_shared::ConnShared,
     error::StreamError,
-    global_pool::GlobalPool,
     stream::{FinState, StreamRef, waker::WakerSlot},
     transit::{self, RateEstimate},
 };
@@ -18,7 +18,7 @@ use crate::{
 /// What the sending direction of a stream needs from the rest of the connection.
 pub struct Ctx<'a> {
     /// State of the connection.
-    pub global: &'a mut GlobalPool,
+    pub global: &'a mut ConnShared,
     /// This stream, as the turn queue knows it.
     pub me: &'a StreamRef,
     /// Poller of this stream. The caller holds the lock of the stream.
@@ -271,7 +271,7 @@ impl OutboundTraffic {
     }
 
     /// Takes the stream out of the turn queue. The stream is gone.
-    pub fn leave_turns(&mut self, global: &mut GlobalPool, me: &StreamRef) {
+    pub fn leave_turns(&mut self, global: &mut ConnShared, me: &StreamRef) {
         if self.ledger.leave_turns(global, me) && global.room_left(Instant::now()) {
             global.wake_front(None);
         }
@@ -453,7 +453,7 @@ impl Ledger {
     }
 
     /// Returns whether the stream was in the queue.
-    fn leave_turns(&mut self, global: &mut GlobalPool, me: &StreamRef) -> bool {
+    fn leave_turns(&mut self, global: &mut ConnShared, me: &StreamRef) -> bool {
         let was_queued = std::mem::take(&mut self.queued);
         if was_queued {
             global.leave_turns(me);
@@ -461,7 +461,7 @@ impl Ledger {
         was_queued
     }
 
-    fn sent(&mut self, global: &mut GlobalPool, len: u64) {
+    fn sent(&mut self, global: &mut ConnShared, len: u64) {
         let unacked = self.unacked + len;
         self.set_unacked(global, unacked);
     }
@@ -469,7 +469,7 @@ impl Ledger {
     /// Sets the counter of bytes in flight, and keeps the usage of the pool in sync.
     ///
     /// Returns whether the stream gave some of the pool back.
-    fn set_unacked(&mut self, global: &mut GlobalPool, unacked: u64) -> bool {
+    fn set_unacked(&mut self, global: &mut ConnShared, unacked: u64) -> bool {
         let old = transit::borrowed(self.unacked, self.base_window);
         let new = transit::borrowed(unacked, self.base_window);
         transit::rebalance(&mut global.tx_used, old, new);

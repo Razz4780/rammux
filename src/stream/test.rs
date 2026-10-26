@@ -11,7 +11,7 @@ use crate::{
     StreamId,
     buffer::Data,
     config::{RammuxConfig, TransitControl},
-    global_pool::GlobalPool,
+    conn_shared::ConnShared,
     header::ControlFlags,
     stream::{FinState, RammuxDuplex, handle::StreamHandle, updates::StreamUpdates},
 };
@@ -32,10 +32,10 @@ const CONFIG: RammuxConfig = RammuxConfig {
 };
 
 fn new_stream(
-    global: GlobalPool,
+    global: ConnShared,
 ) -> (
     StreamHandle,
-    Selector<StreamUpdates, GlobalPool>,
+    Selector<StreamUpdates, ConnShared>,
     RammuxDuplex,
 ) {
     let (handle, updates, duplex) = super::new(StreamId::from_be_bytes([0, 0]), true, &CONFIG);
@@ -110,8 +110,8 @@ async fn rammux_stream_drop_closes_reading() {
     );
 }
 
-fn pool(rx_pool: u32) -> GlobalPool {
-    GlobalPool::new(rx_pool, 0)
+fn pool(rx_pool: u32) -> ConnShared {
+    ConnShared::new(rx_pool, 0)
 }
 
 fn bytes(n: usize) -> Data {
@@ -300,7 +300,7 @@ async fn remote_receive_window_is_respected() {
             Data::default(),
             false,
             false,
-            &mut GlobalPool::default(),
+            &mut ConnShared::default(),
         )
         .unwrap();
     let (update, fin_state) = selector.next().await.unwrap();
@@ -324,7 +324,7 @@ async fn fin_read_closes_writing() {
             Data::default(),
             false,
             true,
-            &mut GlobalPool::default(),
+            &mut ConnShared::default(),
         )
         .unwrap();
     duplex.send(Bytes::from_static(b"a")).await.unwrap_err();
@@ -339,7 +339,7 @@ async fn fin_write_closes_reading() {
             Data::default(),
             true,
             false,
-            &mut GlobalPool::default(),
+            &mut ConnShared::default(),
         )
         .unwrap();
     assert!(duplex.next().await.is_none());
@@ -355,7 +355,7 @@ async fn parts_of_a_frame_are_processed_in_protocol_order() {
             Data::copy_from_slice(b"a"),
             true,
             false,
-            &mut GlobalPool::default(),
+            &mut ConnShared::default(),
         )
         .unwrap();
     assert_eq!(duplex.next().await.unwrap(), Bytes::from_static(b"a"));

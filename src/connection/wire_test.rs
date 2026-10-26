@@ -105,7 +105,7 @@ impl Rig {
             .collect()
     }
 
-    fn global(&mut self) -> &mut crate::global_pool::GlobalPool {
+    fn global(&mut self) -> &mut crate::conn_shared::ConnShared {
         self.conn
             .state
             .active_mut()
@@ -339,14 +339,13 @@ async fn upload(rig: &mut Rig, chunks: usize, len: usize) -> Vec<InboundFrame> {
 
 #[tokio::test(start_paused = true)]
 async fn off_has_no_copa_like_machinery() {
-    // The cheapest observable proxy of "inert": no window in the pool, no pacer timer armed, frames
+    // The cheapest observable proxy of "inert": no window (and so no pacer) in the pool, frames
     // cut only by the frame limit, and PINGs exactly where the data and the clock put them.
     let mut rig = rig(RammuxRole::Client, config());
     let frames = upload(&mut rig, 20, 1024).await;
 
     let active = rig.conn.state.active().unwrap();
     assert!(active.selector.strategy().dc.is_none());
-    assert!(!active.pacer_armed);
 
     let sizes = frames
         .iter()

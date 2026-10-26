@@ -20,7 +20,7 @@ use crate::{
     StreamId,
     buffer::Data,
     config::{RammuxConfig, TransitControl},
-    global_pool::GlobalPool,
+    conn_shared::ConnShared,
     stream::{RammuxDuplex, handle::StreamHandle, updates::StreamUpdates},
 };
 
@@ -63,7 +63,7 @@ struct InFlight {
 
 /// One end of the link: streams with both directions.
 struct End {
-    selector: Selector<StreamUpdates, GlobalPool>,
+    selector: Selector<StreamUpdates, ConnShared>,
     handles: Vec<StreamHandle>,
     duplexes: Vec<RammuxDuplex>,
     ids: Vec<StreamId>,
@@ -72,7 +72,7 @@ struct End {
 
 impl End {
     fn new(initiator: bool) -> Self {
-        let mut global = GlobalPool::new(POOL, POOL);
+        let mut global = ConnShared::new(POOL, POOL);
         global.srtt = Some(Duration::from_millis(100));
         let mut end = Self {
             selector: Selector::new(global),

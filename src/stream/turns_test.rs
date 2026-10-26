@@ -23,8 +23,8 @@ use crate::{
     StreamId,
     buffer::Data,
     config::{RammuxConfig, TransitControl},
+    conn_shared::ConnShared,
     delay::{DelayControl, PongSample},
-    global_pool::GlobalPool,
     stream::{RammuxDuplex, StreamRef, handle::StreamHandle, updates::StreamUpdates},
 };
 
@@ -63,14 +63,14 @@ struct Strm {
 }
 
 struct Bed {
-    selector: Selector<StreamUpdates, GlobalPool>,
+    selector: Selector<StreamUpdates, ConnShared>,
     streams: Vec<Strm>,
 }
 
 impl Bed {
     /// Creates a bed where the peer's pool is `tx_pool` bytes.
     fn new(tx_pool: u32) -> Self {
-        let mut global = GlobalPool::new(1 << 20, tx_pool);
+        let mut global = ConnShared::new(1 << 20, tx_pool);
         global.srtt = Some(Duration::from_secs(1));
         Self {
             selector: Selector::new(global),
@@ -131,7 +131,7 @@ impl Bed {
         usize::from(n)
     }
 
-    fn global(&self) -> &GlobalPool {
+    fn global(&self) -> &ConnShared {
         self.selector.strategy()
     }
 
@@ -223,7 +223,7 @@ impl Bed {
 }
 
 /// The guard of the rule "free room never lets a stream skip the queue": it fails (and it is the only test
-/// that does) if `GlobalPool::has_turn` is forced to true. The equal-share sim tests do not tell,
+/// that does) if `ConnShared::has_turn` is forced to true. The equal-share sim tests do not tell,
 /// because the front is woken before the stream that got the credit, and no scenario with equal writes
 /// that was tried (staggered starts, throttled readers, flushed or not) separates them.
 #[tokio::test(start_paused = true)]
@@ -547,7 +547,7 @@ async fn a_base_window_smaller_than_a_frame_works() {
         remote_recv_window: NonZeroU32::new(5).unwrap(),
         ..CONFIG
     };
-    let mut global = GlobalPool::new(1 << 20, 0);
+    let mut global = ConnShared::new(1 << 20, 0);
     global.srtt = Some(Duration::from_secs(1));
     let mut selector = Selector::new(global);
     let (mut handle, updates, mut duplex) =

@@ -11,12 +11,13 @@
 //! room appears. Both end the same way, see [`DelayControl::on_pong`].
 //! Time is passed in as tokio `Instant`s and wire timestamps, so the whole thing can run on a paused clock.
 
-use std::{collections::VecDeque, time::Duration};
+use std::{collections::VecDeque, task::Context, time::Duration};
 
 use tokio::time::Instant;
 
 use crate::{
     clock::diff,
+    pacer::Pacer,
     transit::{RateEstimate, SRTT_MIN},
 };
 
@@ -44,12 +45,6 @@ const RATE_WARMUP_SRTT: u32 = 2;
 
 /// The pacing rate is this many windows per smoothed round trip, as in Copa.
 const PACING_GAIN: f64 = 2.0;
-
-/// The pacer lets out at least what it releases in this time at once, see [`DelayControl::pace_cap`].
-const PACING_BURST: Duration = Duration::from_millis(2);
-
-/// Weight of a new sample in the smoothed lateness of the timer of the pacer.
-const LATENESS_GAIN: f64 = 1.0 / 8.0;
 
 /// A sliding window minimum or maximum of wrapping timestamps, in O(1) per sample.
 ///
@@ -261,14 +256,8 @@ pub struct DelayControl {
     /// The newest raw `owd_out` samples, for the startup exit test.
     recent_out: VecDeque<u32>,
 
-    /// The pacer: bytes that may be sent now, as of `pace_at`. See [`Self::pace_room`].
-    pace_tokens: f64,
-    pace_at: Instant,
-    /// When the pacer will have room for the frame it kept back, if it kept one back.
-    pace_deadline: Option<Instant>,
-    /// How late the timer of the pacer wakes up, smoothed: about a millisecond on Linux, up to
-    /// 15.6 ms on Windows. A sender that is clocked by the timer sends one burst per wake-up.
-    timer_lateness: Duration,
+    /// The token bucket and the timer of the pacer, at the rate of [`Self::pace_rate`].
+    pacer: Pacer,
 }
 
 /// A snapshot of the measurements and the window of a connection with
@@ -320,10 +309,7 @@ impl DelayControl {
             q_back: 0,
             own: 0.0,
             recent_out: VecDeque::new(),
-            pace_tokens: f64::INFINITY,
-            pace_at: now,
-            pace_deadline: None,
-            timer_lateness: Duration::ZERO,
+            pacer: Pacer::new(now),
         }
     }
 
@@ -562,60 +548,25 @@ impl DelayControl {
         PACING_GAIN * self.window as f64 / self.srtt.as_secs_f64()
     }
 
-    /// The most the pacer lets out at once: two frames, and what it releases in the time the timer
-    /// needs to wake the sender, `PACING_BURST` at least. A sender that is woken every `t` can send
-    /// at most this much per wake-up, so with less the timer would cap the rate: with a burst
-    /// of 2 ms, a timer that wakes every 15.6 ms (Windows) would cap 150 Mbit/s at about 55.
-    fn pace_cap(&self) -> f64 {
-        let burst = PACING_BURST.max(self.timer_lateness);
-        (2 * self.frame_limit) as f64 + self.pace_rate() * burst.as_secs_f64()
-    }
-
-    /// Takes how late the timer of the pacer woke the sender: it was set for `deadline`.
-    ///
-    /// Limitation: the sample is the time from `deadline` to the moment the connection task noticed the
-    /// timer, which also includes delays that are not the timer's (a transport that was not writable,
-    /// a batch of inbound frames, an application that did not poll). One long delay of that kind raises
-    /// the smoothed lateness, and with it the pacer's burst, for many wake-ups. The burst only grows,
-    /// never shrinks the rate, and the lateness decays by a factor of 7/8 (`1 - LATENESS_GAIN`) per pacer
-    /// wake-up: about 16 wake-ups to fall to an eighth.
-    pub fn note_timer(&mut self, deadline: Instant, woke_at: Instant) {
-        let late = woke_at.saturating_duration_since(deadline).as_secs_f64();
-        let smoothed = self.timer_lateness.as_secs_f64();
-        self.timer_lateness =
-            Duration::from_secs_f64((smoothed + (late - smoothed) * LATENESS_GAIN).max(0.0));
-    }
-
-    /// The room the pacer leaves: bytes released at the pacing rate since the last send, up to
-    /// [`Self::pace_cap`].
-    ///
-    /// Without it, data leaves when delivery reports arrive. With bulk both ways the reports wait
-    /// behind the peer's data and arrive in clumps (ACK compression), so the window opens in
-    /// clumps and is sent in bursts at the speed of the local link. The bottleneck queues the burst,
-    /// then idles until the next clump: the link is idle half the time while it holds a queue.
+    /// The room the pacer leaves, see [`Pacer::room`].
     pub fn pace_room(&self, now: Instant) -> u64 {
-        let elapsed = now.saturating_duration_since(self.pace_at).as_secs_f64();
-        to_bytes((self.pace_tokens + self.pace_rate() * elapsed).min(self.pace_cap()))
+        self.pacer.room(now, self.pace_rate(), self.frame_limit)
     }
 
     /// Takes `n` bytes of DATA that were sent out of the pacer's room.
     pub fn on_sent(&mut self, now: Instant, n: u64) {
-        let elapsed = now.saturating_duration_since(self.pace_at).as_secs_f64();
-        let tokens = (self.pace_tokens + self.pace_rate() * elapsed).min(self.pace_cap());
-        self.pace_tokens = (tokens - n as f64).max(0.0);
-        self.pace_at = now;
+        self.pacer.take(now, n, self.pace_rate(), self.frame_limit);
     }
 
     /// Records that the pacer kept `wanted` bytes from being sent: they fit at the deadline.
     pub fn note_paced(&mut self, now: Instant, wanted: u64) {
-        let missing = wanted.saturating_sub(self.pace_room(now)) as f64;
-        let wait = Duration::from_secs_f64(missing / self.pace_rate()) + Duration::from_micros(1);
-        self.pace_deadline = Some(now + wait);
+        self.pacer
+            .hold(now, wanted, self.pace_rate(), self.frame_limit);
     }
 
-    /// Takes the time when the pacer has room for the frame it kept back.
-    pub fn take_pace_deadline(&mut self) -> Option<Instant> {
-        self.pace_deadline.take()
+    /// Arms the timer of the pacer if it kept a frame back, and polls it: [`true`] if it fired.
+    pub fn poll_pacer(&mut self, cx: &mut Context<'_>) -> bool {
+        self.pacer.poll_timer(cx)
     }
 
     /// Records that the window kept something from being sent.
@@ -683,7 +634,7 @@ impl DelayControl {
 }
 
 /// A non-negative number of bytes, rounded down.
-fn to_bytes(value: f64) -> u64 {
+pub(crate) fn to_bytes(value: f64) -> u64 {
     if value.is_nan() || value <= 0.0 {
         0
     } else {
@@ -925,9 +876,9 @@ mod test {
         assert_eq!(feed.dc.pace_room(now + ms(1000)), cap);
         // A frame that does not fit fits at the deadline.
         feed.dc.note_paced(now + ms(1), 30_000);
-        let deadline = feed.dc.take_pace_deadline().unwrap();
+        let deadline = feed.dc.pacer.take_wake().unwrap();
         assert!(deadline > now + ms(1) && feed.dc.pace_room(deadline) >= 30_000);
-        assert!(feed.dc.take_pace_deadline().is_none());
+        assert!(feed.dc.pacer.take_wake().is_none());
     }
 
     #[test]
@@ -939,13 +890,13 @@ mod test {
         let frames = 2 * u64::from(FRAME);
         // 20 MB/s. A timer that is a millisecond late changes nothing: the burst is 2 ms.
         for _ in 0..50 {
-            feed.dc.note_timer(now, now + ms(1));
+            feed.dc.pacer.note_timer(now, now + ms(1));
         }
         assert_eq!(feed.dc.pace_room(now + ms(1000)), frames + 40_000);
         // On Windows the timer is late by 16 ms, and so is the sender: the burst follows,
         // or the rate would be capped at about (2 frames + 40 kB) / 16 ms = 4.5 MB/s.
         for _ in 0..50 {
-            feed.dc.note_timer(now, now + ms(16));
+            feed.dc.pacer.note_timer(now, now + ms(16));
         }
         let room = feed.dc.pace_room(now + ms(1000));
         let expected = frames + 20_000 * 16;

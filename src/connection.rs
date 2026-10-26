@@ -21,13 +21,13 @@ use crate::{
         encoder::OutFrame,
     },
     config::{ConfigError, RammuxConfig, RammuxRole, TransitControl},
+    conn_shared::ConnShared,
     connection::{
         pings::PingSchedule,
         state::{Active, ConnState},
     },
     delay::{DelayControl, PongSample},
     error::{ErrorKind, RammuxError},
-    global_pool::GlobalPool,
     header::Pong,
     stream::RammuxDuplex,
     stream_id::StreamId,
@@ -113,7 +113,7 @@ where
         clock: Clock,
     ) -> Result<Self, ConfigError> {
         config.validate()?;
-        let mut global = GlobalPool::new(config.local_recv_pool, config.remote_recv_pool);
+        let mut global = ConnShared::new(config.local_recv_pool, config.remote_recv_pool);
         if config.transit_control == TransitControl::CopaLike {
             global = global.with_delay_control(DelayControl::new(
                 config.queue_target_bytes.get(),
@@ -133,9 +133,6 @@ where
                 pings: PingSchedule::new(config.ping_interval, config.ping_bytes.get()),
                 pong: None,
                 last_echo: None,
-                pacer: Box::pin(tokio::time::sleep(Duration::ZERO)),
-                pacer_armed: false,
-                pacer_deadline: tokio::time::Instant::now(),
                 clock,
             }),
             config,
@@ -378,21 +375,7 @@ where
             if frame.is_empty() {
                 // The pacer kept a frame back: wake the streams when it has room for it.
                 let global = active.selector.strategy_mut();
-                if let Some(deadline) = global
-                    .dc
-                    .as_mut()
-                    .and_then(DelayControl::take_pace_deadline)
-                {
-                    active.pacer.as_mut().reset(deadline);
-                    active.pacer_deadline = deadline;
-                    active.pacer_armed = true;
-                }
-                if active.pacer_armed && active.pacer.as_mut().poll(cx).is_ready() {
-                    active.pacer_armed = false;
-                    let global = active.selector.strategy_mut();
-                    if let Some(dc) = &mut global.dc {
-                        dc.note_timer(active.pacer_deadline, tokio::time::Instant::now());
-                    }
+                if global.dc.as_mut().is_some_and(|dc| dc.poll_pacer(cx)) {
                     global.wake_front(None);
                     continue;
                 }

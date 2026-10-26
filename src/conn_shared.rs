@@ -13,7 +13,7 @@ use crate::{
 /// It lives in the strategy of the stream selector, so every stream gets it when it is polled,
 /// and the connection gets it when it handles an inbound frame.
 #[derive(Default)]
-pub struct GlobalPool {
+pub struct ConnShared {
     /// Smoothed round-trip time of the connection, [`None`] before the first sample.
     ///
     /// Never zero, see [`SRTT_MIN`].
@@ -42,7 +42,7 @@ pub struct GlobalPool {
     pub dc: Option<DelayControl>,
 }
 
-impl GlobalPool {
+impl ConnShared {
     /// Creates the state of a new connection.
     pub fn new(rx_pool: u32, tx_pool: u32) -> Self {
         Self {

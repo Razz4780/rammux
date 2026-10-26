@@ -16,7 +16,7 @@ use bytes::Bytes;
 use crate::{
     StreamId,
     codec::encoder::OutStream,
-    global_pool::GlobalPool,
+    conn_shared::ConnShared,
     header::ControlFlags,
     stream::{FinState, SharedStreamState, outbound::Ctx},
 };
@@ -27,14 +27,14 @@ pub(crate) struct StreamUpdates {
     pub(super) state: Arc<Mutex<SharedStreamState>>,
 }
 
-impl Task<GlobalPool> for StreamUpdates {
+impl Task<ConnShared> for StreamUpdates {
     type Cont = (StreamUpdate, FinState);
     type Break = (StreamUpdate, FinState);
     type Output = (StreamUpdate, FinState);
 
     fn poll_progress(
         self: Pin<&mut Self>,
-        global: &mut GlobalPool,
+        global: &mut ConnShared,
         cx: &mut Context<'_>,
     ) -> Poll<ControlFlow<Self::Break, Self::Cont>> {
         let this = self.get_mut();
@@ -93,7 +93,7 @@ impl Task<GlobalPool> for StreamUpdates {
 
     fn transform_cont(
         _: BorrowedMut<'_, Self>,
-        _: &mut GlobalPool,
+        _: &mut ConnShared,
         value: Self::Cont,
     ) -> Option<Self::Output> {
         Some(value)
@@ -101,7 +101,7 @@ impl Task<GlobalPool> for StreamUpdates {
 
     fn transform_break(
         removed: Removed<Self>,
-        global: &mut GlobalPool,
+        global: &mut ConnShared,
         value: Self::Break,
     ) -> Option<Self::Output> {
         // A closed stream waits for nothing, and nobody waits for it.

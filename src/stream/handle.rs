@@ -7,8 +7,8 @@ use tokio::time::Instant;
 
 use crate::{
     buffer::Data,
+    conn_shared::ConnShared,
     error::StreamError,
-    global_pool::GlobalPool,
     stream::{FinState, SharedStreamState, outbound::Ctx},
 };
 
@@ -28,7 +28,7 @@ impl StreamHandle {
         data: Data,
         fin_write: bool,
         fin_read: bool,
-        global: &mut GlobalPool,
+        global: &mut ConnShared,
     ) -> Result<FinState, StreamError> {
         let mut guard = self.0.lock().unwrap();
         let SharedStreamState {
