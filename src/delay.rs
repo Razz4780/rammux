@@ -385,6 +385,9 @@ impl DelayControl {
 
         // The growth needs an empty queue all round trip (half of `alpha` at most), and ends the
         // moment the queue reaches `alpha`, not a round trip later.
+        // Half of `alpha` is the midpoint between an empty queue and the target: a doubling adds up to
+        // a window of bytes, so growing geometrically while the queue already holds half the target
+        // would overshoot it within the round trip. A tuning choice, not a derived value.
         if self.own >= self.alpha / 2.0 {
             self.all_small = false;
         }
