@@ -34,7 +34,7 @@ use crate::{
 };
 
 pub use crate::connection::downgrade::Downgraded;
-pub use crate::delay::DelayControlStats;
+pub use crate::delay::CopaLikeStats;
 
 #[cfg(test)]
 mod dc_test;
@@ -512,7 +512,7 @@ where
             return RammuxStats::default();
         };
         let global = active.selector.strategy();
-        let delay_control = global
+        let copa_like = global
             .dc
             .as_ref()
             .map(|dc| dc.stats(tokio::time::Instant::now(), global.tx_bytes));
@@ -527,7 +527,7 @@ where
             turn_queue_len: u32::try_from(global.turns_len()).expect(
                 "at most one queue entry per stream, and there are fewer than u32::MAX streams",
             ),
-            delay_control,
+            copa_like,
         }
     }
 }
@@ -578,7 +578,7 @@ pub struct RammuxStats {
     ///
     /// `None` if the connection does not use [`CopaLike`](crate::config::TransitControl::CopaLike),
     /// or is no longer active.
-    pub delay_control: Option<DelayControlStats>,
+    pub copa_like: Option<CopaLikeStats>,
 }
 
 #[cfg(test)]

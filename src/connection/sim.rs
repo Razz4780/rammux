@@ -32,7 +32,7 @@ use tokio::{
 use crate::{
     clock::Clock,
     config::{RammuxConfig, RammuxRole},
-    connection::{DelayControlStats, RammuxConnection, RammuxProgress, RammuxStats},
+    connection::{CopaLikeStats, RammuxConnection, RammuxProgress, RammuxStats},
     stream::RammuxDuplex,
 };
 
@@ -677,9 +677,9 @@ impl Rig {
     }
 
     /// The `CopaLike` statistics of the client. Panics without `CopaLike`.
-    pub fn delay_stats(&self) -> DelayControlStats {
+    pub fn delay_stats(&self) -> CopaLikeStats {
         self.stats()
-            .delay_control
+            .copa_like
             .expect("the client runs CopaLike and has sampled its statistics")
     }
 

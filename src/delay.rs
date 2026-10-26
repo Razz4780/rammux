@@ -275,7 +275,7 @@ pub struct DelayControl {
 /// [`TransitControl::CopaLike`](crate::config::TransitControl::CopaLike).
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
-pub struct DelayControlStats {
+pub struct CopaLikeStats {
     /// The queue on our forward path, from the one-way delay of `PING`s.
     pub q_fwd: Duration,
     /// How long the reports of the peer currently wait on their way back to us.
@@ -637,8 +637,8 @@ impl DelayControl {
         self.window
     }
 
-    pub fn stats(&self, now: Instant, tx_bytes: u32) -> DelayControlStats {
-        DelayControlStats {
+    pub fn stats(&self, now: Instant, tx_bytes: u32) -> CopaLikeStats {
+        CopaLikeStats {
             q_fwd: Duration::from_micros(u64::from(self.q_fwd)),
             q_back: Duration::from_micros(u64::from(self.q_back)),
             own: to_bytes(self.own),
