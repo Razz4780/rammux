@@ -576,8 +576,9 @@ impl DelayControl {
     /// Limitation: the sample is the time from `deadline` to the moment the connection task noticed the
     /// timer, which also includes delays that are not the timer's (a transport that was not writable,
     /// a batch of inbound frames, an application that did not poll). One long delay of that kind raises
-    /// the smoothed lateness, and with it the pacer's burst, for a few wake-ups. The burst only grows,
-    /// never shrinks the rate, and the lateness decays by `LATENESS_GAIN` per sample.
+    /// the smoothed lateness, and with it the pacer's burst, for many wake-ups. The burst only grows,
+    /// never shrinks the rate, and the lateness decays by a factor of 7/8 (`1 - LATENESS_GAIN`) per pacer
+    /// wake-up: about 16 wake-ups to fall to an eighth.
     pub fn note_timer(&mut self, deadline: Instant, woke_at: Instant) {
         let late = woke_at.saturating_duration_since(deadline).as_secs_f64();
         let smoothed = self.timer_lateness.as_secs_f64();

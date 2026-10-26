@@ -448,6 +448,6 @@ Compared with raw TCP under the same impairment, on emulated links:
 - **CUBIC share** is small by design.
 - **The pacer's timer lateness** is sampled as the time from the timer's deadline to the moment the connection task
   noticed it, which also includes delays that are not the timer's (a transport that was not writable, a batch of inbound
-  frames, an application that did not poll). A long delay of that kind raises the burst of the pacer for a few wake-ups.
+  frames, an application that did not poll). A long delay of that kind raises the burst of the pacer for many wake-ups: the lateness decays by a factor of 7/8 per pacer wake-up (about 16 wake-ups to an eighth), and wake-ups come only while the pacer is armed.
 - **Windows:** slow start after idle, and the timer-driven pacer on a 15.6 ms timer, are unverified.
 - **Passed:** uniform loss (0.1%, 1%) and burst loss (TCP is the limit; no over-cut), and GRO/TSO/GSO on (no effect).

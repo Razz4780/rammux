@@ -742,8 +742,9 @@ mod tests {
             ..stream_frame(7, syn(), 100, b"payload")
         };
         let mut send = Box::pin(codec.send(frame));
-        // The transport accepts 4 bytes per write, and the clock moves between the attempts: a header
-        // that was encoded again at every attempt would carry a later `PING` timestamp.
+        // The transport accepts 4 bytes per write, and all the chunks go out in the first attempt, so the
+        // clock does not move between them. A header that was encoded again after the first byte would
+        // carry `last + 1` as the `PING` timestamp (`PingStamps::next`), not the first stamp.
         for _ in 0..3 {
             let _ = send.as_mut().now_or_never();
             tokio::time::advance(Duration::from_micros(100)).await;
