@@ -13,7 +13,7 @@ use crate::{
         RammuxCodec,
         decoder::{DecodedFrame, InboundFrame},
     },
-    config::{RammuxConfig, RammuxRole},
+    config::{RammuxConfig, RammuxRole, TransitControl},
     connection::{RammuxConnection, RammuxProgress},
     header::{ControlFlags, Header, MAX_HEADER_LEN, Pong, StreamHeader},
 };
@@ -318,6 +318,102 @@ async fn the_reserved_bit_is_a_protocol_violation() {
         .unwrap();
     let error = rig.conn.progress().await.err().unwrap();
     assert!(error.is_protocol_violation());
+}
+
+/// Sends `chunks` chunks of `len` bytes on a new stream of the rig, and returns the frames written.
+async fn upload(rig: &mut Rig, chunks: usize, len: usize) -> Vec<InboundFrame> {
+    let stream = rig.conn.try_start_outbound().unwrap().unwrap();
+    let (mut sink, _stream) = stream.into_split();
+    let mut frames = Vec::new();
+    for _ in 0..chunks {
+        let chunk = Bytes::from(vec![7_u8; len]);
+        driving(&mut rig.conn, async {
+            sink.send(chunk).await.unwrap();
+            sink.flush().await.unwrap();
+        })
+        .await;
+        frames.extend(rig.frames());
+    }
+    frames
+}
+
+#[tokio::test(start_paused = true)]
+async fn bufferbloat_has_no_delay_control_machinery() {
+    // The cheapest observable proxy of "inert": no window in the pool, no pacer timer armed, frames
+    // cut only by the frame limit, and PINGs exactly where the data and the clock put them.
+    let mut rig = rig(RammuxRole::Client, config());
+    let frames = upload(&mut rig, 20, 1024).await;
+
+    let active = rig.conn.state.active().unwrap();
+    assert!(active.selector.strategy().dc.is_none());
+    assert!(!active.pacer_armed);
+
+    let sizes = frames
+        .iter()
+        .map(|frame| frame.data.as_ref().len())
+        .filter(|len| *len > 0)
+        .collect::<Vec<_>>();
+    assert_eq!(sizes.len(), 20 * 1024 / 256);
+    assert!(sizes.iter().all(|len| *len == 256), "{sizes:?}");
+    // The first PING is due at once, then one per 1024 bytes of DATA: no `W / 4` trigger.
+    let pings = frames.iter().filter(|f| f.header.ping.is_some()).count();
+    assert!((20..=22).contains(&pings), "{pings} PINGs");
+}
+
+#[tokio::test(start_paused = true)]
+async fn delay_control_admits_whole_frames_up_to_the_window_and_pings_with_the_data() {
+    let mut config = config();
+    config.transit_control = TransitControl::DelayControl;
+    // `W / 4` would be the PING spacing: keep `ping_bytes` out of the way to see the window decide.
+    config.ping_bytes = NonZeroU32::new(1 << 20).unwrap();
+    let mut rig = rig(RammuxRole::Client, config);
+    // The application hands over 16 KiB; the window keeps most of it from going out, so the send
+    // does not complete. It is polled by hand.
+    let stream = rig.conn.try_start_outbound().unwrap().unwrap();
+    let (mut sink, _stream) = stream.into_split();
+    let mut send = Box::pin(sink.send(Bytes::from(vec![7_u8; 16 * 1024])));
+    let mut frames = Vec::new();
+    for _ in 0..5 {
+        let _ =
+            std::future::poll_fn(|cx| std::future::Future::poll(send.as_mut(), cx)).now_or_never();
+        tokio::time::advance(Duration::from_millis(10)).await;
+        frames.extend(rig.frames());
+    }
+
+    // The window starts at 4 frames, and a frame is never split to fit it.
+    let window = rig.conn.stats().window;
+    assert_eq!(window, 4 * 256);
+    let sent = frames
+        .iter()
+        .map(|frame| frame.data.as_ref().len())
+        .sum::<usize>();
+    assert_eq!(sent, 4 * 256, "the window admits 4 whole frames");
+    assert!(frames.iter().all(|frame| frame.data.as_ref().len() <= 256));
+    // Blocked, the connection asks for a report with a PING: the PINGs follow the data, `W / 4` apart.
+    let pings = frames
+        .iter()
+        .filter_map(|frame| frame.header.ping)
+        .collect::<Vec<_>>();
+    assert!(pings.len() >= 4, "{pings:?}");
+
+    // The peer reports the delivery of everything: the window opens again.
+    tokio::time::advance(Duration::from_millis(20)).await;
+    let header = Header {
+        pong: Some(Pong {
+            t_echo: *pings.last().unwrap(),
+            t_read: 0,
+            rx_bytes: 4 * 256,
+        }),
+        ..Default::default()
+    };
+    rig.write(raw(header, b"")).await;
+    tokio::time::advance(Duration::from_millis(50)).await;
+    let more = rig
+        .frames()
+        .iter()
+        .map(|frame| frame.data.as_ref().len())
+        .sum::<usize>();
+    assert!(more >= 256, "the report freed room, but {more} bytes went");
 }
 
 #[tokio::test(start_paused = true)]
