@@ -4,7 +4,7 @@
 //! `PONG` moves its window `W` up or down by its share of a step of `alpha` per round trip (Copa's
 //! per-ACK update). Everything here is driven by `PONG`s.
 //!
-//! One law with two states, `(W, g)` (math review 4, "L1"): `W` is the window, and the growth `g`
+//! One law with two states, `(W, g)`: `W` is the window, and the growth `g`
 //! is how many bytes the window grows by per round trip while the queue is below `alpha`. `g` is
 //! `alpha` (Copa's step), or doubles per round trip while there is evidence that the growth buys
 //! throughput: startup is that growth from the first round trip on, and so is the recovery after
@@ -307,14 +307,14 @@ impl DelayControl {
 
     /// Takes a `PONG` into account. Call it after `srtt` was updated; `tx_bytes` is what we have sent.
     ///
-    /// The law (math review 4, "L1"), per `PONG` with `delivered` new bytes and the share
+    /// The law, per `PONG` with `delivered` new bytes and the share
     /// `s = min(delivered / W, 1)` of a round trip:
     ///
     /// ```text
     /// stop = max(own, own8) >= alpha      own8: the same on the newest 8 raw samples (HyStart)
     /// if stop and g > alpha:  W = min(W, fwd_in_flight), g = alpha
     /// if own <  alpha and limited:  W += g * s
-    /// if own >= alpha:              W -= (alpha + max(0, own - 2 alpha)) * s      (the relay, and S6)
+    /// if own >= alpha:              W -= (alpha + max(0, own - 2 alpha)) * s     
     /// ```
     ///
     /// Startup is not a mode: it is `g` growing from the first round trip. A growth that is not
@@ -416,15 +416,15 @@ impl DelayControl {
     /// over `alpha` if that is more.
     ///
     /// Why the excess too, and spread over the PONGs: a once-per-round-trip cut of `own - alpha` took
-    /// the measurement of one `PONG`, and on a jittery path that one may be a spike (wifi: chain p99
-    /// 843 ms with the cut, 770 spread). Spread, the cut is the mean of the round trip's measurements,
+    /// the measurement of one `PONG`, and on a jittery path that one may be a spike (on a simulated wifi path,
+    /// p99 delay was 843 ms with the cut, 770 spread). Spread, the cut is the mean of the round trip's measurements,
     /// and a capacity drop or the overshoot of startup is still shed within a round trip.
     ///
     /// Why not one step per round trip: connections that share a bottleneck see the same queue, and
     /// the queue swings by `2 alpha / C` per round trip with their steps, more than the band
     /// `alpha / R1 .. alpha / R2` in which only the faster one would step down. So both step the same
     /// way at nearly every update, and which of them sees the higher queue at its decreases is set by
-    /// the fixed phase of its updates in the swing: the split froze at 0.39-0.62 on k8s, by phase.
+    /// the fixed phase of its updates in the swing: in simulation the split between two connections froze at 0.39-0.62, depending on the phase.
     /// Spread over the round trip, a connection steps down for as long as the queue is in that band,
     /// and the faster one is there longer: the shares converge.
     fn step(&mut self, delivered: u32, now: Instant) {
@@ -441,15 +441,15 @@ impl DelayControl {
                     .saturating_add(to_bytes(self.growth as f64 * share));
             }
         } else {
-            // S6: the excess over `alpha` is shed at once. INVARIANT (math review 2.6): its gain of 1
+            // The excess over `alpha` is shed at once. INVARIANT: its gain of 1
             // is load-bearing. The `own` it reads is a round trip old, so by the time the cut is
             // applied the queue has fallen, and the cut (normalised by `W`, not by the old round trip)
             // overshoots by about `1 + q / d`. That overcut is what lets the queue touch nearly empty
             // within each re-baseline history, and so what lets the re-baseline test see an empty
             // queue (`nearly_empty`) instead of taking our own queue for the path. A gain of 1/2, a
             // Smith predictor or a share normalised by the sample's round trip bring the floor creep
-            // back (dsl10: 20 -> 121 ms in 26 s). Change nothing here without the long-run tests
-            // (`the_base_delay_does_not_ratchet...`, `s6_overcut_empties_the_queue`).
+            // back (in simulation of a 10 Mbit/s path: 20 -> 121 ms in 26 s). Change nothing here without the long-run tests
+            // (`the_base_delay_does_not_ratchet...`, `s6_over_cuts_so_a_capacity_drop_is_shed_fast`).
             let step = self.alpha.max(self.own - self.alpha);
             self.window = self
                 .window
@@ -458,8 +458,8 @@ impl DelayControl {
         }
     }
 
-    /// Once per round trip: the growth for the next one. There is no idle handling
-    /// (v2-delay-noidle): a window that was not used is kept, and does not grow (`limited`).
+    /// Once per round trip: the growth for the next one. There is no idle handling:
+    /// a window that was not used is kept, and does not grow (`limited`).
     ///
     /// `g` doubles, but never beyond `W` (at most a doubling of the window per round trip), and only
     /// if the growth is buying throughput: the queue stayed empty all round trip (`all_small`), `W`
@@ -467,7 +467,7 @@ impl DelayControl {
     /// Otherwise `g` is `alpha`. A rate that rises while the queue stays empty means that the window
     /// was the limit; a flat rate means the link, or the TCP below it, is.
     ///
-    /// The threshold does not depend on `g` (math review 2.4). The rate (a time constant of `srtt`,
+    /// The threshold does not depend on `g`. The rate (a time constant of `srtt`,
     /// fed by reports a round trip old) lags the window by 2-3 round trips, so the rise it shows here
     /// is the step of 2-3 updates back, a quarter of the present one while `g` doubles: a threshold of
     /// `g / 2` would fail at the third doubling by construction (the 1-2-4 sawtooth, a mean step of
@@ -477,11 +477,11 @@ impl DelayControl {
     /// answers with a send buffer, not with a rate, is bounded by it: the rate does not rise, `g`
     /// returns to `alpha` within a round trip. Change the time constant of the rate, or the cadence
     /// of the `PONG`s, and the test becomes either useless (a lag over 3 round trips) or the 6 MB
-    /// overshoot of velup (no lag).
+    /// overshoot of a rate estimate with no lag.
     ///
     /// The estimator-validity rule: the rate has no history in its first two round trips, so its
     /// rise says nothing (it warms up from 0, and the test would fail the first doublings, 0.95 s
-    /// against 0.65 s to 90% on k8s). That is a property of the estimate, not a mode: `rose` is
+    /// against 0.65 s to 90% in simulation). That is a property of the estimate, not a mode: `rose` is
     /// passed while the rate has less than `RATE_WARMUP_SRTT` smoothed round trips of deliveries.
     fn update_window(&mut self, rate: f64, now: Instant) {
         let alpha = to_bytes(self.alpha);
@@ -511,8 +511,8 @@ impl DelayControl {
     /// Coupling: the window excludes `R * q_back`, but the pacer's `srtt` includes `q_back`. Once
     /// `q_back > RTT_base + q_fwd` the pace `2W / srtt` falls below `R`, only the window counts as
     /// limited (the pacer never drives growth), and `W` stops growing while the pacer binds. The gain
-    /// of 2 is the margin that hides this in steady state (at 1.25 the trap was measured: cubic_up
-    /// 127 -> 110 Mbit/s); a reverse queue beyond a round trip is what it does not cover.
+    /// of 2 is the margin that hides this in steady state (at 1.25 the trap was measured in simulation
+    /// against a CUBIC upload: 127 -> 110 Mbit/s); a reverse queue beyond a round trip is what it does not cover.
     pub fn fwd_in_flight(&self, now: Instant, tx_bytes: u32) -> u64 {
         let in_transit =
             u64::try_from(diff(tx_bytes, self.peer_rx.unwrap_or(0)).max(0)).unwrap_or(0);
@@ -1147,8 +1147,8 @@ mod test {
         warm(&mut feed);
         update(&mut feed, 0, ms(100), true, Some(1_000_000));
         let w = feed.dc.window();
-        // Round trips in which the window never limited sending, below the target (v2-delay-noidle:
-        // no idle decay, which would have brought it to twice the 200 kB delivered per round trip).
+        // Round trips in which the window never limited sending, below the target (there is no
+        // idle decay, which would have brought it to twice the 200 kB delivered per round trip).
         for i in 0..10 {
             feed.pong(ms(3000 + 100 * i), ms(100), ms(50), 100_000);
         }

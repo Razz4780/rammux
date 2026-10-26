@@ -78,9 +78,11 @@ busy streams that write at least `frame_limit` bytes at a time converge to equal
 one frame, and a frame holds at most one write, so a stream that writes less gets a proportionally smaller share.
 
 See [TRANSIT_CONTROL.md](TRANSIT_CONTROL.md) for the rules, the reasons, and the known limits.
-The connection fills the pool when there is enough data, like the autotuning multiplexers do,
-so the pool bounds the queue that the connection builds on the path.
-Size it for the latency you can accept.
+In the `Bufferbloat` mode (the default) the connection fills the pool when there is enough data,
+like the autotuning multiplexers do, so the pool bounds the queue that the connection builds on the path.
+Size it for the latency you can accept. In the `DelayControl` mode, a connection-wide window (the idea of Copa)
+keeps the queue near `queue_target_bytes` per connection, from the one-way delay of `PING`s; it does not
+compete with buffer-filling traffic such as CUBIC.
 
 ## Shutdown and transport recovery
 
