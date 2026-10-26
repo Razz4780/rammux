@@ -338,7 +338,7 @@ async fn upload(rig: &mut Rig, chunks: usize, len: usize) -> Vec<InboundFrame> {
 }
 
 #[tokio::test(start_paused = true)]
-async fn bufferbloat_has_no_delay_control_machinery() {
+async fn off_has_no_copa_like_machinery() {
     // The cheapest observable proxy of "inert": no window in the pool, no pacer timer armed, frames
     // cut only by the frame limit, and PINGs exactly where the data and the clock put them.
     let mut rig = rig(RammuxRole::Client, config());
@@ -363,7 +363,7 @@ async fn bufferbloat_has_no_delay_control_machinery() {
 #[tokio::test(start_paused = true)]
 async fn delay_control_admits_whole_frames_up_to_the_window_and_pings_with_the_data() {
     let mut config = config();
-    config.transit_control = TransitControl::DelayControl;
+    config.transit_control = TransitControl::CopaLike;
     // `W / 4` would be the PING spacing: keep `ping_bytes` out of the way to see the window decide.
     config.ping_bytes = NonZeroU32::new(1 << 20).unwrap();
     let mut rig = rig(RammuxRole::Client, config);

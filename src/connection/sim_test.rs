@@ -1,4 +1,4 @@
-//! Dynamics of the per-stream rules (Bufferbloat) on a simulated link, in paused time.
+//! Dynamics of the per-stream rules (mode `Off`) on a simulated link, in paused time.
 //!
 //! The link has a fixed rate and delay in each direction, and an unlimited buffer:
 //! whatever the connections put on it queues up, and the queue shows as the round trip time.

@@ -38,7 +38,7 @@ pub struct GlobalPool {
     ///
     /// Each queued stream has its `queued` flag set.
     turns: VecDeque<StreamRef>,
-    /// The connection window, with `TransitControl::DelayControl`.
+    /// The connection window, with `TransitControl::CopaLike`.
     pub dc: Option<DelayControl>,
 }
 
@@ -52,7 +52,7 @@ impl GlobalPool {
         }
     }
 
-    /// Turns on the connection window of `TransitControl::DelayControl`.
+    /// Turns on the connection window of `TransitControl::CopaLike`.
     pub fn with_delay_control(mut self, dc: DelayControl) -> Self {
         self.dc = Some(dc);
         self

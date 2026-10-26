@@ -37,7 +37,7 @@ impl PingSchedule {
     ///
     /// `tx_bytes` is the counter of `DATA` bytes written so far.
     /// `ping_bytes_cap` lowers the number of bytes that trigger a `PING` (the window of
-    /// `DelayControl` needs samples more often than that when it is small).
+    /// `CopaLike` needs samples more often than that when it is small).
     /// `blocked` tells that the window keeps a frame from being sent: a `PING` is then due as
     /// soon as any data was sent since the last one, as its answer may free the window.
     /// When this returns [`Poll::Ready`], the caller must send the `PING` and call [`Self::sent`].

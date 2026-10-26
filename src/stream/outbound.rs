@@ -345,7 +345,7 @@ impl Ledger {
         let base_room = self.base_window.saturating_sub(self.unacked);
         let full = self.frame_limit.min(waiting);
         let has_turn = ctx.global.has_turn(ctx.me);
-        // The connection window of DelayControl applies to every byte, and needs the turn.
+        // The connection window of the CopaLike mode applies to every byte, and needs the turn.
         let window_room = ctx.global.window_room(ctx.now);
         let conn_room = match window_room {
             None => u64::MAX,

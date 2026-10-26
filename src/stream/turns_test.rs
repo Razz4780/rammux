@@ -36,7 +36,7 @@ const CONFIG: RammuxConfig = RammuxConfig {
     remote_recv_window: NonZeroU32::new(16).unwrap(),
     local_recv_pool: 1 << 20,
     remote_recv_pool: 8,
-    transit_control: TransitControl::Bufferbloat,
+    transit_control: TransitControl::Off,
     ping_bytes: NonZeroU32::new(32).unwrap(),
     queue_target_bytes: NonZeroU32::new(64).unwrap(),
     ping_interval: Duration::from_secs(1),
@@ -78,7 +78,7 @@ impl Bed {
         }
     }
 
-    /// Like [`Self::new`], with the connection window of DelayControl: `alpha` is 100 bytes.
+    /// Like [`Self::new`], with the connection window of the CopaLike mode: `alpha` is 100 bytes.
     fn new_dc(tx_pool: u32) -> Self {
         let mut bed = Self::new(tx_pool);
         let dc = DelayControl::new(100, CONFIG.frame_limit.get());

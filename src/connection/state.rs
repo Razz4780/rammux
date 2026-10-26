@@ -75,7 +75,7 @@ pub struct Active<IO> {
     pub last_echo: Option<u32>,
     /// The private clock of this side.
     pub clock: Clock,
-    /// Wakes the streams when the pacer of `DelayControl` has room again, if it is armed.
+    /// Wakes the streams when the pacer of `CopaLike` has room again, if it is armed.
     pub pacer: std::pin::Pin<Box<tokio::time::Sleep>>,
     pub pacer_armed: bool,
     /// When the armed pacer is to wake up, to measure how late it does.

@@ -36,7 +36,7 @@ const CONFIG: RammuxConfig = RammuxConfig {
     remote_recv_window: NonZeroU32::new(BASE).unwrap(),
     local_recv_pool: POOL,
     remote_recv_pool: POOL,
-    transit_control: TransitControl::Bufferbloat,
+    transit_control: TransitControl::Off,
     ping_bytes: NonZeroU32::new(32).unwrap(),
     queue_target_bytes: NonZeroU32::new(64).unwrap(),
     ping_interval: Duration::from_secs(1),

@@ -102,7 +102,7 @@ A `PING` that is superseded by a newer one before its answer is written gets no 
   that carried the `PING`.
 
 `t_read` and `rx_bytes` are for the measurements of the sender of the `PING` (how much the peer received, and
-when). The flow control of the streams does not use them, but `DelayControl` does (below), so they must be filled in
+when). The flow control of the streams does not use them, but `CopaLike` does (below), so they must be filled in
 correctly.
 
 Answering only the latest `PING` keeps the memory of the responder O(1), with no need to stop reading, and an
@@ -127,7 +127,7 @@ All arithmetic on timestamps and counters wraps; differences are read as `i32`.
 A `PING` is sent after every 32 KiB of `DATA` written (`ping_bytes`), and at least every 5 seconds
 (`ping_interval`) to keep the connection alive. Several can be in flight.
 
-With `DelayControl` (see [TRANSIT_CONTROL.md](TRANSIT_CONTROL.md)), the `PONG`s are also the input of the connection
+With `CopaLike` (see [TRANSIT_CONTROL.md](TRANSIT_CONTROL.md)), the `PONG`s are also the input of the connection
 window: the one-way delay of the `PING`s (`t_read - t_echo`) is the queue signal, `rx_bytes` the delivered bytes. A `PING`
 then goes out also after `W / 4` bytes of `DATA`, and at once when the window keeps a frame from being sent and `DATA`
 was sent since the last `PING`. Both triggers need `DATA` written since the last `PING`, so a peer

@@ -1,4 +1,4 @@
-//! DelayControl on a simulated link, in paused time. The assertions are on properties (queue bounds,
+//! CopaLike on a simulated link, in paused time. The assertions are on properties (queue bounds,
 //! utilization, no starvation, convergence, a base delay that does not creep up), with margins,
 //! not on exact numbers.
 //!
@@ -26,7 +26,7 @@ use crate::{
 
 fn config() -> RammuxConfig {
     let mut config = RammuxConfig::new();
-    config.transit_control = TransitControl::DelayControl;
+    config.transit_control = TransitControl::CopaLike;
     config.frame_limit = NonZeroU16::new(16 * 1024).unwrap();
     config.local_recv_window = NonZeroU32::new(64 * 1024).unwrap();
     config.remote_recv_window = NonZeroU32::new(64 * 1024).unwrap();
@@ -233,7 +233,7 @@ async fn startup_overshoot_is_cut_and_the_queue_stays_short() {
 async fn the_queue_is_far_shorter_than_without_delay_control() {
     // The same path with the pool as the only limit: the queue is what the pool holds.
     let mut config = config();
-    config.transit_control = TransitControl::Bufferbloat;
+    config.transit_control = TransitControl::Off;
     config.local_recv_pool = 4 * 1024 * 1024;
     config.remote_recv_pool = 4 * 1024 * 1024;
     let mut rig = Rig::with_paths(
@@ -507,7 +507,7 @@ async fn a_drifting_clock_of_the_peer_does_not_matter(#[values(50, -50)] ppm: i6
 
 #[tokio::test(start_paused = true)]
 async fn a_cubic_like_competitor_gets_most_of_the_link_and_we_do_not_starve() {
-    // By design DelayControl does not compete with buffer-filling traffic.
+    // By design CopaLike does not compete with buffer-filling traffic.
     let buffer = (Q150 * 1e6 / 8.0 * 0.3) as usize;
     let mut rig = Rig::with_paths(
         Path::constant(Q150, ms(50)).with_foreign_buffer(buffer),

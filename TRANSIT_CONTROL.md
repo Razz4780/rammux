@@ -17,12 +17,12 @@ The flow control of rammux does three things:
    a shared *pool*, and returns credit as the application reads. That protects its memory and nothing else.
 2. **The sender decides how much of the pool each stream uses**: in proportion to what the stream's reader
    has proven it reads, and in turns when the pool is contended (the per-stream rules, below).
-3. **`DelayControl` only: a connection-wide window** on the bytes on the forward path, which keeps the queue
-   of the connection near a fixed size (see [DelayControl](#delaycontrol-a-copa-style-connection-window)).
+3. **`CopaLike` only: a connection-wide window** on the bytes on the forward path, which keeps the queue
+   of the connection near a fixed size (see [CopaLike](#copalike-a-copa-style-connection-window)).
    `RammuxConfig::transit_control` selects the mode. It is a local choice: it only decides what our sender may put
    on the path, and the receiver behaves the same in both modes, so the peers need not agree.
 
-In `Bufferbloat` mode, which has only the per-stream rules, the connection behaves like the autotuning multiplexers
+In `Off` mode (no transit control: only the per-stream rules), the connection behaves like the autotuning multiplexers
 (yamux, HTTP/2 stacks): it fills the pool. What it adds is fair sharing of the pool between busy streams, and the
 protection against stalled readers.
 
@@ -148,7 +148,7 @@ Why:
   8 KiB, whether the room comes from the base window, a small pool or a small allowance. Waiting for a whole frame
   would let residue of credit, a small pool or a small base window block a stream that has room. Tiny frames are
   rare, because room frees up in credit chunks of at least `T_c`; a small frame at the tail of a chunk costs one header.
-  The connection window of DelayControl is the exception, see below: it never splits a frame.
+  The connection window of the CopaLike mode is the exception, see below: it never splits a frame.
 - **Free room never lets a stream skip the queue.** A stream woken by its own credit must not take shared room while
   others are queued ahead of it, even if room is free. Otherwise the split freezes again.
 - **With the connection window, a frame within the stream's base window skips the turns** (fq_codel's sparse flows).
@@ -168,7 +168,7 @@ A stream limited by its allowance delivers `r = (B + A) / L`, where `L` is the l
 
 **Growth to the pool.** `A` keeps growing until the pool binds. The queue then settles near
 `(N * B + P) / C`, capped by the bottleneck buffer (`N` busy streams, `C` the bottleneck rate). That is the
-behavior of yamux, quiche, gRPC and of the pool-only mode.
+behavior of yamux, quiche, gRPC and of `Off` mode.
 
 **Startup.** Each loop, a full window `W = B + A` of credit comes back. The estimate averages over about one loop,
 so afterwards `R_s` is about `W / srtt` and `A_s` about `k * W`; the next window is about `B + 2 * W`. So the window of a
@@ -208,10 +208,10 @@ and the fast streams share the rest (max-min fair).
    busy streams need writes of at least `frame_limit` bytes. Shares by bytes would need turns that carry an amount,
    which has its own costs (see "No byte-count semaphore").
 
-## DelayControl: a Copa-style connection window
+## CopaLike: a Copa-style connection window
 
 The per-stream rules decide who gets the pool. They do not keep the queue on the path short: `srtt` includes our
-own queue, so the allowances grow until the pool binds. `DelayControl` adds one window `W` for the whole connection,
+own queue, so the allowances grow until the pool binds. `CopaLike` adds one window `W` for the whole connection,
 which does.
 
 The idea is Copa's (Arun and Balakrishnan, 2018), in its default mode: a connection aims to keep a fixed number of
@@ -224,7 +224,7 @@ by `alpha` per round trip, spread over the `PONG`s of the round trip (Copa's per
 - the excess over `alpha` is shed in about a round trip (the excess cut), instead of Copa's velocity;
 - Copa's minimum of the last 10 s is replaced by a checked **re-baseline**.
 
-What we give up: `DelayControl` does not compete with buffer-filling traffic such as a CUBIC download. Against it, the
+What we give up: `CopaLike` does not compete with buffer-filling traffic such as a CUBIC download. Against it, the
 connection yields most of the link (the queue is the competitor's).
 
 **Why a window, why connection-wide, and why delivered bytes.** Every stream's bytes wait in the same TCP queue, so
@@ -427,7 +427,7 @@ that makes `q_back` smaller and `fwd_in_flight` larger, so it errs on the side o
 - The pool (`local_recv_pool`) is only a memory limit in this mode. If it is smaller than what the path needs in flight,
   it limits the throughput first (about 5.6 MB at 150 Mbit/s with a 300 ms loop).
 
-### Known limits (DelayControl)
+### Known limits (CopaLike)
 
 Compared with raw TCP under the same impairment, on emulated links:
 
@@ -439,7 +439,7 @@ Compared with raw TCP under the same impairment, on emulated links:
   one aggregate. Raise `queue_target_bytes` on aggregating links.
 - **One-way loss starves the reverse feedback.** With bulk both ways and loss on one direction, the clean direction gets
   0.41-0.75 of raw: its reports come back behind the lossy direction's retransmissions. This is structural (a single byte
-  stream); `Bufferbloat` is worse.
+  stream); `Off` is worse.
 - **Low-BDP links:** on a 10 Mbit/s link, bulk both ways (upload) is about 3% and a CUBIC upload about 5% below what a
   window that grows geometrically only in startup reaches, because `g` may double up to `W` at small `W`.
 - **A rise of the base delay** is cut as if it were our queue until the re-baseline accepts it (16-21% of 10 s throughput

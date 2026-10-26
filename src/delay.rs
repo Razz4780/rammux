@@ -1,4 +1,4 @@
-//! The connection window of `TransitControl::DelayControl`, see `TRANSIT_CONTROL.md`.
+//! The connection window of `TransitControl::CopaLike`, see `TRANSIT_CONTROL.md`.
 //!
 //! Copa-style: the connection keeps about `alpha` bytes in the queue of the bottleneck, and every
 //! `PONG` moves its window `W` up or down by its share of a step of `alpha` per round trip (Copa's
@@ -215,7 +215,7 @@ pub struct PongSample {
     pub rx_bytes: u32,
 }
 
-/// Measurements and the window of a connection with `DelayControl`.
+/// Measurements and the window of a connection with `CopaLike`.
 pub struct DelayControl {
     /// `alpha`, the bytes to keep in the queue.
     alpha: f64,
@@ -272,7 +272,7 @@ pub struct DelayControl {
 }
 
 /// A snapshot of the measurements and the window of a connection with
-/// [`TransitControl::DelayControl`](crate::config::TransitControl::DelayControl).
+/// [`TransitControl::CopaLike`](crate::config::TransitControl::CopaLike).
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
 pub struct DelayControlStats {

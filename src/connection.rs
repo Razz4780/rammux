@@ -114,7 +114,7 @@ where
     ) -> Result<Self, ConfigError> {
         config.validate()?;
         let mut global = GlobalPool::new(config.local_recv_pool, config.remote_recv_pool);
-        if config.transit_control == TransitControl::DelayControl {
+        if config.transit_control == TransitControl::CopaLike {
             global = global.with_delay_control(DelayControl::new(
                 config.queue_target_bytes.get(),
                 config.frame_limit.get(),
@@ -320,7 +320,7 @@ where
 
     /// Decides whether a `PING` goes out now, and if so, accounts for it.
     ///
-    /// With `DelayControl`, the window needs a sample every round trip: a `PING` is due after
+    /// With `CopaLike`, the window needs a sample every round trip: a `PING` is due after
     /// `W / 4` bytes, and when the window keeps a frame from being sent.
     fn poll_ping(active: &mut Active<IO>, cx: &mut Context<'_>) -> bool {
         let global = active.selector.strategy_mut();
@@ -572,11 +572,11 @@ pub struct RammuxStats {
     pub pool_rx_used: u64,
     /// Count of streams waiting for their turn to use the shared pool.
     ///
-    /// With `DelayControl` it also counts the streams that wait for room in the connection window.
+    /// With `CopaLike` it also counts the streams that wait for room in the connection window.
     pub turn_queue_len: u32,
-    /// Measurements and the window of `DelayControl`.
+    /// Measurements and the window of `CopaLike`.
     ///
-    /// `None` if the connection does not use [`DelayControl`](crate::config::TransitControl::DelayControl),
+    /// `None` if the connection does not use [`CopaLike`](crate::config::TransitControl::CopaLike),
     /// or is no longer active.
     pub delay_control: Option<DelayControlStats>,
 }

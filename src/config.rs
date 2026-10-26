@@ -37,12 +37,14 @@ impl fmt::Display for RammuxRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum TransitControl {
+    /// No transit control: flow control by the receive windows, the shared pool and the turn queue only.
+    ///
     /// Streams are limited by their base windows and by their share of the receive pool,
     /// which each stream may use in proportion to the rate its reader has proven.
     /// The connection fills the pool when the application sends enough data.
     /// This is what autotuning multiplexers (yamux, HTTP/2 stacks) do.
-    Bufferbloat,
-    /// On top of the rules of `Bufferbloat`, a connection-wide window on the bytes on the
+    Off,
+    /// The Copa-like connection window. On top of the rules of `Off`, a window on the bytes on the
     /// forward path keeps the queue of the connection near [`RammuxConfig::queue_target_bytes`]
     /// (the idea of Copa), from the one-way delay of `PING`s. Connections of ours that share a
     /// bottleneck share it equally, and the queue stays short. The window does not compete with
@@ -50,7 +52,7 @@ pub enum TransitControl {
     ///
     /// The pool of the receiver is only a memory limit then, and
     /// must hold what the path needs in flight, or it limits the throughput first.
-    DelayControl,
+    CopaLike,
 }
 
 /// Configuration for a [`RammuxConnection`](crate::connection::RammuxConnection).
@@ -116,7 +118,7 @@ pub struct RammuxConfig {
     /// The pool is the responsibility of the user, rammux uses the configured value as it is.
     /// Any size works, 0 included (streams run on their base windows). A pool or a window smaller than
     /// [`Self::frame_limit`] is used with smaller frames.
-    /// With [`TransitControl::Bufferbloat`], the pool bounds the queue that
+    /// With [`TransitControl::Off`], the pool bounds the queue that
     /// the connection can build on the path, at about `(streams * window + pool) / bandwidth`.
     ///
     /// # Negotiation
@@ -142,7 +144,7 @@ pub struct RammuxConfig {
     /// The peer answers the latest `PING` it has read with a `PONG`, which gives us a round trip time sample.
     /// Several `PING`s can be in flight.
     ///
-    /// With [`TransitControl::DelayControl`] the spacing is at most a quarter of the connection window
+    /// With [`TransitControl::CopaLike`] the spacing is at most a quarter of the connection window
     /// (`min(ping_bytes, W / 4)`), and the samples are the input of the window, so this value also sets
     /// how many samples the window sees per round trip. A larger value means fewer samples: the stop of the
     /// window's fast growth, which needs 8 of them, takes longer, and the standing minimum that filters
@@ -150,7 +152,7 @@ pub struct RammuxConfig {
     ///
     /// This value is a local knob and does not have to be negotiated.
     pub ping_bytes: NonZeroU32,
-    /// The bytes that a connection with [`TransitControl::DelayControl`] keeps queued in the
+    /// The bytes that a connection with [`TransitControl::CopaLike`] keeps queued in the
     /// bottleneck, `alpha` in `TRANSIT_CONTROL.md`.
     ///
     /// The connection adjusts its window to hold this much in the queue, so a path with the
@@ -159,7 +161,7 @@ pub struct RammuxConfig {
     /// whatever their round trip time. Larger values keep the links of the path fed better and
     /// make the queue longer.
     ///
-    /// Ignored with [`TransitControl::Bufferbloat`]. With [`TransitControl::DelayControl`] it must
+    /// Ignored with [`TransitControl::Off`]. With [`TransitControl::CopaLike`] it must
     /// not be smaller than [`RammuxConfig::frame_limit`]: a frame that large must fit into the
     /// standing queue the window aims for. This value is a local knob and does not have to be
     /// negotiated.
@@ -194,7 +196,7 @@ impl RammuxConfig {
     /// 5. [`Self::ping_interval`] - 5s
     /// 6. [`Self::inbound_frame_timeout`] - 10s
     /// 7. [`Self::local_recv_pool`] and [`Self::remote_recv_pool`] - 4 MiB
-    /// 8. [`Self::transit_control`] - [`TransitControl::Bufferbloat`]
+    /// 8. [`Self::transit_control`] - [`TransitControl::Off`]
     pub const fn new() -> Self {
         Self {
             frame_limit: NonZeroU16::new(16 * 1024).unwrap(),
@@ -204,7 +206,7 @@ impl RammuxConfig {
             remote_recv_window: NonZeroU32::new(64 * 1024).unwrap(),
             local_recv_pool: 4 * 1024 * 1024,
             remote_recv_pool: 4 * 1024 * 1024,
-            transit_control: TransitControl::Bufferbloat,
+            transit_control: TransitControl::Off,
             ping_bytes: NonZeroU32::new(32 * 1024).unwrap(),
             queue_target_bytes: NonZeroU32::new(64 * 1024).unwrap(),
             ping_interval: Duration::from_secs(5),
@@ -239,7 +241,7 @@ impl RammuxConfig {
                 inbound_frame_timeout: self.inbound_frame_timeout,
             });
         }
-        if self.transit_control == TransitControl::DelayControl
+        if self.transit_control == TransitControl::CopaLike
             && self.queue_target_bytes.get() < u32::from(self.frame_limit.get())
         {
             return Err(ConfigError::QueueTargetBelowFrameLimit {
@@ -281,7 +283,7 @@ pub enum ConfigError {
         /// Configured timeout.
         inbound_frame_timeout: Duration,
     },
-    /// With `DelayControl`, `queue_target_bytes` is smaller than `frame_limit`.
+    /// With `CopaLike`, `queue_target_bytes` is smaller than `frame_limit`.
     #[error(
         "queue_target_bytes ({queue_target_bytes}) must not be smaller than frame_limit ({frame_limit})"
     )]
@@ -343,14 +345,14 @@ mod test {
     #[test]
     fn delay_control_is_valid() {
         let mut config = RammuxConfig::new();
-        config.transit_control = TransitControl::DelayControl;
+        config.transit_control = TransitControl::CopaLike;
         config.validate().unwrap();
     }
 
     #[test]
     fn delay_control_queue_target_holds_a_frame() {
         let mut config = RammuxConfig::new();
-        config.transit_control = TransitControl::DelayControl;
+        config.transit_control = TransitControl::CopaLike;
         config.frame_limit = NonZeroU16::new(4096).unwrap();
         config.queue_target_bytes = NonZeroU32::new(4095).unwrap();
         assert!(matches!(
@@ -362,9 +364,9 @@ mod test {
         ));
         config.queue_target_bytes = NonZeroU32::new(4096).unwrap();
         config.validate().unwrap();
-        // The target is ignored without DelayControl.
+        // The target is ignored without CopaLike.
         config.queue_target_bytes = NonZeroU32::new(1).unwrap();
-        config.transit_control = TransitControl::Bufferbloat;
+        config.transit_control = TransitControl::Off;
         config.validate().unwrap();
     }
 

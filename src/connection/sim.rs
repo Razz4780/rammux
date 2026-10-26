@@ -676,11 +676,11 @@ impl Rig {
         self.client_stats.lock().unwrap().clone()
     }
 
-    /// The `DelayControl` statistics of the client. Panics without `DelayControl`.
+    /// The `CopaLike` statistics of the client. Panics without `CopaLike`.
     pub fn delay_stats(&self) -> DelayControlStats {
         self.stats()
             .delay_control
-            .expect("the client runs DelayControl and has sampled its statistics")
+            .expect("the client runs CopaLike and has sampled its statistics")
     }
 
     /// Bytes read by the server on the stream.
