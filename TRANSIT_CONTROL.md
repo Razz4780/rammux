@@ -90,8 +90,8 @@ Two time spans, chosen deliberately:
 - **Average over one loop (`srtt`).** After a loop the estimate mostly reflects that loop's credit, so the window of a
   new stream about doubles per loop while its reader keeps up: the growth of yamux and of the adaptive window of HTTP/2.
 - **Allow `k = 2` loops (`tau_s`).** The steady allowance is about twice what the stream has in flight.
-- **The cost:** a noisier estimate (the ripple of batched credit is about `batch / (2 * srtt)`, where a batch is the credit returned at once, at least `T_c`; it does not matter,
-  because the pool binds first), and a stream forgets after a pause of about one loop. Averaging over `tau_s`
+- **The cost:** a noisier estimate (the ripple of batched credit is about `batch / (2 * srtt)`, where a batch is the credit returned at once, at least `T_c`;
+  it does not matter, because the pool binds first), and a stream forgets after a pause of about one loop. Averaging over `tau_s`
   itself would read simpler, but a new stream would grow only about 1.65 times per loop.
 
 **It does not limit delay.** `srtt` includes our own queue, so a longer queue means a longer loop, a larger `srtt`,
@@ -120,7 +120,8 @@ Without turns, Y keeps its 64 KiB base window and gets 1.6 Mbit/s, indefinitely.
 **The turn queue.** Streams waiting for shared room take turns, one frame per turn (a frame is whatever fits, see below). The queue holds the streams
 themselves (identity, so reused stream IDs cannot be confused), and waking the front means waking that stream's
 regular poller. A turn carries no byte count: it means "you may use the shared room now", and the stream works out the
-amount when its turn comes.
+amount when its turn comes. Under `Off`, the next waiter is woken when the pool has room; under `CopaLike`, whenever the
+window has room, whatever the pool holds.
 
 With `base_room = max(0, B - unacked_s)`, `full = min(frame_limit, waiting bytes)`,
 `borrow_allow = max(0, A_s - borrowed_s)`, `pool_room = P_tx - U_tx`,
@@ -176,8 +177,8 @@ new stream about doubles per loop (a bit faster at the very start, as `B` comes 
 2.3 to 3 times in the first loops). That matches yamux, TCP slow start and the adaptive window of HTTP/2.
 
 **Shares.** Once the pool binds, each stream's allowance has about 2x slack, so the pool and not the allowance
-decides each busy stream's share, and the turn queue makes that share equal (in turns, see limit 7 of "Known limits (per-stream rules)"). Freed room arrives at the link rate
-`C` and is handed out in turns, so each of `n` waiting streams gains `C / n`; each stream loses room at its own
+decides each busy stream's share, and the turn queue makes that share equal (in turns, see limit 7 of "Known limits (per-stream rules)").
+Freed room arrives at the link rate `C` and is handed out in turns, so each of `n` waiting streams gains `C / n`; each stream loses room at its own
 delivery rate, proportional to what it holds. The streams settle where each delivers `C / n`; the imbalance shrinks
 within about one loop time. A newcomer is limited only by its own allowance ramp, which about doubles per loop: in the example above (330 ms
 loops), Y reaches an even split in about 5 loops, roughly 1.7 s.
@@ -448,6 +449,7 @@ Compared with raw TCP under the same impairment, on emulated links:
 - **CUBIC share** is small by design.
 - **The pacer's timer lateness** is sampled as the time from the timer's deadline to the moment the connection task
   noticed it, which also includes delays that are not the timer's (a transport that was not writable, a batch of inbound
-  frames, an application that did not poll). A long delay of that kind raises the burst of the pacer for many wake-ups: the lateness decays by a factor of 7/8 per pacer wake-up (about 16 wake-ups to an eighth), and wake-ups come only while the pacer is armed.
+  frames, an application that did not poll). A long delay of that kind raises the burst of the pacer for many wake-ups: the lateness decays by a factor of 7/8 per pacer wake-up
+  (about 16 wake-ups to an eighth), and wake-ups come only while the pacer is armed.
 - **Windows:** slow start after idle, and the timer-driven pacer on a 15.6 ms timer, are unverified.
 - **Passed:** uniform loss (0.1%, 1%) and burst loss (TCP is the limit; no over-cut), and GRO/TSO/GSO on (no effect).
