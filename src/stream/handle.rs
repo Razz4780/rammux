@@ -44,7 +44,7 @@ impl StreamHandle {
             now: Instant::now(),
         };
         if let Some(credit) = credit {
-            outbound.received_window_update(credit.get(), &mut ctx)?;
+            outbound.received_window_update(credit, &mut ctx)?;
         }
         inbound.received_data(data, ctx.global)?;
         if fin_write {

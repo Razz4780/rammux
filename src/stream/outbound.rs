@@ -1,6 +1,6 @@
 use std::{
     io,
-    num::NonZeroU16,
+    num::{NonZeroU16, NonZeroU32},
     ops::Not,
     task::{Poll, Waker},
 };
@@ -222,19 +222,16 @@ impl OutboundTraffic {
     /// The peer returned credit. The bytes go back to the shared pool, not to this stream.
     pub fn received_window_update(
         &mut self,
-        credit: u32,
+        credit: NonZeroU32,
         ctx: &mut Ctx<'_>,
     ) -> Result<(), StreamError> {
-        if credit == 0 {
-            return Ok(());
-        }
         if let OutboundState::Closed {
             fin_state: FinState { received: true, .. },
         } = &self.state
         {
             return Err(StreamError("sent window update after FIN_READ"));
         }
-        let credit = u64::from(credit);
+        let credit = u64::from(credit.get());
         let unacked = self
             .ledger
             .unacked
@@ -367,7 +364,6 @@ impl Ledger {
                 self.join_turns_front(ctx);
                 return None;
             }
-            self.note_window_limit(ctx, window_room, full);
             self.sent(ctx.global, n);
             if window_room.is_some() && self.queued {
                 self.after_turn(ctx, waiting, n);

@@ -522,11 +522,6 @@ pub struct Rig {
     start: Instant,
 }
 
-/// A clock that runs fast or slow: `ppm` parts per million.
-pub fn skewed_clock(ppm: i64) -> Clock {
-    Clock::skewed(ppm)
-}
-
 impl Rig {
     /// A symmetric link.
     pub fn new(mbit: f64, rtt: Duration, config: RammuxConfig) -> Self {
@@ -579,7 +574,7 @@ impl Rig {
             RammuxRole::Server,
             server_io,
             server_config,
-            skewed_clock(server_ppm),
+            Clock::skewed(server_ppm),
         )
         .unwrap();
         let (open, open_rx) = mpsc::unbounded_channel();

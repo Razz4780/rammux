@@ -49,6 +49,10 @@ mod state;
 mod wire_test;
 
 /// How many inbound frames are processed in a row before outbound frames get a turn.
+///
+/// It bounds how long a flood of inbound frames can hold back the sending side, and so the delay of
+/// our `PONG`s and credit. The value is a round number of the order of the frames a single read of a
+/// busy transport yields, not a derived one.
 const INBOUND_BATCH: usize = 16;
 
 /// State machine of a single rammux connection.
@@ -567,6 +571,8 @@ pub struct RammuxStats {
     /// a peer that would make it do so violates the protocol, and the connection fails.
     pub pool_rx_used: u64,
     /// Count of streams waiting for their turn to use the shared pool.
+    ///
+    /// With `DelayControl` it also counts the streams that wait for room in the connection window.
     pub turn_queue_len: u32,
     /// Measurements and the window of `DelayControl`.
     ///
