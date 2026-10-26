@@ -59,8 +59,10 @@ rammux writes each frame (its header and its payload) with one vectored write. A
 implement vectored writes natively (`is_write_vectored()` is false) gets two writes per frame, the header and then the
 payload, which costs a system call or a packet more. Wrap such a transport in a buffered writer
 (`tokio::io::BufWriter`, or `BufStream` for both directions): rammux flushes after the last frame it has ready,
-so nothing is held back. A buffered reader is fine too: its buffered bytes stay in the transport that the
-downgrade returns.
+so nothing is held back. Wrap the reading side too (`BufStream` does both): the decoder reads the flags of a
+frame, then the rest of its header, then the payload, so a bare `TcpStream` costs two to three `recv` calls per frame
+and a buffered reader makes it one or two. The bytes a buffered reader holds stay in the transport that the downgrade
+returns.
 
 rammux does not define an in-band handshake. Before running the protocol,
 the application must agree on compatible configuration and roles.

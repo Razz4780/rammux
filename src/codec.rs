@@ -50,8 +50,15 @@ pub mod encoder;
 /// A transport without native vectored writes (`is_write_vectored()` is false) gets tokio's default
 /// `poll_write_vectored`, which writes the header, and the payload with the next call: two writes per frame.
 /// Such a transport is best wrapped in a buffered writer (e.g. `tokio::io::BufWriter`), which this codec flushes
-/// after the last frame it has ready. A buffered reader is fine: what it has buffered stays in the transport
-/// returned by the downgrade.
+/// after the last frame it has ready.
+///
+/// # Decoder
+///
+/// A header has a variable length that the flags (its first 2 bytes) determine, and the codec never reads past
+/// the end of a frame, so a `DATA` frame takes three reads of the transport: the flags, the rest of the header,
+/// and the payload (a control frame takes two). On a bare socket each is a system call, so wrap the transport in
+/// a buffered reader too (`tokio::io::BufStream` does both directions). What a buffered reader holds stays in
+/// the transport returned by the downgrade.
 pub struct RammuxCodec<IO> {
     io: IO,
     pending: Option<EncoderItem>,
@@ -735,7 +742,8 @@ mod tests {
             ..stream_frame(7, syn(), 100, b"payload")
         };
         let mut send = Box::pin(codec.send(frame));
-        // Accepts 4 bytes, then the rest 4 at a time, while time passes.
+        // The transport accepts 4 bytes per write, and the clock moves between the attempts: a header
+        // that was encoded again at every attempt would carry a later `PING` timestamp.
         for _ in 0..3 {
             let _ = send.as_mut().now_or_never();
             tokio::time::advance(Duration::from_micros(100)).await;

@@ -139,8 +139,14 @@ pub struct RammuxConfig {
     pub transit_control: TransitControl,
     /// A `PING` is sent when this much `DATA` was written since the last one.
     ///
-    /// The latest `PING` read is answered with a `PONG`, which gives the peer a round trip time sample.
+    /// The peer answers the latest `PING` it has read with a `PONG`, which gives us a round trip time sample.
     /// Several `PING`s can be in flight.
+    ///
+    /// With [`TransitControl::DelayControl`] the spacing is at most a quarter of the connection window
+    /// (`min(ping_bytes, W / 4)`), and the samples are the input of the window, so this value also sets
+    /// how many samples the window sees per round trip. A larger value means fewer samples: the stop of the
+    /// window's fast growth, which needs 8 of them, takes longer, and the standing minimum that filters
+    /// out jitter has less to filter with. Leave it at the default unless you measure otherwise.
     ///
     /// This value is a local knob and does not have to be negotiated.
     pub ping_bytes: NonZeroU32,

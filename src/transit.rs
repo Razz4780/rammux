@@ -8,6 +8,11 @@ use tokio::time::Instant;
 pub const ALLOWANCE_RTTS: f64 = 2.0;
 
 /// Bytes of credit at which the receiver returns credit to the sender, unless the base window is small.
+///
+/// Two frames of the default size: credit comes back at least every couple of frames, so the sender
+/// does not wait for a half window, and the control frames stay a small share of the data (about 1700
+/// per second at 150 Mbit/s with all of them counted, see "Known limits" in `TRANSIT_CONTROL.md`).
+/// A tuning choice, not a derived value.
 pub const CREDIT_THRESHOLD: u32 = 32 * 1024;
 
 /// Weight of a new round-trip time sample in the smoothed one.

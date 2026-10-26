@@ -35,7 +35,7 @@ protection against stalled readers.
 | `P_rx`, `U_rx` | Receiver side: our pool (`local_recv_pool`), and the peer's use of it. |
 | `unacked_s` | Bytes sent on stream `s` and not credited back. Each side tracks it for both directions of every stream. |
 | `borrowed_s` | `max(0, unacked_s - B)`: the stream's use of the pool. `U = sum of borrowed_s`, held in `u64`. |
-| `T_c` | Credit threshold, `min(32 KiB, B / 2)`. |
+| `T_c` | Credit threshold, `max(1, min(32 KiB, B / 2))`. |
 | `R_s`, `A_s` | Rate estimate of the stream (a decaying sum of its credit with the time constant `srtt`), and its allowance `R_s * tau_s`. |
 | `tau_s` | `k * srtt`, with `k = 2`: how long the allowance covers. |
 | `srtt` | Smoothed round trip time (EWMA, gain 1/8, at least 1 us) of `PING`/`PONG` exchanges. |
@@ -60,8 +60,9 @@ keeps `U_tx <= P_tx` never makes `U_rx > P_rx`. A frame that does is a protocol 
 - **Credit** is the bytes the application has read from the stream and not credited yet. `WINDOW(credit)` is sent
   once credit reaches `T_c`, not later (waiting for more would delay the sender) and not for every read
   (control frames are not free).
-- **No deadlock:** `T_c <= B / 2 < B` and the sender can always fill `B`. A stream with less than `T_c` uncredited
-  bytes therefore always has room to send.
+- **No deadlock:** for `B >= 2`, `T_c <= B / 2 < B` and the sender can always fill `B`, so a stream with less than `T_c`
+  uncredited bytes always has room to send. For `B = 1`, `T_c = 1 = B`: the one byte is credited as soon as it is read,
+  so the sender never waits for credit that is not coming.
 - **After `FIN_READ`** the stream's counter is zero (that returns its share of the pool at the sender too), the
   data that is still in flight is discarded without error, and no credit is sent. Such data still counts in `rx_bytes`.
 - Nothing is tuned here: no RTT, no rates, no window growth.
@@ -89,7 +90,7 @@ Two time spans, chosen deliberately:
 - **Average over one loop (`srtt`).** After a loop the estimate mostly reflects that loop's credit, so the window of a
   new stream about doubles per loop while its reader keeps up: the growth of yamux and of the adaptive window of HTTP/2.
 - **Allow `k = 2` loops (`tau_s`).** The steady allowance is about twice what the stream has in flight.
-- **The cost:** a noisier estimate (the ripple of batched credit is `P_c / (2 * srtt)`, which does not matter,
+- **The cost:** a noisier estimate (the ripple of batched credit is about `batch / (2 * srtt)`, where a batch is the credit returned at once, at least `T_c`; it does not matter,
   because the pool binds first), and a stream forgets after a pause of about one loop. Averaging over `tau_s`
   itself would read simpler, but a new stream would grow only about 1.65 times per loop.
 
@@ -150,11 +151,12 @@ Why:
   The connection window of DelayControl is the exception, see below: it never splits a frame.
 - **Free room never lets a stream skip the queue.** A stream woken by its own credit must not take shared room while
   others are queued ahead of it, even if room is free. Otherwise the split freezes again.
-- **[DC] A frame within the stream's base window skips the turns** (fq_codel's sparse flows). The turns share the
-  connection window between streams that borrow; a stream within its base window sends at most a base window per
-  round trip, so letting it go first costs the borrowers little and keeps small requests and replies from waiting
-  behind their frames. If the window has no room, it waits at the front of the queue. On wan100 and k8s it removed the
-  ~1 ms (p50) and up to 25 ms (p99, bulk both ways) that small writes waited behind bulk turns.
+- **With the connection window, a frame within the stream's base window skips the turns** (fq_codel's sparse flows).
+  The turns share the connection window between streams that borrow; a stream within its base window sends at most a
+  base window per round trip, so letting it go first costs the borrowers little and keeps small requests and replies from
+  waiting behind their frames. If the window has no room, it waits at the front of the queue. On emulated 100 ms paths
+  with bulk both ways this removed about 1 ms at the median and up to 25 ms at the 99th percentile that small writes
+  waited behind bulk turns.
 - **No byte-count semaphore.** A stream's allowance keeps decaying while it waits. A semaphore fixes the amount at
   request time, so it could grant a stalled stream more than its allowance, and that stream would hold up the queue.
 - **Credit and `FIN_READ` are never held back** by the queue: they go out with the next frame of the connection.
@@ -166,7 +168,7 @@ A stream limited by its allowance delivers `r = (B + A) / L`, where `L` is the l
 
 **Growth to the pool.** `A` keeps growing until the pool binds. The queue then settles near
 `(N * B + P) / C`, capped by the bottleneck buffer (`N` busy streams, `C` the bottleneck rate). That is the
-behavior of yamux, quiche, gRPC and the rammux before this design.
+behavior of yamux, quiche, gRPC and of the pool-only mode.
 
 **Startup.** Each loop, a full window `W = B + A` of credit comes back. The estimate averages over about one loop,
 so afterwards `R_s` is about `W / srtt` and `A_s` about `k * W`; the next window is about `B + 2 * W`. So the window of a
@@ -174,7 +176,7 @@ new stream about doubles per loop (a bit faster at the very start, as `B` comes 
 2.3 to 3 times in the first loops). That matches yamux, TCP slow start and the adaptive window of HTTP/2.
 
 **Shares.** Once the pool binds, each stream's allowance has about 2x slack, so the pool and not the allowance
-decides each busy stream's share, and the turn queue makes that share equal (in turns, see the known limit 7). Freed room arrives at the link rate
+decides each busy stream's share, and the turn queue makes that share equal (in turns, see limit 7 of "Known limits (per-stream rules)"). Freed room arrives at the link rate
 `C` and is handed out in turns, so each of `n` waiting streams gains `C / n`; each stream loses room at its own
 delivery rate, proportional to what it holds. The streams settle where each delivers `C / n`; the imbalance shrinks
 within about one loop time. A newcomer is limited only by its own allowance ramp, which about doubles per loop: in the example above (330 ms
@@ -183,7 +185,7 @@ loops), Y reaches an even split in about 5 loops, roughly 1.7 s.
 **Slow and stalled readers** never queue, because their allowance blocks them first. A slow reader keeps its read rate,
 and the fast streams share the rest (max-min fair).
 
-## Known limits
+## Known limits (per-stream rules)
 
 1. **New and resumed streams ramp up from `B`** at about twice per round trip: a 0.5-1 MB response on a 100 ms path
    takes 3-4 round trips. hyper with its default 2 MiB windows takes about 1, rust-yamux (256 KiB, doubling) 2-3.
@@ -201,7 +203,7 @@ and the fast streams share the rest (max-min fair).
 7. **A turn moves one frame, and a frame holds at most one write.** The turn queue equalizes the number of frames,
    not bytes. A stream that writes less than `frame_limit` at a time sends smaller frames, and gets a share that
    follows the size of its writes. Example: a background stream sending 2500-byte messages competes with a bulk
-   stream whose frames are 16 KiB (dsl10): they split the pool about 2500 to 16384, so the background stream gets
+   stream whose frames are 16 KiB: they split the pool about 2500 to 16384, so the background stream gets
    about 13% of it and not half (the simulated link pins a 2 KiB against a 16 KiB writer at 1 to 8). Equal shares between
    busy streams need writes of at least `frame_limit` bytes. Shares by bytes would need turns that carry an amount,
    which has its own costs (see "No byte-count semaphore").
@@ -219,16 +221,17 @@ by `alpha` per round trip, spread over the `PONG`s of the round trip (Copa's per
 - the target is `alpha` bytes and not `1/delta` packets;
 - the signal is the **one-way** forward queue, which the reverse direction does not disturb;
 - in-flight counts only bytes on the **forward** path (`fwd_in_flight`), which keeps bulk in both directions stable;
-- the excess is cut **in one step** when the connection holds far more than `alpha`, instead of Copa's velocity;
+- the excess over `alpha` is shed in about a round trip (the excess cut), instead of Copa's velocity;
 - Copa's minimum of the last 10 s is replaced by a checked **re-baseline**.
 
 What we give up: `DelayControl` does not compete with buffer-filling traffic such as a CUBIC download. Against it, the
-connection yields most of the link (the queue is the competitor's). Why a window, why connection-wide, and why
-delivered bytes: every stream's bytes wait in the same TCP queue, so the connection limits the delay once; and the
-window counts delivery to the peer's rammux (`rx_bytes` in `PONG`s) and not credit, because credit waits for the
-application to read, and one stalled reader would then block everyone (300 KB unread in a stream that nobody reads
-would sit inside `W` forever). This is the split TCP makes: the receive window covers the reader, the congestion window
-the network.
+connection yields most of the link (the queue is the competitor's).
+
+**Why a window, why connection-wide, and why delivered bytes.** Every stream's bytes wait in the same TCP queue, so
+the connection limits the delay once. The window counts delivery to the peer's rammux (`rx_bytes` in `PONG`s) and not
+credit, because credit waits for the application to read, and one stalled reader would then block everyone: 300 KB
+unread in a stream that nobody reads would sit inside `W` forever. This is the split TCP makes: the receive window
+covers the reader, the congestion window the network.
 
 **Why it is fair.** At the fixed point every connection holds `alpha` bytes queued: `rate * q_fwd = alpha`.
 Connections that share a bottleneck see the same `q_fwd`, so they get the same rate, whatever their base round trip.
@@ -254,42 +257,46 @@ All are per connection and updated on every `PONG` (the clocks of the two sides 
 **Why `fwd_in_flight`.** With bulk in both directions, `PONG`s queue behind the peer's data. When the peer's queue
 drains, a backlog of reports arrives at once, `in_transit` collapses, and a window on `in_transit` would release a burst
 of megabytes: the ACK compression of two-way traffic. Subtracting what is delivered but not reported yet keeps both
-directions busy and short. (Without it, the bulk-both-ways simulation reaches 80% of the link instead of 93%.)
-The subtraction does not grow with the time since the last `PONG`: a stall of the forward path has no reports, and must
-not open the window. Bursts are the pacer's business.
+directions busy and short. (In simulation, bulk both ways reaches about 80% of the link without the subtraction and
+about 93% with it.) The subtraction does not grow with the time since the last `PONG`: a stall of the forward path has
+no reports, and must not open the window. Bursts are the pacer's business.
 
 ### The window
 
-- **Start and floor.** `W` starts at 4 frames and never drops below 4 frames: one floor everywhere (the cut, the steps, the stop of the growth), so that the `PING` spacing of `W / 4` bytes always leaves room for a frame.
-- **Enforcement.** Every DATA byte needs room in the window and the turn: `conn_room = if has_turn { W - fwd_in_flight }
-  else { 0 }` caps what a stream sends in every step of its polling order. A stream that only the window or the turn
-  keeps from sending joins the queue, and the front is woken when a `PONG` frees room. Credit, `PONG`s and
-  `PING`s are never held back by the window.
+- **Start and floor.** `W` starts at 4 frames and never drops below 4 frames: one floor everywhere (the excess cut, the
+  steps, the stop of the growth), so that the `PING` spacing of `W / 4` bytes always leaves room for a frame.
+- **Enforcement.** Every DATA byte counts against the window: a frame is sent only if `W - fwd_in_flight` has room for
+  all of it. A frame that borrows from the pool also needs the turn (`conn_room = if has_turn { W - fwd_in_flight } else
+  { 0 }`). A frame within the stream's base window skips the turns: it needs only room in the window, and if there is
+  none, the stream waits at the front of the queue. A stream that the window or the turn keeps from sending joins the
+  queue, and the front is woken when a `PONG` frees room. Credit, `PONG`s and `PING`s are never held back by the window.
 - **The window never splits a frame** (silly window avoidance, RFC 813 and RFC 1122 4.2.3.4). A frame the stream
   could send otherwise goes whole, or waits until the window has room for all of it. Room in the window opens with
   every `PONG`, a few bytes at a time, and a blocked frame asks for a `PING`, whose `PONG` opens a few more: a sender
-  that fills every opening ends up sending a frame and a `PING` per `PONG`. On wan100 that was 330 000 frames of 20
-  bytes per second each way, whose headers, segments and CPU made the queue that the window then measured (about half
-  of the link was data). Waiting cannot block for good: a frame is at most `frame_limit`, which is the floor of `W`, so
-  a drained window always has room for it.
-- **Pacing** (Copa's rule): DATA leaves at most at `2 * W / srtt`, with bursts of at most two frames or 2 ms of that
-  rate (tokio's timer wakes the sender about once a millisecond). Without it, data leaves when delivery reports
+  that fills every opening ends up sending a frame and a `PING` per `PONG`. On a 150 Mbit/s path with 100 ms of delay
+  that was hundreds of thousands of frames of 20 bytes per second each way, whose headers, segments and CPU made the
+  queue that the window then measured (about half of the link was data). Waiting cannot block for good: a frame is at
+  most `frame_limit`, which is the floor of `W`, so a drained window always has room for it.
+- **Pacing** (Copa's rule): DATA leaves at most at `2 * W / srtt`. A burst is at most two frames plus 2 ms of that rate
+  (`2 * frame_limit + pace_rate * max(2 ms, timer_lateness)`), where `timer_lateness` is the smoothed lateness of the
+  pacer's own timer: on a platform whose timer wakes the sender every 15.6 ms (Windows), 2 ms of burst would cap the
+  rate at a fraction of the link, so the burst follows the timer. Without pacing, data leaves when delivery reports
   arrive. With bulk both ways the reports wait behind the peer's data and arrive in clumps (the ACK compression of
   two-way traffic), so the window opens in clumps and goes out in bursts at the speed of the local link. The
-  bottleneck queues each burst and then idles until the next one. On k8s with bulk both ways the sender was idle in
-  half of the 20 ms slots and its download ran at 121 Mbit/s with 25-70 ms of queue; paced, it is idle in 1% of them
-  and runs at 133 Mbit/s. A userspace sender cannot see the queues that bunch its reports, so it keeps its own clock.
-  A frame that the pacer holds back wakes the sender on a timer, and only the window (not the pacer) counts as
-  limiting for the growth of `W`.
-- **One law, two states `(W, g)`** (math review 4, "L1"). `W` is the window; `g` is the growth,
-  in bytes per round trip, while the queue is below the target. There is no startup mode: startup is `g` growing from the
-  first round trip. Each `PONG` that delivers `delivered` bytes has the share `s = min(delivered / W, 1)` of a round trip:
+  bottleneck queues each burst and then idles until the next one. On a 150 Mbit/s path with 100 ms of delay and bulk
+  both ways, an unpaced sender was idle in half of the 20 ms slots, and its download ran about 10% lower with 25-70 ms
+  of queue; paced, it is idle in 1% of them. A userspace sender cannot see the queues that bunch its reports, so it
+  keeps its own clock. A frame that the pacer holds back wakes the sender on a timer, and only the window (not the
+  pacer) counts as limiting for the growth of `W`.
+- **One law, two states `(W, g)`.** `W` is the window; `g` is the growth, in bytes per round trip, while the queue is
+  below the target. There is no startup mode: startup is `g` growing from the first round trip. Each `PONG` that
+  delivers `delivered` bytes has the share `s = min(delivered / W, 1)` of a round trip:
 
   ```text
   stop = max(own, own8) >= alpha          own8: the same test on the newest 8 raw samples
   if stop and g > alpha:  W = min(W, fwd_in_flight), g = alpha
   if own <  alpha and limited:  W += g * s
-  if own >= alpha:              W -= (alpha + max(0, own - 2 alpha)) * s        (the relay, and S6)
+  if own >= alpha:              W -= (alpha + max(0, own - 2 alpha)) * s        (the excess cut)
   ```
 
   Once per round trip (when a `PONG` arrives for a `PING` sent after the previous update), `g` doubles, but never beyond
@@ -298,133 +305,149 @@ not open the window. Bursts are the pacer's business.
   - **`limited`** has one meaning everywhere: the window kept a frame from being sent within the last `srtt`.
   - **The stop.** A geometric `g` overshoots by what the delay of the measurement hides, about a doubling. It ends on
     the first `PONG` that shows `alpha` queued, by the standing minimum of `srtt / 2` (`own`) or by the smallest of the
-    newest 8 raw `owd_out` samples above the base delay (`own8`, HyStart's 8, against jitter), whichever is first, and the
-    window keeps only what is on the path. The update alone sees a doubling's queue only a round trip later, when the
-    window has doubled again: 1 to 3 BDP of excess (70-120 ms of queue for about a second on k8s). The same stop ends
-    the first growth and the recovery after room appeared, because it is the same physics.
+    newest 8 raw `owd_out` samples above the base delay (`own8`, HyStart's 8 samples, against jitter), whichever is
+    first, and the window keeps only what is on the path (the unsent part of a doubled window would only queue). The
+    update alone sees the queue of a doubling only a round trip later, when the window has doubled again, which is 1 to
+    3 bandwidth-delay products of excess. The same stop ends the first growth and the recovery after room appeared,
+    because it is the same physics.
   - **The rise.** The threshold does not depend on `g`: the rate lags the window by 2-3 round trips, so the rise it
     shows is the step of two updates back, and a threshold of `g / 2` would fail at the third doubling by construction
-    (the 1-2-4 sawtooth). That lag is also the test's safety: if the TCP below, not the window, limits the rate, the rate
+    (a 1-2-4 sawtooth). That lag is also the test's safety: if the TCP below, not the window, limits the rate, the rate
     does not rise and `g` falls back to `alpha` within a round trip. While the rate has less than two `srtt` of
     deliveries (its first rounds, from zero), its rise says nothing and the test is passed: a property of the
     estimate, not a mode.
-  - **S6.** The decrease sheds the excess over `alpha` in about one round trip, spread over the `PONG`s (the mean of the
-    round trip's measurements, not the `own` of one spike: wifi chain p99 843 -> 770 ms). Its gain of 1 is
-    load-bearing: the `own` it reads is a round trip old, so it over-cuts a falling queue by about `1 + q / d`, and that
-    over-cut is what lets the queue touch nearly empty within each re-baseline history.
-  - The steps are **spread over the `PONG`s** (Copa's per-ACK update): each `PONG` moves `W` by `alpha * delivered / W`,
-    in the direction its own `own` says. With one step per round trip, connections on one bottleneck saw the same queue
-    swing by `2 alpha / C` per round trip, more than the band `alpha / R1 .. alpha / R2` where only the faster one
-    steps down; both stepped the same way at nearly every update, and the split froze at 0.39-0.62 on k8s, decided by
-    the phase of the updates in the swing; spread, it is 0.46-0.52. The cost: the queue averages `alpha`, and at 10
-    Mbit/s (`alpha` = 52 ms) the loop's swing is about as large, so the queue empties 4-7% of the time.
-  - **Four couplings, written at the rules in `delay.rs`:** S6's gain of 1 and the drain that the re-baseline test
-    needs; the lag of the rate and the safety of `g`; `ping_bytes` and the time span of the 8-sample test and of the
-    standing minimum; the pacer's `srtt` (it includes `q_back`) and the window (it excludes `R * q_back`), where the
-    pacing gain of 2 is the margin.
-- **No idle decay** (an earlier design had one). An update where `W` did not limit sending neither grows nor
-  lowers `W`, and the growth does not start again: after an idle period `W` is as it was. That design cut it to
-  `max(4 frames, min(W, 2 * used))` (TCP's congestion window validation) and restarted startup; the pacer now bounds the
-  burst of a restart, and the decrease (the cut and the steps, which never wait for `limited`) brings `W` down if the
-  path got slower.
-
-Why the one-step cut: when the capacity drops, steps of `alpha` per round trip cannot shed the excess while the round
-trip itself is seconds long. With the cut, a 150 to 10 Mbit/s drop is back under 150 ms of queue in about 3 to 4 s.
+  - **The excess cut.** The decrease sheds the excess over `alpha` in about one round trip, spread over the `PONG`s,
+    so that it follows the mean of the round trip's measurements and not the `own` of one spike. Its gain of 1 is
+    load-bearing: the `own` it reads is a round trip old, so it over-cuts a falling queue by about `1 + q / d` (`q` the
+    queue, `d` the delay of the measurement), and that over-cut is what lets the queue touch nearly empty within each
+    re-baseline history (see the drain invariant below). When the capacity drops, steps of `alpha` per round trip could
+    not shed the excess while the round trip itself is seconds long; the excess cut does, and a drop from 150 to 10
+    Mbit/s is back under 150 ms of queue in about 3 to 4 s.
+  - **The steps are spread over the `PONG`s** (Copa's per-ACK update): each `PONG` moves `W` by `alpha * delivered / W`,
+    in the direction its own `own` says. With one step per round trip, connections on one bottleneck would see the same
+    queue swing by `2 alpha / C` per round trip, more than the band `alpha / R1 .. alpha / R2` where only the faster one
+    steps down. Both would step the same way at nearly every update, and the split would freeze wherever the phase of the
+    updates in the swing put it (in simulation 0.39-0.62 for two equal connections; spread, 0.46-0.52). The cost of
+    spreading: the queue averages `alpha`, and when `alpha / C` is as large as the loop (52 ms at 10 Mbit/s), the swing of
+    the loop is about as large as the queue, so the queue empties 4-7% of the time.
+- **No idle decay.** An update where `W` did not limit sending neither grows nor lowers `W`, and the growth does not
+  start again: after an idle period `W` is as it was. Cutting `W` to what was used (TCP's congestion window validation)
+  and restarting startup is not needed: the pacer bounds the burst of a restart, and the decrease (the excess cut and
+  the steps, which never wait for `limited`) brings `W` down if the path got slower.
 
 `PING`s: the window needs a fresh sample every round trip. On top of the usual cadence, a `PING` goes out after
-`min(ping_bytes, W / 4)` bytes of DATA, and at once when the window blocks a frame and DATA was sent since the last `PING`.
+`min(ping_bytes, W / 4)` bytes of DATA, and at once when the window blocks a frame and DATA was sent since the last
+`PING`.
+
+### Couplings
+
+Four places where two rules depend on each other. Each is written at its rule in `delay.rs`; change one side and
+check the other.
+
+- **The gain of 1 of the excess cut and the re-baseline drain.** The `own` that the cut reads is a round trip old, so the
+  cut over-cuts a falling queue, and that over-cut is what lets the queue touch nearly empty within each re-baseline
+  history. A smaller gain leaves the queue standing and the base delay creeps up.
+- **The lag of the rate and the safety of `g`.** The rate lags the window by 2-3 round trips; if the TCP below does not
+  answer a doubling with a rate, the rise test fails and `g` returns to `alpha` within a round trip. A rate with no lag
+  would let a doubling overshoot by megabytes against a send buffer.
+- **`ping_bytes` and the sample windows.** The 8 newest samples span `8 * min(ping_bytes, W / 4) / R`, so the `PING`
+  spacing also sets the speed and jitter tolerance of the 8-sample stop and the number of samples in the standing
+  minimum.
+- **The pacer's `srtt` and the window.** `srtt` includes `q_back`; the window excludes `R * q_back`. Once
+  `q_back > RTT_base + q_fwd` the pace `2 W / srtt` falls below `R`, and `W` stops growing while the pacer binds. The
+  pacing gain of 2 is the margin that hides this in steady state; a reverse queue beyond a round trip is what it does
+  not cover.
+
+**The drain invariant.** At low bandwidth-delay product (`alpha` larger than the BDP, e.g. 10 Mbit/s with a 40 ms round
+trip), the queue empties only because the excess cut over-cuts, and that works because `R * q_fwd` overstates the bytes we
+really hold. Capping `own` by `fwd_in_flight` is physically true but loose by about a BDP, and it removed that
+overstatement: on a 10 Mbit/s link the share of 1 s windows draining to 2 ms or less fell from 0.65 to about 0,
+re-baselines rose from 2 to 12 per minute, and a 15 ms standing queue appeared. So any change to `own` or to the excess
+cut must be checked against the drained share (0.65) and the re-baseline rate (about 2 per minute).
 
 ### Keeping the base delays honest: the re-baseline test
 
 The base delay can rise: a route change, a delay swing, clock drift, a queue of someone else that we cannot drain. Only our
-own response tells these apart from our queue. On every `PONG`, for each direction, the raw samples of the last 5 `srtt` are
-compared with the *current* base delay (a queue computed against an older base would make the test fire again on every
-`PONG`): if no sample had a nearly empty queue, the base delay is raised to the smallest raw sample. There is no condition
-on `W`, so a steady phantom delay never counts as nearly empty, which covers idle and application-limited connections.
-The test needs a history of 5 `srtt` since the first sample or since the last re-baseline (otherwise it takes the queue
-of the startup for the path, and repeats as soon as the sample it was based on leaves the window).
+own response tells these apart from our queue. On every `PONG`, for each direction (the same test for both), the raw
+samples of the last 5 `srtt` are compared with the *current* base delay (a queue computed against an older base would make
+the test fire again on every `PONG`): if no sample had a nearly empty queue, the base delay is raised to the smallest raw
+sample. There is no condition on `W`, so a steady phantom delay never counts as nearly empty, which covers idle and
+application-limited connections. The test needs a history of 5 `srtt` since the first sample or since the last
+re-baseline (otherwise it takes the queue of the startup for the path, and repeats as soon as the sample it was based on
+leaves the window).
 
 "Nearly empty": some sample of the window had a queue of at most a quarter of the largest standing queue of the window
 (the standing value, the minimum of `srtt / 2`, keeps spikes of jitter out of the peak). Copa's own test uses 10% of the
 largest raw sample; it assumes that the queue empties, and two connections of ours with different round trips do not empty
 their joint queue together (below).
 
-The test is sound only if our own queue empties within its 5 round trips. With one step of `alpha` per round trip it did not
-(the queue cycled between `alpha / 2` and `2 alpha`), and on wan100 the test ratcheted the base delay from 55 to 112 ms in
-120 s. With the steps spread over the `PONG`s the queue swings around `alpha` and empties now and then, and the test no
-longer ratchets: 120 s of bulk on wan100 and dsl10 keep the same ping round trip from start to end, and the simulation holds
-one or two connections flat for 300 s.
+The test is sound only if our own queue empties within its 5 round trips. With one step of `alpha` per round trip it does
+not (the queue cycles between `alpha / 2` and `2 alpha`). With the steps spread over the `PONG`s the queue swings around
+`alpha` and empties now and then, and the test does not ratchet: in simulation, one or two connections hold the same ping
+round trip from the start to the end of minutes of bulk.
 
-Rejected: a variant that also counted a queue of at most `2 alpha / R_max` (`R_max`: the largest rate of the last 10 s) as
-nearly empty, i.e. one that our own target explains. It seals a phantom delay in: at the fixed point the rate is about
-`alpha / phantom`, and that rate is what makes `2 alpha / R_max` large enough to explain the phantom. Per-packet jitter is such
-a phantom: netem keeps the order of packets, so under load each packet waits for the slowest one before it, and the loaded
-path is 10-13 ms slower (wifi scenario) than the fastest sample, which sets the base delay. On netem, 2 repeats each, against
-Copa's test: wifi bulk down 36.3 Mbit/s against 91.2, wifi with two connections 0.24 / 0.76 against 0.51 / 0.49, k8s_swing
-90.5 against 103. A drain of the queue on top of the steps was also rejected: it cost 3-15% where it was tried.
+**Alternatives that fail.**
 
-Two connections with different round trips (the bench's `--dual-extra-ms`, one connection 50 or 100 ms farther each way,
-through the same bottleneck) do not empty their joint queue within 5 round trips of each. With Copa's 10% they took part of
-each other's queue for the path: on wan100 with +50 ms the ping round trip climbed from 65 to 140-185 ms in 120 s, on k8s
-from 113 to 160-175 ms (12 of 12 runs), and its minimum stayed at the base, so the queue did empty, just not often enough.
-With a quarter of the standing peak it stays at 67 and 112-118 ms (24 of 24 runs at +50 and +100 ms), with no cost found
-elsewhere (wifi, k8s_swing, dsl10, wan100, k8s; bulk down, both ways, two connections). The connection with the longer round
-trip gets 0.56-0.62 of the two (the multiplexers without a window give it 0.30-0.41).
+- Also counting a queue of at most `2 alpha / R_max` (`R_max`: the largest rate of the last 10 s) as nearly empty, i.e. one
+  that our own target explains. It seals a phantom delay in: at the fixed point the rate is about `alpha / phantom`, and
+  that rate is what makes `2 alpha / R_max` large enough to explain the phantom. Per-packet jitter is such a phantom: a
+  path that keeps packet order makes each packet wait for the slowest one before it, so under load the path is slower
+  than the fastest sample, which sets the base delay, by most of the jitter. On an emulated path with 20 ms of such
+  jitter, this variant gave bulk download 36 Mbit/s against 91 Mbit/s with the quarter-of-peak test, and two connections
+  split 0.24 / 0.76 instead of 0.51 / 0.49.
+- A drain of the queue on top of the steps cost 3-15% of throughput where it was tried.
+- Copa's 10%, with two connections whose round trips differ (one 50 or 100 ms farther each way, through the same
+  bottleneck): their joint queue does not empty within 5 round trips of each, they take part of each other's queue for the
+  path, and the ping round trip climbed from 65 to 140-185 ms in 120 s on a 100 ms path (from 113 to 160-175 ms on a
+  path with large delay swings). The queue did empty, just not often enough. With a quarter of the standing peak it stays
+  at 67 and 112-118 ms, with no cost found elsewhere (jitter, delay swings, 10 and 100 Mbit/s, bulk down, both ways, two
+  connections). The connection with the longer round trip gets 0.56-0.62 of the two (multiplexers without a window give
+  it 0.30-0.41).
 
-The back direction always uses Copa's test. Its base delay can take in the bottom of the peer's queue of `alpha`; that
-makes `q_back` smaller and `fwd_in_flight` larger, so it errs on the side of sending less.
+The back direction uses the same test. Its base delay can take in part of the bottom of the peer's queue of `alpha`;
+that makes `q_back` smaller and `fwd_in_flight` larger, so it errs on the side of sending less.
 
-### Expected behavior and limits
+### Expected behavior
 
-- **Utilization** 93% to 100% in steady state; the queue is about `alpha / C` per connection of ours (3.5 ms at 150 Mbit/s,
-  52 ms at 10 Mbit/s), with the additions of the re-baseline test.
+- **Utilization** 93% to 100% in steady state; the queue is about `alpha / C` per connection of ours (3.5 ms at
+  150 Mbit/s, 52 ms at 10 Mbit/s), with the additions of the re-baseline test.
 - **Bulk both ways** is decoupled through `fwd_in_flight`.
 - **Fairness:** two connections split 50/50, also when one starts 5 s later and when one has 100 ms more round trip.
   Connections that re-baseline at different times make the split noisy (four connections at 10 Mbit/s: 19% to 36%).
 - **The queue grows with the number of our connections:** `N alpha / C`. Four connections at 10 Mbit/s with 64 KiB each
   make about a second in the simulation.
-- **A CUBIC-like competitor** gets most of the link (we keep about 12% in the simulation); the queue is theirs. No starvation.
-- **After an idle period** the window is as it was, and does not grow while the application does not limit
-  it. The restart goes out at the pacing rate (bursts of at most two frames or 2 ms), and the first `PONG`s measure the queue
-  it makes. A stale window on a changed path is corrected by the decrease, not by a restart.
-- **Interactive frames wait their turn when `W` binds:** every DATA byte then needs the turn, so a request waits behind the
-  frames of the bulk streams (one frame per turn each).
-- The pool (`local_recv_pool`) is only a memory limit in this mode. If it is smaller than what the path needs in flight, it
-  limits the throughput first (about 5.6 MB at 150 Mbit/s with a 300 ms loop).
+- **A CUBIC-like competitor** gets most of the link (we keep about 12% in the simulation); the queue is theirs. No
+  starvation.
+- **Interactive frames:** a frame within the stream's base window skips the turns, so a small request does not wait
+  behind the frames of the bulk streams for a turn; it waits only for room in the window, at the front of the queue.
+  Frames that borrow from the pool wait their turn, one frame per turn each.
+- **After an idle period** the window is as it was, and does not grow while the application does not limit it. The
+  restart goes out at the pacing rate (bursts of at most two frames plus 2 ms), and the first `PONG`s measure the queue it
+  makes. A stale window on a changed path is corrected by the decrease, not by a restart.
+- The pool (`local_recv_pool`) is only a memory limit in this mode. If it is smaller than what the path needs in flight,
+  it limits the throughput first (about 5.6 MB at 150 Mbit/s with a 300 ms loop).
 
-### Invariants
+### Known limits (DelayControl)
 
-Four places where two rules depend on each other. Each is written at its rule in `delay.rs`; change one side and check the other.
+Compared with raw TCP under the same impairment, on emulated links:
 
-- **S6's gain of 1 and the re-baseline drain.** The `own` that S6 reads is a round trip old, so S6 over-cuts a falling queue, and that
-  over-cut is what lets the queue touch nearly empty within each re-baseline history. A smaller gain brings the floor creep back.
-- **The lag of the rate and the safety of `g`.** The rate lags the window by 2-3 round trips; if the TCP below does not answer a
-  doubling with a rate, the rise test fails and `g` returns to `alpha` within a round trip.
-- **`ping_bytes` and the sample windows.** The 8 newest samples span `8 * min(ping_bytes, W / 4) / R`, so the `PING` spacing also sets
-  the speed and jitter tolerance of the 8-sample stop and the number of samples in the standing minimum.
-- **The pacer's `srtt` and the window.** `srtt` includes `q_back`; the window excludes `R * q_back`. The pacing gain of 2 is the margin.
-
-**The drain invariant.** At low BDP (`alpha` larger than the bandwidth-delay product, e.g. 10 Mbit/s), the queue empties only because
-S6 over-cuts, and that works because `R * q_fwd` overstates the bytes we really hold. Capping `own` by `fwd_in_flight` is physically
-true but loose by about a BDP, and it removed that overstatement: on a 10 Mbit/s link the share of 1 s windows draining to 2 ms or
-less fell from 0.65 to about 0, re-baselines rose from 2 to 12 per minute, and a 15 ms standing queue appeared. So any change to
-`own` or to S6 must be checked against the drained share (0.65) and the re-baseline rate (about 2 per minute).
-
-### Known limits
-
-Against raw TCP under the same impairment (netem benches):
-
-- **Stall or outage recovery.** After a 1 s hold (rate near 0), time to 90% of the rate is about 2.5 s against raw's 1.1 s, and the
-  10 s ratio is 0.82. Cause: `PING`s sent before the stall return after it, the standing minimum keeps that stale delay, `own` shows a
-  phantom queue, and S6 cuts `W` to the floor. The queue stays bounded (about 17-25 ms at the 95th percentile). Untried: drop delay
-  samples from `PING`s sent before a gap in deliveries.
-- **Wi-Fi aggregation.** On netem `slot` with 64 KiB aggregates: 0.88 of raw at `alpha` = 64 KiB, 0.91 at 128 KiB, because `alpha` is
-  about one aggregate. Raise `queue_target_bytes` on aggregating links.
-- **One-way loss starves the reverse feedback.** With bulk both ways and loss on one direction, the clean direction gets 0.41-0.75 of
-  raw: its reports come back behind the lossy direction's retransmissions. This is structural (a single byte stream); `Bufferbloat` is worse.
-- **Low-BDP links:** compared with the version that had velocity apart from startup, bulk both ways (upload) is 3% lower and a CUBIC
-  upload 5% lower on a 10 Mbit/s link, because `g` may double up to `W` at small `W`.
-- **A rise of the base delay** is cut as if it were our queue until the re-baseline accepts it (16-21% of 10 s throughput for
-  0.6-0.7 s).
-- **CUBIC share** is small by design. **Windows** slow start after idle is unverified.
+- **Stall or outage recovery.** After a 1 s hold (rate near 0), time to 90% of the rate is about 2.5 s against raw's 1.1 s,
+  and the 10 s ratio is 0.82. Cause: `PING`s sent before the stall return after it, the standing minimum keeps that stale
+  delay, `own` shows a phantom queue, and the excess cut takes `W` to the floor. The queue stays bounded (about 17-25 ms at
+  the 95th percentile). Untried: drop delay samples from `PING`s sent before a gap in deliveries.
+- **Wi-Fi aggregation.** With 64 KiB aggregates: 0.88 of raw at `alpha` = 64 KiB, 0.91 at 128 KiB, because `alpha` is about
+  one aggregate. Raise `queue_target_bytes` on aggregating links.
+- **One-way loss starves the reverse feedback.** With bulk both ways and loss on one direction, the clean direction gets
+  0.41-0.75 of raw: its reports come back behind the lossy direction's retransmissions. This is structural (a single byte
+  stream); `Bufferbloat` is worse.
+- **Low-BDP links:** on a 10 Mbit/s link, bulk both ways (upload) is about 3% and a CUBIC upload about 5% below what a
+  window that grows geometrically only in startup reaches, because `g` may double up to `W` at small `W`.
+- **A rise of the base delay** is cut as if it were our queue until the re-baseline accepts it (16-21% of 10 s throughput
+  for 0.6-0.7 s).
+- **A clock-rate offset of the peer** shows as a phantom delay that grows with time, and is removed by the re-baseline test.
+- **CUBIC share** is small by design.
+- **The pacer's timer lateness** is sampled as the time from the timer's deadline to the moment the connection task
+  noticed it, which also includes delays that are not the timer's (a transport that was not writable, a batch of inbound
+  frames, an application that did not poll). A long delay of that kind raises the burst of the pacer for a few wake-ups.
+- **Windows:** slow start after idle, and the timer-driven pacer on a 15.6 ms timer, are unverified.
 - **Passed:** uniform loss (0.1%, 1%) and burst loss (TCP is the limit; no over-cut), and GRO/TSO/GSO on (no effect).

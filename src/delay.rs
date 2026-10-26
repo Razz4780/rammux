@@ -9,23 +9,33 @@
 //! `alpha` (Copa's step), or doubles per round trip while there is evidence that the growth buys
 //! throughput: startup is that growth from the first round trip on, and so is the recovery after
 //! room appears. Both end the same way, see [`DelayControl::on_pong`].
-//! Time is passed in, so the formulas can be tested without a clock.
+//! Time is passed in as tokio `Instant`s and wire timestamps, so the whole thing can run on a paused clock.
 
 use std::{collections::VecDeque, time::Duration};
 
 use tokio::time::Instant;
 
-use crate::{clock::diff, transit::RateEstimate};
+use crate::{
+    clock::diff,
+    transit::{RateEstimate, SRTT_MIN},
+};
 
 /// How many round trips of raw one-way delay samples the re-baseline test looks at.
+///
+/// The test is sound only if the connection's own queue gets nearly empty within this history, so it
+/// must span several swings of the window (the queue swings around `alpha` about once or twice per
+/// round trip). It is also how long a wrong base delay survives after a route change, so it cannot be
+/// long. Five is a compromise between the two, not a derived value. (Copa uses a fixed 10 s window.)
 const HISTORY_SRTT: u32 = 5;
 
-/// How many of the newest samples the fast stop of the growth looks at (HyStart's `N_RTT_SAMPLE`).
+/// How many of the newest samples the fast stop of the growth looks at: the 8 samples of HyStart
+/// (Ha and Rhee, the slow start exit of CUBIC), which guard against a single delayed sample.
 ///
 /// Coupling: the time span of these 8 samples is `8 * min(ping_bytes, W / 4) / R`, so `ping_bytes`,
-/// documented as a cadence setting, also sets how fast this test is and how jitter-proof (about 14
-/// ms at 150 Mbit/s, 2 round trips at `W` = 4 frames), and the number of samples of the standing
-/// minimum of `srtt / 2` (about 2 at small `W`). Change the `PING` spacing and both move.
+/// which looks like a cadence setting, also sets how fast this test is and how jitter-proof (about 14
+/// ms at 150 Mbit/s with the default spacing, 2 round trips at `W` = 4 frames), and the number of
+/// samples in the standing minimum of `srtt / 2` (about 2 at small `W`). Change the `PING` spacing and
+/// both move.
 const RECENT_SAMPLES: usize = 8;
 
 /// The rate estimate needs this many smoothed round trips of deliveries before its rise means
@@ -168,11 +178,13 @@ impl OwdTracker {
         }
         let smallest = micros_above(lowest, floor);
         let peak = micros_above(highest, floor);
-        // Some sample had a queue of at most a quarter of the standing peak. Copa's 10% assumes that
-        // the queue empties: ours and that of a connection of ours with another round trip do not
-        // empty together, and with 10% two such connections took each other's queue for the path
-        // (netem, +50 ms: the ping round trip 65 -> 170 ms in 120 s). A phantom larger than a third of
-        // the swing of our own queue is still removed (per-packet jitter, rises of the delay).
+        // Some sample had a queue of at most a quarter of the standing peak. Copa uses 10% of the
+        // largest raw sample, which assumes that the queue empties completely. Two connections of ours
+        // with different round trips swing out of phase and do not empty their joint queue together,
+        // so with 10% each takes part of the other's queue for the path, and the base delay ratchets
+        // up. A quarter of the standing peak (the standing value keeps a spike of jitter out of the
+        // peak) tolerates the part of the joint queue that never drains, and still removes a phantom
+        // larger than a third of the swing of our own queue (per-packet jitter, a rise of the path delay).
         let nearly_empty = u64::from(smallest) * 4 <= u64::from(peak);
         if !nearly_empty {
             self.floor = Some(lowest);
@@ -303,7 +315,7 @@ impl DelayControl {
             back: OwdTracker::new(),
             rate: RateEstimate::new(now),
             peer_rx: None,
-            srtt: Duration::from_micros(1),
+            srtt: SRTT_MIN,
             q_fwd: 0,
             q_back: 0,
             own: 0.0,
@@ -324,7 +336,7 @@ impl DelayControl {
     /// stop = max(own, own8) >= alpha      own8: the same on the newest 8 raw samples (HyStart)
     /// if stop and g > alpha:  W = min(W, fwd_in_flight), g = alpha
     /// if own <  alpha and limited:  W += g * s
-    /// if own >= alpha:              W -= (alpha + max(0, own - 2 alpha)) * s     
+    /// if own >= alpha:              W -= (alpha + max(0, own - 2 alpha)) * s
     /// ```
     ///
     /// Startup is not a mode: it is `g` growing from the first round trip. A growth that is not
@@ -425,18 +437,19 @@ impl DelayControl {
     /// `g`, which is `alpha` unless the growth is geometric. Above: down by `alpha`, or by the excess
     /// over `alpha` if that is more.
     ///
-    /// Why the excess too, and spread over the PONGs: a once-per-round-trip cut of `own - alpha` took
-    /// the measurement of one `PONG`, and on a jittery path that one may be a spike (on a simulated wifi path,
-    /// p99 delay was 843 ms with the cut, 770 spread). Spread, the cut is the mean of the round trip's measurements,
-    /// and a capacity drop or the overshoot of startup is still shed within a round trip.
+    /// Why the excess too, and spread over the PONGs: a once-per-round-trip cut of `own - alpha` would
+    /// take the measurement of one `PONG`, and on a jittery path that one may be a spike. Spread, the
+    /// cut follows the mean of the round trip's measurements, and a capacity drop or the overshoot of
+    /// startup is still shed within a round trip.
     ///
     /// Why not one step per round trip: connections that share a bottleneck see the same queue, and
     /// the queue swings by `2 alpha / C` per round trip with their steps, more than the band
     /// `alpha / R1 .. alpha / R2` in which only the faster one would step down. So both step the same
     /// way at nearly every update, and which of them sees the higher queue at its decreases is set by
-    /// the fixed phase of its updates in the swing: in simulation the split between two connections froze at 0.39-0.62, depending on the phase.
-    /// Spread over the round trip, a connection steps down for as long as the queue is in that band,
-    /// and the faster one is there longer: the shares converge.
+    /// the fixed phase of its updates in the swing: the split between two connections freezes at
+    /// whatever that phase gives, not at an even one. Spread over the round trip, a connection steps
+    /// down for as long as the queue is in that band, and the faster one is there longer: the shares
+    /// converge.
     fn step(&mut self, delivered: u32, now: Instant) {
         if delivered == 0 {
             return;
@@ -451,15 +464,16 @@ impl DelayControl {
                     .saturating_add(to_bytes(self.growth as f64 * share));
             }
         } else {
-            // The excess over `alpha` is shed at once. INVARIANT: its gain of 1
-            // is load-bearing. The `own` it reads is a round trip old, so by the time the cut is
-            // applied the queue has fallen, and the cut (normalised by `W`, not by the old round trip)
-            // overshoots by about `1 + q / d`. That overcut is what lets the queue touch nearly empty
-            // within each re-baseline history, and so what lets the re-baseline test see an empty
-            // queue (`nearly_empty`) instead of taking our own queue for the path. A gain of 1/2, a
-            // Smith predictor or a share normalised by the sample's round trip bring the floor creep
-            // back (in simulation of a 10 Mbit/s path: 20 -> 121 ms in 26 s). Change nothing here without the long-run tests
-            // (`the_base_delay_does_not_ratchet...`, `s6_over_cuts_so_a_capacity_drop_is_shed_fast`).
+            // The excess cut: the excess over `alpha` is shed in about one round trip.
+            // INVARIANT: its gain of 1 is load-bearing. The `own` it reads is a round trip old, so by
+            // the time the cut is applied the queue has fallen, and the cut (normalised by `W`, not
+            // by the old round trip) overshoots by about `1 + q / d`. That overcut is what lets the
+            // queue touch nearly empty within each re-baseline history, and so what lets the
+            // re-baseline test see an empty queue (`nearly_empty`) instead of taking our own queue
+            // for the path. A gain of 1/2, a Smith predictor or a share normalised by the sample's
+            // round trip leave the queue standing, and the base delay creeps up. Change nothing here
+            // without the long-run tests (`the_base_delay_does_not_ratchet...`,
+            // `the_floor_does_not_creep_at_low_bdp`, `the_excess_cut_overshoots_so_a_capacity_drop_is_shed_fast`).
             let step = self.alpha.max(self.own - self.alpha);
             self.window = self
                 .window
@@ -490,9 +504,9 @@ impl DelayControl {
     /// overshoot of a rate estimate with no lag.
     ///
     /// The estimator-validity rule: the rate has no history in its first two round trips, so its
-    /// rise says nothing (it warms up from 0, and the test would fail the first doublings, 0.95 s
-    /// against 0.65 s to 90% in simulation). That is a property of the estimate, not a mode: `rose` is
-    /// passed while the rate has less than `RATE_WARMUP_SRTT` smoothed round trips of deliveries.
+    /// rise says nothing (it warms up from 0, and the test would fail the first doublings and slow
+    /// down the start). That is a property of the estimate, not a mode: `rose` is passed while the
+    /// rate has less than `RATE_WARMUP_SRTT` smoothed round trips of deliveries.
     fn update_window(&mut self, rate: f64, now: Instant) {
         let alpha = to_bytes(self.alpha);
         let limited = self.limited(now);
@@ -521,8 +535,9 @@ impl DelayControl {
     /// Coupling: the window excludes `R * q_back`, but the pacer's `srtt` includes `q_back`. Once
     /// `q_back > RTT_base + q_fwd` the pace `2W / srtt` falls below `R`, only the window counts as
     /// limited (the pacer never drives growth), and `W` stops growing while the pacer binds. The gain
-    /// of 2 is the margin that hides this in steady state (at 1.25 the trap was measured in simulation
-    /// against a CUBIC upload: 127 -> 110 Mbit/s); a reverse queue beyond a round trip is what it does not cover.
+    /// of 2 is the margin that hides this in steady state (a gain near 1.25 does not hide it when a
+    /// competing upload fills the reverse queue); a reverse queue beyond a round trip is what the
+    /// margin does not cover.
     pub fn fwd_in_flight(&self, now: Instant, tx_bytes: u32) -> u64 {
         let in_transit =
             u64::try_from(diff(tx_bytes, self.peer_rx.unwrap_or(0)).max(0)).unwrap_or(0);
@@ -554,6 +569,12 @@ impl DelayControl {
     }
 
     /// Takes how late the timer of the pacer woke the sender: it was set for `deadline`.
+    ///
+    /// Limitation: the sample is the time from `deadline` to the moment the connection task noticed the
+    /// timer, which also includes delays that are not the timer's (a transport that was not writable,
+    /// a batch of inbound frames, an application that did not poll). One long delay of that kind raises
+    /// the smoothed lateness, and with it the pacer's burst, for a few wake-ups. The burst only grows,
+    /// never shrinks the rate, and the lateness decays by `LATENESS_GAIN` per sample.
     pub fn note_timer(&mut self, deadline: Instant, woke_at: Instant) {
         let late = woke_at.saturating_duration_since(deadline).as_secs_f64();
         let smoothed = self.timer_lateness.as_secs_f64();
@@ -624,11 +645,6 @@ impl DelayControl {
             rebaselines_fwd: self.out.rebaselines,
             rebaselines_back: self.back.rebaselines,
         }
-    }
-
-    #[cfg(test)]
-    pub fn stats_rebaselines(&self) -> (u64, u64) {
-        (self.out.rebaselines, self.back.rebaselines)
     }
 
     #[cfg(test)]
@@ -776,8 +792,7 @@ mod test {
         for i in 0..20 {
             feed.pong(ms(10 * i), ms(120), ms(70), 1000);
         }
-        // The first samples were the base delay, and the later ones are 20 ms above it?
-        // No: all are equal, the queue is zero.
+        // All the samples are equal: there is no queue.
         assert_eq!(feed.dc.queue_micros().0, 0);
         // A sample 30 ms lower.
         feed.pong(ms(200), ms(90), ms(40), 1000);
@@ -820,7 +835,8 @@ mod test {
         assert_eq!(feed.dc.queue_micros().0, 0);
         // The test is applied to queues against the current base: it did not fire again on
         // every following PONG.
-        assert_eq!(feed.dc.stats_rebaselines(), (1, 0));
+        let stats = feed.dc.stats(feed.start, 0);
+        assert_eq!((stats.rebaselines_fwd, stats.rebaselines_back), (1, 0));
     }
 
     #[test]
@@ -831,7 +847,8 @@ mod test {
             let queue = ms((i % 20) * 2);
             feed.pong(ms(10 * i), SRTT + queue, ms(50) + queue, 1000);
         }
-        assert_eq!(feed.dc.stats_rebaselines(), (0, 0));
+        let stats = feed.dc.stats(feed.start, 0);
+        assert_eq!((stats.rebaselines_fwd, stats.rebaselines_back), (0, 0));
         assert_eq!(feed.dc.floors().0, Some(50_000));
     }
 
@@ -1157,8 +1174,8 @@ mod test {
         warm(&mut feed);
         update(&mut feed, 0, ms(100), true, Some(1_000_000));
         let w = feed.dc.window();
-        // Round trips in which the window never limited sending, below the target (there is no
-        // idle decay, which would have brought it to twice the 200 kB delivered per round trip).
+        // Round trips in which the window never limited sending, below the target: it neither grows
+        // nor shrinks, however much (or little) the application sends.
         for i in 0..10 {
             feed.pong(ms(3000 + 100 * i), ms(100), ms(50), 100_000);
         }
@@ -1188,8 +1205,8 @@ mod test {
     fn the_window_never_drops_below_four_frames() {
         let mut feed = Feed::new(0);
         warm(&mut feed);
-        // The steps (the shedding of an excess too), the decay and the exit of startup all stop at
-        // the same floor. This update ends startup; the next PONG sheds the 400 ms.
+        // The steps, the excess cut and the stop of the growth all stop at the same floor. This
+        // update stops the growth; the next PONG sheds the 400 ms of queue.
         update(&mut feed, 0, ms(400), true, Some(u64::from(FRAME) + 10));
         feed.pong_ago(ms(2210), ms(500), ms(450), 100_000);
         assert_eq!(feed.dc.window(), 4 * u64::from(FRAME));
@@ -1296,7 +1313,7 @@ mod test {
     }
 
     #[test]
-    fn growth_gate_a_one_pong_with_a_queue_of_half_alpha_closes_it() {
+    fn doubling_stops_when_one_pong_shows_half_alpha_queued() {
         let mut feed = past_startup(10_000_000);
         let seen = rising(&mut feed, 0, 4, ms(0), true);
         assert!(seen.iter().any(|v| *v > 1), "{seen:?}");
@@ -1311,7 +1328,7 @@ mod test {
     }
 
     #[test]
-    fn growth_gate_b_a_window_that_did_not_limit_closes_it() {
+    fn doubling_stops_when_the_window_did_not_limit() {
         let mut feed = past_startup(10_000_000);
         let seen = rising(&mut feed, 0, 4, ms(0), true);
         assert!(*seen.last().unwrap() > 1, "{seen:?}");
@@ -1323,7 +1340,7 @@ mod test {
     }
 
     #[test]
-    fn growth_gate_c_a_flat_rate_closes_it() {
+    fn doubling_stops_when_the_rate_is_flat() {
         let mut feed = past_startup(10_000_000);
         // The window limits and the queue is empty, but the rate does not rise: the link or the
         // TCP below it is the limit, not the window.
