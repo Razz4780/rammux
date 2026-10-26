@@ -45,14 +45,6 @@ mod wire_test;
 /// How many inbound frames are processed in a row before outbound frames get a turn.
 const INBOUND_BATCH: usize = 16;
 
-/// How many `PONG`s a connection may owe before it stops reading.
-///
-/// Every `PING` is answered, and a frame carries at most one `PONG`. A peer that sends `PING`s faster
-/// than we can write the answers (or that does not read them at all) would make the queue grow
-/// without bound. Past this many, we stop reading until the queue shrinks: the memory is bounded,
-/// and the peer is pushed back through the transport (TCP's window), like by any other slow reader.
-const MAX_OWED_PONGS: usize = 256;
-
 /// State machine of a single rammux connection.
 ///
 /// # Polling
@@ -116,7 +108,7 @@ where
                     config.remote_recv_pool,
                 )),
                 pings: PingSchedule::new(config.ping_interval, config.ping_bytes.get()),
-                pongs: Default::default(),
+                pong: None,
                 clock,
             }),
             config,
@@ -139,10 +131,6 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<RammuxProgress<IO>, ErrorKind>> {
         let active = self.state.active_mut()?;
-        if active.pongs.len() >= MAX_OWED_PONGS {
-            // The caller wakes us up when the owed PONGs drop below the cap.
-            return Poll::Pending;
-        }
         let frame = std::task::ready!(active.codec.poll_next_unpin(cx))
             .ok_or(io::ErrorKind::UnexpectedEof)
             .map_err(io::Error::from)??;
@@ -174,8 +162,9 @@ where
             }
         }
         if let Some(t_ping) = header.ping {
+            // Only the latest PING is answered, see `Active::pong`.
             // The counter does not include the payload of this frame.
-            active.pongs.push_back(Pong {
+            active.pong = Some(Pong {
                 t_echo: t_ping,
                 t_read: now,
                 rx_bytes: global.rx_bytes,
@@ -300,7 +289,7 @@ where
             let mut frame = OutFrame::default();
             let tx_bytes = active.selector.strategy().tx_bytes;
 
-            frame.pong = active.pongs.pop_front();
+            frame.pong = active.pong.take();
             if active.pings.poll_due(cx, tx_bytes).is_ready() {
                 active.pings.sent(tx_bytes);
                 frame.ping = true;
@@ -333,12 +322,6 @@ where
         }
     }
 
-    fn owes_too_many_pongs(&self) -> bool {
-        self.state
-            .active()
-            .is_ok_and(|active| active.pongs.len() >= MAX_OWED_PONGS)
-    }
-
     fn poll_progress_inner(
         &mut self,
         cx: &mut Context<'_>,
@@ -362,12 +345,7 @@ where
         if let Poll::Ready(RammuxProgress::Downgraded(..)) = inbound {
             return inbound.map(Ok);
         }
-        let was_capped = self.owes_too_many_pongs();
         let _ = self.make_outbound_progress(cx)?;
-        if was_capped && !self.owes_too_many_pongs() {
-            // Reading was paused, and the codec has no reason to wake us.
-            cx.waker().wake_by_ref();
-        }
         inbound.map(Ok)
     }
 

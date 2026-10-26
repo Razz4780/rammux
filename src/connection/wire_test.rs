@@ -129,7 +129,7 @@ async fn driving<T>(conn: &mut RammuxConnection<DuplexStream>, fut: impl Future<
 }
 
 #[tokio::test(start_paused = true)]
-async fn every_ping_is_answered_once_in_order() {
+async fn pings_read_one_by_one_are_each_answered_in_order() {
     let mut rig = rig(RammuxRole::Server, config());
     // Skip the PING the connection sends on its own.
     rig.frames();
@@ -539,14 +539,14 @@ impl tokio::io::AsyncWrite for Pipes {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_flood_of_pings_does_not_grow_the_owed_pongs_without_bound() {
-    // A peer that sends only PINGs and never reads. The answers do not fit the pipe back, so the
-    // connection must stop reading at the cap instead of queueing a PONG for every PING.
+async fn a_flood_of_pings_is_read_without_a_stall_and_answered_with_the_latest() {
+    // A peer that sends only PINGs and does not read for a while. The answers do not fit the pipe
+    // back, but the connection must keep reading, and hold at most one answer.
     let (read, mut peer_out) = tokio::io::duplex(1 << 20);
     let (write, mut peer_in) = tokio::io::duplex(1024);
     let mut conn =
         RammuxConnection::new(RammuxRole::Server, Pipes { read, write }, config()).unwrap();
-    let owed = |conn: &RammuxConnection<Pipes>| conn.state.active().unwrap().pongs.len();
+    let owed = |conn: &RammuxConnection<Pipes>| conn.state.active().unwrap().pong;
     let ping = |t_ping| {
         raw(
             Header {
@@ -568,26 +568,52 @@ async fn a_flood_of_pings_does_not_grow_the_owed_pongs_without_bound() {
         peer_out.write_all(&ping(t_ping)).await.unwrap();
     }
     settle(&mut conn);
-    assert_eq!(owed(&conn), super::MAX_OWED_PONGS);
+    // Every frame was read despite the full pipe back: the last PING is the one owed, the only slot.
+    assert_eq!(owed(&conn).map(|pong| pong.t_echo), Some(sent - 1));
 
-    // The peer starts reading: the connection resumes, and every PING is answered in the end.
+    // The peer starts reading: the latest PING is answered, and nothing else.
     let mut codec = RammuxCodec::new(
         &mut peer_in,
         config().frame_limit,
         Duration::from_secs(3600),
         Clock::new(),
     );
-    let mut pongs = 0;
-    while pongs < sent {
+    let mut echoes = Vec::new();
+    for _ in 0..100 {
         settle(&mut conn);
         while let Some(Some(frame)) = tokio::task::unconstrained(codec.next()).now_or_never() {
             if let DecodedFrame::Frame(frame) = frame.unwrap() {
-                pongs += u32::from(frame.header.pong.is_some());
+                echoes.extend(frame.header.pong.map(|pong| pong.t_echo));
             }
         }
-        assert!(owed(&conn) <= super::MAX_OWED_PONGS);
     }
-    assert_eq!(owed(&conn), 0);
+    assert_eq!(echoes.last(), Some(&(sent - 1)));
+    assert!(
+        echoes.len() < 100,
+        "far fewer answers than PINGs: {echoes:?}"
+    );
+    assert!(owed(&conn).is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_ping_superseded_before_the_next_write_gets_no_pong() {
+    let mut rig = rig(RammuxRole::Server, config());
+    rig.frames();
+    // Both PINGs are read before the connection writes anything.
+    let mut bytes = Vec::new();
+    for t_ping in [7, 8] {
+        let header = Header {
+            ping: Some(t_ping),
+            ..Default::default()
+        };
+        bytes.extend(raw(header, b""));
+    }
+    rig.peer_out.write_all(&bytes).await.unwrap();
+    let pongs = rig.pongs();
+    assert_eq!(
+        pongs.iter().map(|pong| pong.t_echo).collect::<Vec<_>>(),
+        [8]
+    );
 }
 
 #[tokio::test(start_paused = true)]

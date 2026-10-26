@@ -93,8 +93,8 @@ Successive `t_ping`s of one side strictly increase.
 Each side also keeps two `u32` counters, `tx_bytes` and `rx_bytes`, which wrap.
 They count the payload bytes of `DATA` frames written and read (including the data discarded by the reader).
 
-The responder answers every `PING` exactly once, in order, as soon as possible, with at most one `PONG`
-per frame. The `PONG` contains:
+The responder answers the latest `PING` it has read, as soon as possible, with at most one `PONG` per frame.
+A `PING` that is superseded by a newer one before its answer is written gets no answer. The `PONG` contains:
 
 - `t_echo`, copied from the `PING`,
 - `t_read`, the responder's clock at the moment it read the header of the frame with that `PING`,
@@ -104,10 +104,11 @@ per frame. The `PONG` contains:
 `t_read` and `rx_bytes` are for the measurements of the sender of the `PING` (how much the peer received, and
 when). The flow control of this version does not use them, but they must be filled in correctly.
 
-A responder may stop reading while it owes too many `PONG`s (rammux stops at 256). That bounds the memory a
-flood of `PING`s can take, and pushes back on the sender of the `PING`s through the transport. A sender
-must not rely on an answer to a `PING` if the transport does not drain. After the responder has sent `TERM`,
-`PING`s that arrive are not answered.
+Answering only the latest `PING` keeps the memory of the responder O(1), with no need to stop reading, and an
+answer never waits in a queue behind older ones (that wait would be counted as delay in the sender's samples).
+A sender must not rely on an answer to a `PING` if the transport does not drain, or to every `PING`. Every `PONG`
+is an independent sample, and `rx_bytes` is cumulative. After the responder has sent `TERM`, `PING`s that arrive are
+not answered.
 
 The sender of the `PING` accepts a `PONG` whenever it comes. On receiving it at its clock `now`:
 

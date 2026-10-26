@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use async_selector::selector::Selector;
 use slab::Slab;
@@ -60,8 +60,17 @@ pub struct Active<IO> {
     pub selector: Selector<StreamUpdates, GlobalPool>,
     /// Decides when to send `PING`s.
     pub pings: PingSchedule,
-    /// Answers to the `PING`s we read, not written yet. Oldest first.
-    pub pongs: VecDeque<Pong>,
+    /// The answer to the latest `PING` we read, if it is not written yet. The next outgoing frame takes it.
+    ///
+    /// Only the latest `PING` is answered; a newer one overwrites an unanswered one. Why:
+    /// 1. The memory is O(1), with no cap and no read stall: a flood of `PING`s costs only CPU, like
+    ///    any flood of frames.
+    /// 2. An answer that waits in a queue carries our queueing in the peer's back-delay sample.
+    ///    The latest `PING` is the freshest sample.
+    /// 3. Nothing on the sender's side needs one `PONG` per `PING`: `rx_bytes` is cumulative, and every
+    ///    `PONG` is an independent sample.
+    /// 4. No deadlock: a cap on owed `PONG`s could stop both sides from reading at the same time.
+    pub pong: Option<Pong>,
     /// The private clock of this side.
     pub clock: Clock,
 }
