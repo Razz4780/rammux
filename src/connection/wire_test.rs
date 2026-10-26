@@ -488,7 +488,7 @@ fn credit_header(id: u16, flags: ControlFlags, credit: u32) -> Header {
     }
 }
 
-fn fin_read() -> ControlFlags {
+fn syn_fin_read() -> ControlFlags {
     ControlFlags {
         fin_read: true,
         ..syn()
@@ -572,9 +572,9 @@ async fn stream_lifecycle_violations() {
         fin_read: true,
         ..none
     };
-    violation(config(), vec![control(0, fin_read()), control(0, fr)]).await;
+    violation(config(), vec![control(0, syn_fin_read()), control(0, fr)]).await;
     let window = raw(credit_header(0, none, 1), b"");
-    violation(config(), vec![control(0, fin_read()), window]).await;
+    violation(config(), vec![control(0, syn_fin_read()), window]).await;
 }
 
 #[tokio::test(start_paused = true)]

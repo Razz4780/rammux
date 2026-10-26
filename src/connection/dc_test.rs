@@ -1,6 +1,9 @@
-//! DelayControl on a simulated link, in paused time. The scenarios are those of the fluid
-//! simulations in the design (`sim/exp1.py` to `exp5.py`); the assertions are on properties
-//! (queue bounds, utilization, no starvation, convergence), not on exact numbers.
+//! DelayControl on a simulated link, in paused time. The assertions are on properties (queue bounds,
+//! utilization, no starvation, convergence, a base delay that does not creep up), with margins,
+//! not on exact numbers.
+//!
+//! Most scenarios run at a quarter of the scale (see [`quarter`]): the same delays and dynamics with a
+//! quarter of the bytes to move, which makes the simulation faster.
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -41,6 +44,10 @@ fn ms(n: u64) -> Duration {
 fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
 }
+
+/// How long the tests of a base delay that must not creep up run. A broken re-baseline test shows
+/// its creep within a minute or two; these tests were checked to fail on such a break at this length.
+const LONG_RUN: Duration = Duration::from_secs(120);
 
 /// Samples of the queue delay of a direction of the link.
 struct Queue {
@@ -194,12 +201,12 @@ fn quarter() -> RammuxConfig {
     config
 }
 
-/// Mbit/s of the scenarios of the design, at quarter scale.
+/// Mbit/s of the usual paths (150, 70 and 10 Mbit/s), at quarter scale.
 const Q150: f64 = 150.0 / 4.0;
 const Q70: f64 = 70.0 / 4.0;
 const Q10: f64 = 10.0 / 4.0;
 
-/// A rig with the paths of the design: `down` Mbit/s forward, `up` Mbit/s back, `delay` each way.
+/// A rig with the usual paths: `down` Mbit/s forward, `up` Mbit/s back, `delay` each way.
 fn rig(down: f64, up: f64, delay: u64, scaled: bool) -> Rig {
     let config = || if scaled { quarter() } else { config() };
     Rig::with_paths(
@@ -214,7 +221,8 @@ fn rig(down: f64, up: f64, delay: u64, scaled: bool) -> Rig {
 #[tokio::test(start_paused = true)]
 async fn startup_overshoot_is_cut_and_the_queue_stays_short() {
     // 150 Mbit/s, 100 ms, full scale: the window doubles until it holds `alpha` of queue, overshoots
-    // to about twice the bandwidth-delay product, and the excess is shed in one step.
+    // to about twice the bandwidth-delay product, and the stop of the growth and the excess cut bring
+    // it back.
     let (startup, steady, util, _) = one_bulk(150.0, ms(50), secs(30)).await;
     assert!(startup.max < 700.0, "{startup:?}");
     assert!(steady.p95 < 80.0, "{steady:?}");
@@ -252,9 +260,8 @@ async fn one_connection_at_10_mbit_fills_the_link() {
     rig.bulk(None).await;
     tokio::time::sleep(secs(10)).await;
     let util = utilization(&rig.forward, secs(30)).await;
-    // With the steps spread over the PONGs the queue averages `alpha` (52 ms here), and the swing of
-    // the loop is about as large, so it empties 4-7% of the time: 0.93-0.96. One step per round trip
-    // held about 1.7 alpha and never emptied (1.0), but froze the split of two connections.
+    // The queue averages `alpha` (52 ms here) and the swing of the loop is about as large, so the
+    // queue empties some 4-7% of the time and the utilization is a little below 1.
     assert!(util > 0.92, "{util}");
     // `alpha` is 52 ms of queue here.
     let steady = q.between(secs(10), secs(40));
@@ -262,11 +269,11 @@ async fn one_connection_at_10_mbit_fills_the_link() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_test_of_copa_does_not_ratchet_at_low_bdp() {
-    // With one step of alpha per round trip, at 10 Mbit/s the queue cycled between about alpha / 2
-    // and 2 alpha and never emptied, so Copa's test took part of our queue for the delay of the path
-    // again and again (171 ms). With the steps spread over the PONGs the queue reaches nearly empty
-    // now and then, and the connection holds about alpha (52 ms).
+async fn the_rebaseline_test_does_not_ratchet_at_low_bdp() {
+    // At 10 Mbit/s the bandwidth-delay product is below `alpha`. If the queue never emptied, the
+    // re-baseline test would take part of our own queue for the delay of the path again and again,
+    // and the queue would grow. Because the queue reaches nearly empty now and then, the connection
+    // holds about `alpha` (52 ms).
     let mut rig = rig(Q10, Q70, 25, true);
     let q = Queue::watch(&rig.forward);
     rig.bulk(None).await;
@@ -281,14 +288,14 @@ async fn four_connections_share_equally_and_the_queue_is_theirs_together() {
     let links = Links::new(Path::constant(Q150, ms(50)), Path::constant(Q70, ms(50)));
     let q = Queue::watch(&links.forward);
     let rigs = connections(&links, quarter, &[0, 2, 4, 6], &[]).await;
-    tokio::time::sleep(secs(30)).await;
-    let shares = shares(&rigs, secs(30)).await;
-    let queue = q.between(secs(30), secs(60));
+    tokio::time::sleep(secs(20)).await;
+    let shares = shares(&rigs, secs(20)).await;
+    let queue = q.between(secs(20), secs(40));
     for share in &shares {
         assert!((share - 0.25).abs() < 0.05, "{shares:?}");
     }
     assert!(queue.mean < 150.0, "{queue:?}");
-    // Nearly never empty (2-3% with the steps spread over the PONGs).
+    // Nearly never empty.
     assert!(
         queue.empty < 0.05,
         "the queue of four connections nearly never empties, as designed: {queue:?}"
@@ -331,9 +338,9 @@ async fn bulk_both_ways_keeps_both_directions_busy_and_short() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_capacity_drop_is_shed_in_one_step() {
+async fn a_capacity_drop_is_shed_within_a_few_seconds() {
     // 150 -> 10 Mbit/s at 20 s. Steps of alpha per round trip could not shed the excess while the
-    // round trip itself is seconds long: one cut does.
+    // round trip itself is seconds long: the excess cut sheds it in about one round trip.
     let rate = |t: Duration| if t < secs(20) { Q150 } else { Q10 };
     let mut rig = Rig::with_paths(
         Path::constant(Q150, ms(50)).with_rate(rate),
@@ -359,7 +366,7 @@ async fn a_capacity_drop_is_shed_in_one_step() {
 
 #[tokio::test(start_paused = true)]
 async fn a_swinging_delay_does_not_stall_or_bloat() {
-    // The delay of the path swings between 50 and 100 ms each way, like k8s_swing.
+    // The delay of the path swings between 50 and 100 ms each way.
     let mut rig = Rig::with_paths(
         Path::constant(Q150, ms(50)).with_delay(swing(ms(50), ms(100))),
         Path::constant(Q70, ms(50)).with_delay(swing(ms(50), ms(100))),
@@ -370,9 +377,8 @@ async fn a_swinging_delay_does_not_stall_or_bloat() {
     let q = Queue::watch(&rig.forward);
     rig.bulk(None).await;
     tokio::time::sleep(secs(20)).await;
-    let util = utilization(&rig.forward, secs(60)).await;
-    let queue = q.between(secs(20), secs(80));
-    // 0.85 with one step per round trip; 0.85 with the steps spread.
+    let util = utilization(&rig.forward, secs(40)).await;
+    let queue = q.between(secs(20), secs(60));
     assert!(util > 0.82, "{util}");
     assert!(queue.p95 < 100.0, "{queue:?}");
 }
@@ -392,19 +398,18 @@ async fn jitter_of_the_path_does_not_bloat_or_stall() {
     tokio::time::sleep(secs(10)).await;
     let util = utilization(&rig.forward, secs(40)).await;
     let queue = q.between(secs(10), secs(50));
-    // How much of the jitter is left in the standing minimum depends on how many samples it sees:
-    // with whole frames there are a few PINGs per round trip (0.69), with the frames of a few bytes
-    // that the window used to cut there were thousands (0.82).
+    // How much of the jitter is left in the standing minimum depends on how many samples it sees,
+    // which is a few `PING`s per round trip.
     assert!(util > 0.95, "{util}");
     assert!(queue.p95 < 100.0, "{queue:?}");
 }
 
 #[tokio::test(start_paused = true)]
 async fn per_packet_jitter_is_not_taken_for_our_queue() {
-    // The wifi scenario of the bench: 25 ms and 20 ms of jitter per packet, order kept. Under load
-    // every packet waits for the slowest one before it, so a loaded path is slower than the fastest
-    // sample ever seen by most of the jitter, and the minimum of a few samples in srtt / 2 never comes
-    // down to the minimum of thousands: a phantom of 10-13 ms on netem. Copa's test removes it.
+    // A 25 Mbit/s path with 20 ms of jitter per packet, order kept. Under load every packet waits
+    // for the slowest one before it, so a loaded path is slower than the fastest sample ever seen by
+    // most of the jitter, and the minimum of a few samples in srtt / 2 never comes down to the minimum
+    // of thousands: a phantom delay of the order of the jitter. The re-baseline test removes it.
     let mut rig = Rig::with_paths(
         Path::constant(25.0, ms(15)).with_jitter(ms(20)),
         Path::constant(Q70, ms(50)),
@@ -423,15 +428,15 @@ async fn per_packet_jitter_is_not_taken_for_our_queue() {
 #[rstest]
 #[tokio::test(start_paused = true)]
 async fn the_base_delay_does_not_ratchet_over_minutes(#[values(Q10, 25.0)] mbit: f64) {
-    // Copa's test with one connection, 300 s: its queue must stay where it starts (10 Mbit/s holds
-    // about 67 ms, 100 Mbit/s about 7.5 ms).
+    // The re-baseline test with one connection over minutes: the queue must stay where it starts
+    // (about 67 ms at 10 Mbit/s, about 7.5 ms at 100 Mbit/s).
     let mut rig = rig(mbit, Q70, 25, true);
     let q = Queue::watch(&rig.forward);
     rig.bulk(None).await;
-    tokio::time::sleep(secs(300)).await;
+    tokio::time::sleep(LONG_RUN).await;
     let (early, late) = (
         q.between(secs(20), secs(60)),
-        q.between(secs(260), secs(300)),
+        q.between(LONG_RUN - secs(40), LONG_RUN),
     );
     assert!(late.mean < 1.15 * early.mean, "{early:?} {late:?}");
 }
@@ -439,14 +444,14 @@ async fn the_base_delay_does_not_ratchet_over_minutes(#[values(Q10, 25.0)] mbit:
 #[tokio::test(start_paused = true)]
 async fn two_connections_do_not_ratchet_over_minutes() {
     // Two connections with the same round trip: their joint queue empties often enough for neither to
-    // take the other's queue for the path (9.3 ms after 300 s).
+    // take the other's queue for the path.
     let links = Links::new(Path::constant(Q150, ms(50)), Path::constant(Q70, ms(50)));
     let q = Queue::watch(&links.forward);
     let _rigs = connections(&links, quarter, &[0, 5], &[]).await;
-    tokio::time::sleep(secs(300)).await;
+    tokio::time::sleep(LONG_RUN).await;
     let (early, late) = (
         q.between(secs(20), secs(60)),
-        q.between(secs(260), secs(300)),
+        q.between(LONG_RUN - secs(40), LONG_RUN),
     );
     assert!(late.mean < 1.15 * early.mean, "{early:?} {late:?}");
     assert!(late.mean < 20.0, "{late:?}");
@@ -455,16 +460,17 @@ async fn two_connections_do_not_ratchet_over_minutes() {
 #[tokio::test(start_paused = true)]
 async fn two_connections_with_different_round_trips_do_not_ratchet() {
     // With 100 ms more round trip on one, the two cycles do not line up and the joint queue does
-    // not empty within 5 round trips of each. With Copa's 10% they took part of each other's queue
-    // for the path: 42 ms after 60 s, 115 ms after 300 s. With a quarter of the standing peak: 11
-    // ms, then 19 ms.
+    // not empty within 5 round trips of each. A re-baseline test that wanted the queue to empty
+    // completely (10% of the peak) would take part of each other's queue for the path, and the
+    // base delay would ratchet up for as long as the connections run. A quarter of the standing peak
+    // tolerates the part that never drains.
     let links = Links::new(Path::constant(Q150, ms(50)), Path::constant(Q70, ms(50)));
     let q = Queue::watch(&links.forward);
     let _rigs = connections(&links, quarter, &[0, 5], &[0, 50]).await;
-    tokio::time::sleep(secs(300)).await;
+    tokio::time::sleep(LONG_RUN).await;
     let (early, late) = (
         q.between(secs(20), secs(60)),
-        q.between(secs(260), secs(300)),
+        q.between(LONG_RUN - secs(40), LONG_RUN),
     );
     assert!(late.mean < 30.0, "{early:?} {late:?}");
 }
@@ -485,10 +491,10 @@ async fn a_drifting_clock_of_the_peer_does_not_matter(#[values(50, -50)] ppm: i6
     let q = Queue::watch(&rig.forward);
     rig.bulk(None).await;
     tokio::time::sleep(secs(10)).await;
-    let util = utilization(&rig.forward, secs(90)).await;
-    let queue = q.between(secs(10), secs(100));
+    let util = utilization(&rig.forward, secs(50)).await;
+    let queue = q.between(secs(10), secs(60));
     assert!(util > 0.97, "{util}");
-    // (a) with a fast peer clock re-baselines often; with pacing its queue p95 is 84 ms (it was under 80).
+    // A fast peer clock re-baselines often, and the queue stays bounded.
     assert!(queue.p95 < 100.0, "{queue:?}");
     if ppm > 0 {
         assert!(
@@ -533,15 +539,18 @@ async fn after_an_idle_period_the_window_is_kept_and_the_link_fills_at_once() {
         ..Default::default()
     })
     .await;
-    tokio::time::sleep(secs(39)).await;
-    // No idle handling (v2-delay-noidle): the window is kept, and does not grow while the
-    // application does not limit it. The pacer bounds the burst of the restart.
-    let window = rig.delay_stats().window;
+    // The application pauses at 10 s. A second later the data it sent has been delivered and reported.
+    tokio::time::sleep(secs(11)).await;
+    let before = rig.delay_stats().window;
     assert!(
-        (100_000..3_000_000).contains(&window),
+        (100_000..3_000_000).contains(&before),
         "{:?}",
         rig.delay_stats()
     );
+    tokio::time::sleep(secs(28)).await;
+    // There is no idle handling: the window is kept, and does not grow while the application does
+    // not limit it. The pacer bounds the burst of the restart.
+    assert_eq!(rig.delay_stats().window, before, "{:?}", rig.delay_stats());
 
     // It restarts from that window, and is at 90% of the link within a few round trips.
     // The application restarts at 40 s.
@@ -578,8 +587,8 @@ async fn two_connections_converge_to_equal_shares(#[values(0, 50)] extra: u64) {
 async fn the_window_does_not_cut_frames_into_pieces() {
     // Silly window syndrome: room in the window opens a few bytes at a time, with every report. A sender
     // that fills every opening sends tiny frames, each with a PING, and the headers and the CPU of both
-    // peers become the bottleneck (on netem it halved the throughput). Every write costs the header
-    // of a segment on the simulated link, so such frames cost throughput here too.
+    // peers become the bottleneck. Every write costs the header of a segment on the simulated link,
+    // so such frames cost throughput here too.
     let mut rig = rig(Q150, Q70, 50, true);
     rig.bulk(None).await;
     tokio::time::sleep(secs(10)).await;
@@ -606,9 +615,9 @@ async fn the_window_does_not_cut_frames_into_pieces() {
 #[tokio::test(start_paused = true)]
 async fn a_stall_of_the_forward_path_does_not_open_the_window() {
     // The forward path stops for two round trips: there are no reports. The data in flight stays
-    // in flight; the window does not open as time passes (it used to, by the rate times the time
-    // since the last report, up to one round trip), and what the sender puts on the path is
-    // what the window had room for when the stall began, not more.
+    // in flight; the window does not open as time passes (the bytes assumed delivered do not grow
+    // with the time since the last report), and what the sender puts on the path is what the
+    // window had room for when the stall began, not more.
     let stall = |t: Duration| {
         if t >= secs(20) && t < secs(20) + ms(400) {
             0.000_001
@@ -642,12 +651,15 @@ async fn a_stall_of_the_forward_path_does_not_open_the_window() {
 }
 
 /// What the invariant "the queue touches nearly empty within each re-baseline history" looks like
-/// from outside, at 10 Mbit/s (40 ms of round trip, a bandwidth-delay product of half of `alpha`):
-/// the re-baselines the connection made, the true queue in the long run, and how deep the troughs of
-/// the true queue were (the smallest queue of each 1 s window, against the largest of it).
+/// from outside, at 10 Mbit/s (40 ms of round trip, a bandwidth-delay product of half of `alpha`).
+/// Returns:
+/// - the re-baselines the connection made after the first 20 s;
+/// - the mean queue early (20-60 s) and late (the last 40 s);
+/// - the smallest, over the 1 s windows from 20 s on, of the share of samples with the queue below
+///   1 ms: nonzero if every such window had a moment with an empty queue.
 ///
-/// Math review 2.6: S6 over-cuts a falling queue by about `1 + q / d`, and that is what empties the
-/// queue here. With its gain halved the floor creeps (20 -> 121 ms in 26 s in the fluid model).
+/// The excess cut over-cuts a falling queue by about `1 + q / d`, and that is what empties the queue
+/// here. With its gain halved the base delay creeps up.
 async fn low_bdp_floor(total: u64) -> (u64, f64, f64, f64) {
     let mut rig = rig(Q10, Q70, 25, true);
     let q = Queue::watch(&rig.forward);
@@ -679,14 +691,14 @@ async fn the_floor_does_not_creep_at_low_bdp() {
     assert!(rebaselines <= 2, "{rebaselines}");
 }
 
-/// Math review 2.6: the gain of 1 of S6 is load-bearing. The `own` that the cut reads is a round trip
-/// old, so the cut over-shoots the queue it meets by about `1 + q / d`, and the over-cut empties the
+/// The gain of 1 of the excess cut is load-bearing. The `own` that the cut reads is a round trip old,
+/// so the cut overshoots the queue it meets by about `1 + q / d`, and the overshoot empties the
 /// queue after a drop (and, in the steady state of a low bandwidth-delay product, is what lets the
-/// re-baseline test see an empty queue). A gain of 1/2 sheds the same excess more slowly, and leaves
-/// the queue standing: the sum of the mean queue over the 3 s after a drop to a fifth of the capacity
-/// is 276 ms with a gain of 1 and 402 ms with 1/2 (checked by halving it).
+/// re-baseline test see an empty queue). A gain of 1/2 sheds the same excess more slowly and leaves
+/// the queue standing: the bound below on the queue summed over the 3 s after a drop to a fifth of
+/// the capacity fails with half the gain.
 #[tokio::test(start_paused = true)]
-async fn s6_over_cuts_so_a_capacity_drop_is_shed_fast() {
+async fn the_excess_cut_overshoots_so_a_capacity_drop_is_shed_fast() {
     let rate = |t: Duration| if t < secs(20) { Q150 } else { Q150 / 5.0 };
     let mut rig = Rig::with_paths(
         Path::constant(Q150, ms(50)).with_rate(rate),
@@ -702,5 +714,5 @@ async fn s6_over_cuts_so_a_capacity_drop_is_shed_fast() {
     assert!(shed < 330.0, "{shed}");
     // And the queue gets nearly empty on the way: the over-cut.
     let touched = (20..24).any(|t| q.between(secs(t), secs(t + 1)).empty > 0.2);
-    assert!(touched);
+    assert!(touched, "the queue never got nearly empty after the drop");
 }

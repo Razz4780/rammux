@@ -615,16 +615,25 @@ async fn the_window_does_not_stop_a_stream_that_has_nothing_to_send() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_stream_in_its_base_window_still_waits_for_the_window() {
-    let mut bed = Bed::new_dc(0);
-    let x = bed.add();
-    // The base window is 16, but the window is 32: with 16 in flight from y, x gets the rest only.
-    let y = bed.add();
-    bed.write(y, 16);
-    bed.write(x, 24);
+async fn a_stream_in_its_base_window_waits_at_the_front_when_the_window_is_full() {
+    // Every byte goes out of a base window of 16, and the pool is not touched. The window holds 32 bytes.
+    let mut bed = Bed::new_dc(8);
+    let [x, y, z] = [bed.add(), bed.add(), bed.add()];
+    for s in [x, y, z] {
+        bed.write(s, 16);
+    }
+    // Frames go out in turns of the polling order until the window is full: x sends two frames,
+    // y and z one each. y and z have base window to spare, but the window is full: they wait at
+    // the front of the queue (a stream within its base window moves to the front, so the one
+    // refused last is first).
     let sent = bed.drain_grouped();
-    assert_eq!(sent.iter().map(|(_, n)| n).sum::<usize>(), 32, "{sent:?}");
-    assert_eq!(sent.last().unwrap().0, y.max(x));
+    assert_eq!(sent, [(x, 8), (x, 8), (y, 8), (z, 8)]);
+    assert_eq!(bed.queue(), [z, y]);
+    // The first PONG sets the baseline of the rate: the peer got 16 bytes, and 16 bytes of room
+    // open, which go to the streams that waited, one frame each.
+    bed.pong(16);
+    assert_eq!(bed.drain_grouped(), [(y, 8), (z, 8)]);
+    assert!(bed.queue().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -662,7 +671,8 @@ async fn a_stream_within_its_base_window_goes_before_the_streams_that_borrow() {
     bed.write(y, 8);
     assert_eq!(bed.drain(), []);
     assert_eq!(bed.queue(), [y, x]);
-    // The peer got 32 bytes, and the window doubles (startup): y's frame goes first.
+    // The first PONG only sets the baseline of the rate, so the window does not grow. The peer got
+    // 32 bytes, so the window has room again, and y's frame goes first.
     bed.pong(32);
     let sent = bed.drain();
     assert_eq!(sent.first(), Some(&(y, 8)), "{sent:?}");
