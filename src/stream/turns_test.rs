@@ -677,3 +677,26 @@ async fn a_stream_within_its_base_window_goes_before_the_streams_that_borrow() {
     let sent = bed.drain();
     assert_eq!(sent.first(), Some(&(y, 8)), "{sent:?}");
 }
+
+#[tokio::test(start_paused = true)]
+async fn the_window_wakes_every_waiter_when_the_pool_has_no_room() {
+    // The pool is empty, so only the window can stop a frame within a base window. A PONG that
+    // reopens the window must let all the waiters send, not only the front one.
+    let mut bed = Bed::new_dc(0);
+    let [x, y, z, w] = [bed.add(), bed.add(), bed.add(), bed.add()];
+    for s in [x, y] {
+        bed.write(s, 16);
+    }
+    // x and y fill the 32-byte window.
+    assert_eq!(bed.drain_grouped(), [(x, 8), (x, 8), (y, 8), (y, 8)]);
+    // z and w are refused and queue at the front.
+    for s in [z, w] {
+        bed.write(s, 8);
+    }
+    assert_eq!(bed.drain(), []);
+    assert_eq!(bed.queue(), [w, z]);
+    // The window has 16 bytes of room after the first PONG: one frame for each.
+    bed.pong(16);
+    assert_eq!(bed.drain_grouped(), [(z, 8), (w, 8)]);
+    assert!(bed.queue().is_empty());
+}

@@ -122,9 +122,17 @@ impl GlobalPool {
         self.tx_pool.saturating_sub(self.tx_used)
     }
 
-    /// Returns whether there is room in the peer's pool and in the connection window.
+    /// Returns whether a queued stream could send now, so that the next in line is worth waking.
+    ///
+    /// With a connection window (`CopaLike`), the queue also holds streams that wait for the window
+    /// alone: a frame within its stream's base window needs no pool room. So the window decides,
+    /// and a stream that also needs the pool finds out when it is polled. Without a window, the
+    /// pool decides.
     pub fn room_left(&self, now: Instant) -> bool {
-        self.pool_room() > 0 && self.window_room(now).is_none_or(|room| room > 0)
+        match self.window_room(now) {
+            None => self.pool_room() > 0,
+            Some(room) => room > 0,
+        }
     }
 
     /// Returns the number of streams waiting for their turn.
