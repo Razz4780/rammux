@@ -35,8 +35,12 @@ use crate::{
 
 pub use crate::connection::downgrade::Downgraded;
 
+#[cfg(test)]
+mod dc_test;
 mod downgrade;
 mod pings;
+#[cfg(test)]
+mod sim;
 #[cfg(test)]
 mod sim_test;
 mod state;
