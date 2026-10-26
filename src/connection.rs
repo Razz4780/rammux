@@ -34,6 +34,7 @@ use crate::{
 };
 
 pub use crate::connection::downgrade::Downgraded;
+pub use crate::delay::DelayControlStats;
 
 #[cfg(test)]
 mod dc_test;
@@ -507,11 +508,10 @@ where
             return RammuxStats::default();
         };
         let global = active.selector.strategy();
-        let delay = global
+        let delay_control = global
             .dc
             .as_ref()
-            .map(|dc| dc.stats(tokio::time::Instant::now(), global.tx_bytes))
-            .unwrap_or_default();
+            .map(|dc| dc.stats(tokio::time::Instant::now(), global.tx_bytes));
         RammuxStats {
             inbound_streams: u32::try_from(active.streams.inbound.len())
                 .expect("we can't have more than u32 inbound streams"),
@@ -523,14 +523,7 @@ where
             turn_queue_len: u32::try_from(global.turns_len()).expect(
                 "at most one queue entry per stream, and there are fewer than u32::MAX streams",
             ),
-            q_fwd: delay.q_fwd,
-            q_back: delay.q_back,
-            own: delay.own,
-            rate: delay.rate,
-            fwd_in_flight: delay.fwd_in_flight,
-            window: delay.window,
-            rebaselines_fwd: delay.rebaselines_fwd,
-            rebaselines_back: delay.rebaselines_back,
+            delay_control,
         }
     }
 }
@@ -575,22 +568,11 @@ pub struct RammuxStats {
     pub pool_rx_used: u64,
     /// Count of streams waiting for their turn to use the shared pool.
     pub turn_queue_len: u32,
-    /// The queue on our forward path, from the one-way delay of `PING`s. Only with `DelayControl`.
-    pub q_fwd: Duration,
-    /// How long the reports of the peer currently wait on their way back to us. `DelayControl`.
-    pub q_back: Duration,
-    /// Bytes of ours in the queue of the bottleneck, `rate * q_fwd`. `DelayControl`.
-    pub own: u64,
-    /// The delivery rate, in bytes per second, from the bytes the peer reports. `DelayControl`.
-    pub rate: f64,
-    /// Bytes on the forward path, as the connection window counts them. `DelayControl`.
-    pub fwd_in_flight: u64,
-    /// The connection window, in bytes. `DelayControl`.
-    pub window: u64,
-    /// How many times the base delay of the forward path was raised. `DelayControl`.
-    pub rebaselines_fwd: u64,
-    /// How many times the base delay of the way back was raised. `DelayControl`.
-    pub rebaselines_back: u64,
+    /// Measurements and the window of `DelayControl`.
+    ///
+    /// `None` if the connection does not use [`DelayControl`](crate::config::TransitControl::DelayControl),
+    /// or is no longer active.
+    pub delay_control: Option<DelayControlStats>,
 }
 
 #[cfg(test)]

@@ -52,6 +52,7 @@ async fn a_bulk_stream_grows_to_the_pool_and_fills_the_link() {
     // The stream borrowed (nearly) all of the pool, and there is a queue: the loop is much longer than the path.
     let pool = 512 * 1024;
     assert!(stats.pool_tx_used * 10 >= pool * 9, "{stats:?}");
+    assert!(stats.delay_control.is_none(), "{stats:?}");
     assert!(stats.pool_tx_used <= pool, "{stats:?}");
     let srtt = stats.srtt.unwrap();
     assert!(srtt > 3 * RTT, "{srtt:?}");

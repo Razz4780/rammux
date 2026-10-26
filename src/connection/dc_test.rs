@@ -491,7 +491,11 @@ async fn a_drifting_clock_of_the_peer_does_not_matter(#[values(50, -50)] ppm: i6
     // (a) with a fast peer clock re-baselines often; with pacing its queue p95 is 84 ms (it was under 80).
     assert!(queue.p95 < 100.0, "{queue:?}");
     if ppm > 0 {
-        assert!(rig.stats().rebaselines_fwd > 0, "{:?}", rig.stats());
+        assert!(
+            rig.delay_stats().rebaselines_fwd > 0,
+            "{:?}",
+            rig.delay_stats()
+        );
     }
 }
 
@@ -532,8 +536,12 @@ async fn after_an_idle_period_the_window_is_kept_and_the_link_fills_at_once() {
     tokio::time::sleep(secs(39)).await;
     // No idle handling (v2-delay-noidle): the window is kept, and does not grow while the
     // application does not limit it. The pacer bounds the burst of the restart.
-    let window = rig.stats().window;
-    assert!((100_000..3_000_000).contains(&window), "{:?}", rig.stats());
+    let window = rig.delay_stats().window;
+    assert!(
+        (100_000..3_000_000).contains(&window),
+        "{:?}",
+        rig.delay_stats()
+    );
 
     // It restarts from that window, and is at 90% of the link within a few round trips.
     // The application restarts at 40 s.
@@ -620,8 +628,9 @@ async fn a_stall_of_the_forward_path_does_not_open_the_window() {
     // After that there are none, and the sender may send only what is left of its window.
     tokio::time::sleep(secs(20) + ms(200)).await;
     let (_, before) = rig.forward.writes();
-    let window = rig.stats().window;
-    let room = window.saturating_sub(rig.stats().fwd_in_flight);
+    let stats = rig.delay_stats();
+    let window = stats.window;
+    let room = window.saturating_sub(stats.fwd_in_flight);
     tokio::time::sleep(ms(200)).await;
     let (_, after) = rig.forward.writes();
     let sent = after - before;
@@ -644,9 +653,9 @@ async fn low_bdp_floor(total: u64) -> (u64, f64, f64, f64) {
     let q = Queue::watch(&rig.forward);
     rig.bulk(None).await;
     tokio::time::sleep(secs(20)).await;
-    let before = rig.stats().rebaselines_fwd;
+    let before = rig.delay_stats().rebaselines_fwd;
     tokio::time::sleep(secs(total - 20)).await;
-    let rebaselines = rig.stats().rebaselines_fwd - before;
+    let rebaselines = rig.delay_stats().rebaselines_fwd - before;
     let (early, late) = (
         q.between(secs(20), secs(60)).mean,
         q.between(secs(total - 40), secs(total)).mean,

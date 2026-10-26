@@ -381,7 +381,7 @@ async fn delay_control_admits_whole_frames_up_to_the_window_and_pings_with_the_d
     }
 
     // The window starts at 4 frames, and a frame is never split to fit it.
-    let window = rig.conn.stats().window;
+    let window = rig.conn.stats().delay_control.unwrap().window;
     assert_eq!(window, 4 * 256);
     let sent = frames
         .iter()

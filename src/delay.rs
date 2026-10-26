@@ -259,16 +259,26 @@ pub struct DelayControl {
     timer_lateness: Duration,
 }
 
-/// A snapshot of the measurements, for the statistics.
+/// A snapshot of the measurements and the window of a connection with
+/// [`TransitControl::DelayControl`](crate::config::TransitControl::DelayControl).
 #[derive(Debug, Clone, Copy, Default)]
-pub struct DelayStats {
+#[non_exhaustive]
+pub struct DelayControlStats {
+    /// The queue on our forward path, from the one-way delay of `PING`s.
     pub q_fwd: Duration,
+    /// How long the reports of the peer currently wait on their way back to us.
     pub q_back: Duration,
+    /// Bytes of ours in the queue of the bottleneck, `rate * q_fwd`.
     pub own: u64,
+    /// The delivery rate, in bytes per second, from the bytes the peer reports.
     pub rate: f64,
+    /// Bytes on the forward path, as the connection window counts them.
     pub fwd_in_flight: u64,
+    /// The connection window, in bytes.
     pub window: u64,
+    /// How many times the base delay of the forward path was raised.
     pub rebaselines_fwd: u64,
+    /// How many times the base delay of the way back was raised.
     pub rebaselines_back: u64,
 }
 
@@ -603,8 +613,8 @@ impl DelayControl {
         self.window
     }
 
-    pub fn stats(&self, now: Instant, tx_bytes: u32) -> DelayStats {
-        DelayStats {
+    pub fn stats(&self, now: Instant, tx_bytes: u32) -> DelayControlStats {
+        DelayControlStats {
             q_fwd: Duration::from_micros(u64::from(self.q_fwd)),
             q_back: Duration::from_micros(u64::from(self.q_back)),
             own: to_bytes(self.own),
