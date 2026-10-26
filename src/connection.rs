@@ -109,6 +109,7 @@ where
                 )),
                 pings: PingSchedule::new(config.ping_interval, config.ping_bytes.get()),
                 pong: None,
+                last_echo: None,
                 clock,
             }),
             config,
@@ -152,12 +153,20 @@ where
         let global = active.selector.strategy_mut();
         let now = active.clock.micros(header_at);
         if let Some(pong) = header.pong {
-            // A PONG is welcome even if we have no idea what it answers.
-            // If it seems to come from the future, it does not make sense, and we ignore it.
-            // And if it took longer than the peer may stay silent, it is stale: the peer would be dead.
-            if let Some(rtt) = clock::elapsed(now, pong.t_echo)
-                && rtt <= self.config.inbound_frame_timeout
+            // A PONG answers one of our PINGs, and the peer answers only the latest one it has read,
+            // so the echoes of a sound peer strictly increase. Whatever is not later than the last
+            // accepted echo (a duplicate, a reordered PONG), or later than the newest stamp we have
+            // sent (an echo of a PING that never existed), is ignored. The age of the echo does not
+            // matter: a PONG can wait in a queue for as long as the queue is.
+            let sent = active.codec.newest_ping_stamp();
+            let fresh = active
+                .last_echo
+                .is_none_or(|last| clock::diff(pong.t_echo, last) > 0);
+            if fresh
+                && sent.is_some_and(|sent| clock::diff(pong.t_echo, sent) <= 0)
+                && let Some(rtt) = clock::elapsed(now, pong.t_echo)
             {
+                active.last_echo = Some(pong.t_echo);
                 global.observe_rtt(rtt);
             }
         }

@@ -112,8 +112,12 @@ not answered.
 
 The sender of the `PING` accepts a `PONG` whenever it comes. On receiving it at its clock `now`:
 
-- `rtt = now - t_echo` is a round trip time measured on a single clock. It is ignored if it comes out
-  negative.
+- `rtt = now - t_echo` is a round trip time measured on a single clock. The `PONG` is ignored for the
+  purpose of this sample unless `t_echo` is strictly later than the `t_echo` of the last accepted `PONG`
+  and not later than the newest `t_ping` the sender has sent. The responder answers only the latest `PING`
+  it has read, so the echoes of a sound peer strictly increase; a duplicate, a reordered `PONG` and an echo
+  of a `PING` that was never sent are therefore ignored. The age of `t_echo` is not limited: a `PONG` may
+  wait in a queue for as long as the queue is.
 - `now - t_read` is the time from "the peer read our `PING`" to "we got its answer", plus an unknown clock
   offset. Only differences between such values mean anything.
 

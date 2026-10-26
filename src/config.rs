@@ -110,7 +110,7 @@ pub struct RammuxConfig {
     pub remote_recv_pool: u32,
     /// A `PING` is sent when this much `DATA` was written since the last one.
     ///
-    /// Every `PING` is answered with a `PONG`, which gives the peer a round trip time sample.
+    /// The latest `PING` read is answered with a `PONG`, which gives the peer a round trip time sample.
     /// Several `PING`s can be in flight.
     ///
     /// This value is a local knob and does not have to be negotiated.

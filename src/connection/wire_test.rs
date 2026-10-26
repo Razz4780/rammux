@@ -113,11 +113,6 @@ impl Rig {
             .selector
             .strategy_mut()
     }
-
-    fn now_micros(&self) -> u32 {
-        let clock = self.conn.state.active().unwrap().clock;
-        clock.micros(tokio::time::Instant::now())
-    }
 }
 
 /// Drives the connection until the future completes.
@@ -221,68 +216,95 @@ async fn rx_bytes_counts_data_the_reader_never_sees() {
     assert_eq!(pongs.last().unwrap().rx_bytes, 7);
 }
 
+/// A PONG that carries the given echo.
+fn pong_of(t_echo: u32) -> Vec<u8> {
+    raw(
+        Header {
+            pong: Some(Pong {
+                t_echo,
+                t_read: 0,
+                rx_bytes: 0,
+            }),
+            ..Default::default()
+        },
+        b"",
+    )
+}
+
+impl Rig {
+    /// Makes the connection send a PING and returns its `t_ping`.
+    async fn send_ping(&mut self, after: Duration) -> u32 {
+        tokio::time::advance(after).await;
+        self.frames()
+            .into_iter()
+            .filter_map(|frame| frame.header.ping)
+            .next_back()
+            .expect("a PING is due")
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn pong_gives_the_round_trip_time() {
     let mut rig = rig(RammuxRole::Server, config());
     rig.frames();
     assert_eq!(rig.conn.stats().srtt, None);
 
-    tokio::time::advance(Duration::from_millis(50)).await;
-    let t_echo = rig.now_micros() - 5000;
-    let header = Header {
-        pong: Some(Pong {
-            t_echo,
-            t_read: 0,
-            rx_bytes: 0,
-        }),
-        ..Default::default()
-    };
-    // A PONG is welcome although we have no PING in flight.
-    rig.write(raw(header, b"")).await;
-    assert_eq!(rig.conn.stats().srtt, Some(Duration::from_millis(5)));
-
-    // A PONG from the future is ignored.
-    let header = Header {
-        pong: Some(Pong {
-            t_echo: rig.now_micros() + 1000,
-            t_read: 0,
-            rx_bytes: 0,
-        }),
-        ..Default::default()
-    };
-    rig.write(raw(header, b"")).await;
+    let t_ping = rig.send_ping(Duration::from_secs(5)).await;
+    tokio::time::advance(Duration::from_millis(5)).await;
+    rig.write(pong_of(t_ping)).await;
     assert_eq!(rig.conn.stats().srtt, Some(Duration::from_millis(5)));
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_round_trip_longer_than_the_frame_timeout_is_not_a_sample() {
-    // No PONG can come back later than the peer is allowed to stay silent: a sample that large comes
-    // from a stale or forged t_echo, and would push the smoothed round trip time to minutes.
-    let mut config = config();
-    config.inbound_frame_timeout = Duration::from_secs(10);
-    let mut rig = rig(RammuxRole::Server, config);
+async fn only_a_pong_for_a_ping_sent_after_the_last_answered_is_a_sample() {
+    let mut rig = rig(RammuxRole::Server, config());
     rig.frames();
-    let pong = |t_echo| Header {
-        pong: Some(Pong {
-            t_echo,
-            t_read: 0,
-            rx_bytes: 0,
-        }),
-        ..Default::default()
-    };
-    tokio::time::advance(Duration::from_millis(50)).await;
-    rig.write(raw(pong(rig.now_micros() - 5000), b"")).await;
+    let first = rig.send_ping(Duration::from_secs(5)).await;
+    tokio::time::advance(Duration::from_millis(5)).await;
+    rig.write(pong_of(first)).await;
     assert_eq!(rig.conn.stats().srtt, Some(Duration::from_millis(5)));
 
-    // The frame is already there when the time passes.
-    let t_echo = rig.now_micros();
-    rig.peer_out
-        .write_all(&raw(pong(t_echo), b""))
-        .await
-        .unwrap();
-    tokio::time::advance(Duration::from_secs(10) + Duration::from_millis(1)).await;
-    rig.settle();
+    let second = rig.send_ping(Duration::from_secs(5)).await;
+    tokio::time::advance(Duration::from_millis(20)).await;
+    // A duplicate of an answered echo is ignored.
+    rig.write(pong_of(first)).await;
     assert_eq!(rig.conn.stats().srtt, Some(Duration::from_millis(5)));
+    // An echo of a stamp we never sent is ignored.
+    rig.write(pong_of(second + 1000)).await;
+    assert_eq!(rig.conn.stats().srtt, Some(Duration::from_millis(5)));
+    // The genuine answer counts.
+    rig.write(pong_of(second)).await;
+    assert!(rig.conn.stats().srtt.unwrap() > Duration::from_millis(5));
+    let srtt = rig.conn.stats().srtt;
+    // Now it is a duplicate, too.
+    rig.write(pong_of(second)).await;
+    assert_eq!(rig.conn.stats().srtt, srtt);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pong_that_waited_longer_than_the_frame_timeout_is_a_sample() {
+    // The timeout limits the gaps between frames, not the latency: frames keep arriving while the PONG
+    // waits in a queue behind other data.
+    let mut config = config();
+    config.inbound_frame_timeout = Duration::from_secs(10);
+    config.ping_interval = Duration::from_secs(5);
+    let mut rig = rig(RammuxRole::Server, config);
+    rig.frames();
+    let t_ping = rig.send_ping(Duration::from_secs(5)).await;
+    for _ in 0..4 {
+        tokio::time::advance(Duration::from_secs(4)).await;
+        rig.write(raw(
+            Header {
+                ping: Some(1),
+                ..Default::default()
+            },
+            b"",
+        ))
+        .await;
+        rig.frames();
+    }
+    rig.write(pong_of(t_ping)).await;
+    assert!(rig.conn.stats().srtt.unwrap() >= Duration::from_secs(10));
 }
 
 #[tokio::test(start_paused = true)]

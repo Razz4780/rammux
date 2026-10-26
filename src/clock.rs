@@ -67,6 +67,11 @@ impl PingStamps {
         }
     }
 
+    /// Returns the newest stamp that went out, if any.
+    pub fn newest(&self) -> Option<u32> {
+        self.last
+    }
+
     /// Records that the given stamp went out.
     pub fn commit(&mut self, stamp: u32) {
         self.last = Some(stamp);

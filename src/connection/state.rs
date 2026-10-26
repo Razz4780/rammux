@@ -71,6 +71,8 @@ pub struct Active<IO> {
     ///    `PONG` is an independent sample.
     /// 4. No deadlock: a cap on owed `PONG`s could stop both sides from reading at the same time.
     pub pong: Option<Pong>,
+    /// The `t_echo` of the last `PONG` we accepted, see `RammuxConnection::poll_inbound_progress`.
+    pub last_echo: Option<u32>,
     /// The private clock of this side.
     pub clock: Clock,
 }

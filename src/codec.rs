@@ -82,6 +82,11 @@ impl<IO> RammuxCodec<IO> {
         }
     }
 
+    /// Returns the `t_ping` of the newest `PING` that went out, if any.
+    pub fn newest_ping_stamp(&self) -> Option<u32> {
+        self.ping_stamps.newest()
+    }
+
     pub fn into_inner(self) -> IO {
         self.io
     }
