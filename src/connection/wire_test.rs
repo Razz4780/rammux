@@ -610,10 +610,75 @@ async fn a_flood_of_pings_is_read_without_a_stall_and_answered_with_the_latest()
         }
     }
     assert_eq!(echoes.last(), Some(&(sent - 1)));
+    // The pipe back holds 1024 bytes while the peer does not read: the answers that fit were written
+    // (at most 1024 / PONG frame size of them) and everything after was superseded, so the rest is the
+    // one owed answer. Without the supersession there would be `sent` answers.
+    let pong_frame_len = raw(
+        Header {
+            pong: Some(Pong {
+                t_echo: 0,
+                t_read: 0,
+                rx_bytes: 0,
+            }),
+            ..Default::default()
+        },
+        b"",
+    )
+    .len();
     assert!(
-        echoes.len() < 100,
-        "far fewer answers than PINGs: {echoes:?}"
+        echoes.len() <= 1024 / pong_frame_len + 1,
+        "at most what fit into the pipe, plus the owed one: {} answers",
+        echoes.len()
     );
+    assert!(owed(&conn).is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_blocked_writer_keeps_reading_and_owes_one_pong() {
+    // The transport does not drain: not even the first frame fits into the pipe back.
+    let (read, mut peer_out) = tokio::io::duplex(1 << 20);
+    let (write, mut peer_in) = tokio::io::duplex(4);
+    let mut conn =
+        RammuxConnection::new(RammuxRole::Server, Pipes { read, write }, config()).unwrap();
+    let owed = |conn: &RammuxConnection<Pipes>| conn.state.active().unwrap().pong;
+    let settle = |conn: &mut RammuxConnection<Pipes>| {
+        while let Some(result) = tokio::task::unconstrained(conn.progress()).now_or_never() {
+            result.unwrap();
+        }
+    };
+
+    // The first PING rides along with the frame that the writer then gets stuck on.
+    // The next ones are read all the same, and only the latest is owed.
+    for t_ping in [100, 200, 300] {
+        let header = Header {
+            ping: Some(t_ping),
+            ..Default::default()
+        };
+        peer_out.write_all(&raw(header, b"")).await.unwrap();
+        settle(&mut conn);
+        // The frame was read despite the blocked writer.
+        if t_ping != 100 {
+            assert_eq!(owed(&conn).map(|pong| pong.t_echo), Some(t_ping));
+        }
+    }
+
+    // The writing resumes: the peer reads, and gets the answer to the latest PING and not to 200.
+    let mut codec = RammuxCodec::new(
+        &mut peer_in,
+        config().frame_limit,
+        Duration::from_secs(3600),
+        Clock::new(),
+    );
+    let mut echoes = Vec::new();
+    for _ in 0..16 {
+        settle(&mut conn);
+        while let Some(Some(frame)) = tokio::task::unconstrained(codec.next()).now_or_never() {
+            if let DecodedFrame::Frame(frame) = frame.unwrap() {
+                echoes.extend(frame.header.pong.map(|pong| pong.t_echo));
+            }
+        }
+    }
+    assert_eq!(echoes, [100, 300]);
     assert!(owed(&conn).is_none());
 }
 
