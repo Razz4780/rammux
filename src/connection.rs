@@ -78,6 +78,12 @@ where
     /// Creates a new rammux connection with clean state.
     ///
     /// Fails if the config is not valid, see [`RammuxConfig::validate`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside of a Tokio runtime, or in a runtime without the time driver
+    /// (`enable_time` or `enable_all` on the runtime builder). The connection uses Tokio timers
+    /// for the `PING`s and the inbound frame timeout.
     pub fn new(role: RammuxRole, io: IO, config: RammuxConfig) -> Result<Self, ConfigError> {
         config.validate()?;
         Ok(Self {
@@ -233,6 +239,24 @@ mod test {
     };
 
     const DATA: Bytes = Bytes::from_static(&[b'A'; 64 * 1024]);
+
+    #[test]
+    #[should_panic(expected = "no reactor running")]
+    fn new_panics_outside_of_a_tokio_runtime() {
+        let (io, _peer) = tokio::io::duplex(64);
+        let _ = RammuxConnection::new(RammuxRole::Client, io, RammuxConfig::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "timers are disabled")]
+    fn new_panics_without_the_time_driver() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (io, _peer) = tokio::io::duplex(64);
+        let _ = RammuxConnection::new(RammuxRole::Client, io, RammuxConfig::new());
+    }
 
     #[rstest]
     #[tokio::test]

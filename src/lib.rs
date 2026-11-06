@@ -12,6 +12,11 @@
 //! control, sends keepalive `PING`s, and performs graceful downgrade back to the
 //! underlying transport when rammux is finished.
 //!
+//! # Runtime
+//!
+//! rammux runs on Tokio. [`RammuxConnection::new`](connection::RammuxConnection::new) must be called
+//! within a Tokio runtime that has the time driver enabled, or it panics.
+//!
 //! # Configuration and negotiation
 //!
 //! rammux does not define an in-band handshake for transport parameters. Before

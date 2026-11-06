@@ -56,6 +56,9 @@ If the connection stops being polled, all stream IO stalls with it.
 
 ## Connection setup
 
+Create the connection within a Tokio runtime that has the time driver enabled (`enable_time` or `enable_all`):
+rammux uses Tokio timers, and panics without them.
+
 Set `TCP_NODELAY` on the transport if it is a TCP socket. rammux sends small control frames
 (window credit, `PING`s), and Nagle's algorithm and delayed ACKs would hold them back.
 
