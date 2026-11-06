@@ -15,19 +15,13 @@ control, keepalive, and shutdown in one place.
 
 When you need many independent streams over one connection, and you want them to share its bandwidth fairly.
 
-The mainstream multiplexers that run over TCP all split the available bandwidth between their streams unfairly,
-to some extent:
+The mainstream TCP multiplexers that autotune receive windows all split the available bandwidth between their streams unfairly, to some extent:
 
-- the stream that comes first takes most of the bandwidth, and a stream that comes later is choked (yamux);
-- within a single stream, the faster direction chokes the slower one (HTTP/2 in hyper, with the adaptive window);
-- when the reader of a busy stream slows down, the bandwidth that the stream no longer uses
-  does not go to the other streams (both yamux and hyper with the adaptive window).
+- the stream that comes first takes most of the bandwidth, and a stream that comes later is choked; OR
+- on an asymmetrical connection, within a single stream, the faster direction chokes the slower one; OR
+- when the reader of a busy stream slows down, the bandwidth that the stream no longer uses does not go to the other streams.
 
-These multiplexers tune the windows at the receiver. rammux inverts the autotuning: it is the *sender* that decides
-which stream gets more throughput, and it decides with high granularity, for every frame
-(see [Flow control](#flow-control)).
-
-The cost is acceptable: about 5% more packets on a connection that transfers data in one direction only.
+These multiplexers tune the windows at the receiver. rammux fixes the issue by inverting the autotuning: it is the *sender* that decides which stream gets more throughput, and it decides with high granularity, for every frame (see [Flow control](#flow-control)). The cost: about 5% more packets on connections that only transfer data in one direction.
 
 ## What this crate provides
 
