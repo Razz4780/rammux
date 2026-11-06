@@ -1,6 +1,6 @@
 # rammux protocol
 
-This document describes the wire format and session rules implemented in rammux (protocol version 2).
+This document describes the wire format and session rules implemented in rammux (protocol version 1).
 
 rammux multiplexes many virtual bidirectional byte streams over one ordered byte
 transport. The underlying transport is expected to be a reliable full-duplex
@@ -14,8 +14,8 @@ Inspired by [Yamux](https://github.com/hashicorp/yamux).
 
 Before the first rammux frame is sent, the peers must already agree on:
 
-- the version of this protocol (2): frames carry no version, so peers of different versions cannot tell,
-  and they misparse each other's frames (version 1 has another header)
+- the version of this protocol (1): frames carry no version, so peers of different versions cannot tell,
+  and they misparse each other's frames
 - which side is the `client` and which side is the `server`
 - the maximum frame payload size (`frame_limit`, at most 65 535)
 - how many concurrent inbound streams each side is willing to serve (at most 32 768)

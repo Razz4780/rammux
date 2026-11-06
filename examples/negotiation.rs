@@ -84,7 +84,7 @@ async fn negotiate_rammux(role: RammuxRole, mut io: DuplexStream, mut config: Ra
 }
 
 /// The version of the rammux protocol (see `PROTOCOL.md`) that this example speaks.
-const PROTOCOL_VERSION: u8 = 2;
+const PROTOCOL_VERSION: u8 = 1;
 
 /// Exchanged by peers before starting the rammux connection.
 ///
