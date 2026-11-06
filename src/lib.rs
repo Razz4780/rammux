@@ -68,3 +68,13 @@ static_assertions::const_assert!(std::mem::size_of::<u32>() <= std::mem::size_of
 const fn safe_cast_usize(value: u32) -> usize {
     value as usize
 }
+
+/// Returns the instant `after` from now.
+///
+/// A duration too long to add, such as [`Duration::MAX`](std::time::Duration::MAX), means "never":
+/// the deadline is then 30 years from now, as with [`tokio::time::sleep`].
+fn deadline(after: std::time::Duration) -> tokio::time::Instant {
+    const NEVER: std::time::Duration = std::time::Duration::from_secs(30 * 365 * 24 * 60 * 60);
+    let now = tokio::time::Instant::now();
+    now.checked_add(after.min(NEVER)).unwrap_or(now + NEVER)
+}

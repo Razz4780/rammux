@@ -209,6 +209,46 @@ async fn samples_stay_right_across_the_wrap_of_the_clock() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_endless_frame_timeout_works() {
+    let mut config = config();
+    config.inbound_frame_timeout = Duration::MAX;
+    let mut rig = rig(RammuxRole::Server, config);
+    rig.frames();
+    rig.write(raw(
+        Header {
+            ping: Some(1),
+            ..Default::default()
+        },
+        b"",
+    ))
+    .await;
+    assert_eq!(rig.pongs(), [Pong { t_echo: 1 }]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_endless_ping_interval_works() {
+    let mut config = config();
+    config.ping_interval = Duration::from_secs(u64::MAX);
+    config.inbound_frame_timeout = Duration::MAX;
+    let mut rig = rig(RammuxRole::Server, config);
+    // The first PING is due right away, the next one never.
+    let pings = rig
+        .frames()
+        .iter()
+        .filter(|f| f.header.ping.is_some())
+        .count();
+    assert_eq!(pings, 1);
+    // Less than the frame timeout of the peer in the rig.
+    tokio::time::advance(Duration::from_secs(1800)).await;
+    let pings = rig
+        .frames()
+        .iter()
+        .filter(|f| f.header.ping.is_some())
+        .count();
+    assert_eq!(pings, 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn the_reserved_bit_is_a_protocol_violation() {
     let mut rig = rig(RammuxRole::Server, config());
     rig.frames();

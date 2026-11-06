@@ -20,7 +20,7 @@ pub struct InboundTraffic {
     state: InboundState,
     /// Bytes received and not credited back.
     ///
-    /// Never smaller than the same counter of the sender, see `TRANSIT_CONTROL.md`.
+    /// Never larger than the same counter of the sender, see `TRANSIT_CONTROL.md`.
     window: Window,
     /// Bytes read by the application and not credited back yet. Never more than the bytes in [`Self::window`].
     credit: u64,

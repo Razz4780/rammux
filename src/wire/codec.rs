@@ -72,7 +72,9 @@ impl<IO> RammuxCodec<IO> {
             decoder: Default::default(),
             frame_limit,
             clock: Clock::new(),
-            inbound_frame_sleep: Box::pin(tokio::time::sleep(inbound_frame_timeout)),
+            inbound_frame_sleep: Box::pin(tokio::time::sleep_until(crate::deadline(
+                inbound_frame_timeout,
+            ))),
             inbound_frame_timeout,
         }
     }
@@ -207,7 +209,7 @@ where
             Poll::Ready(result) => {
                 this.inbound_frame_sleep
                     .as_mut()
-                    .reset(Instant::now() + this.inbound_frame_timeout);
+                    .reset(crate::deadline(this.inbound_frame_timeout));
                 Poll::Ready(result)
             },
         }

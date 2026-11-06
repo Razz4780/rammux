@@ -379,3 +379,19 @@ async fn parts_of_a_frame_are_processed_in_protocol_order() {
         )
         .unwrap_err();
 }
+
+#[tokio::test]
+async fn a_rejected_write_does_not_lose_the_stream() {
+    let (_handle, mut selector, duplex) = new_stream(pool(0));
+    let (mut sink, _stream) = duplex.into_split();
+    sink.start_send_unpin(Bytes::from_static(b"a")).unwrap();
+    // Not ready: the first write is not sent yet.
+    sink.start_send_unpin(Bytes::from_static(b"b")).unwrap_err();
+    drop(sink);
+
+    let mut fin_write = false;
+    while let Some(Some((update, _))) = selector.next().now_or_never() {
+        fin_write |= update.flags.fin_write;
+    }
+    assert!(fin_write, "closing the sink sends FIN_WRITE");
+}

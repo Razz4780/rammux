@@ -119,7 +119,12 @@ impl Sink<Bytes> for RammuxSink {
         let this = self.get_mut();
         let shared = this.shared.as_ref().ok_or(io::ErrorKind::BrokenPipe)?;
         let result = shared.lock().outbound.write(item, &shared.updates);
-        if result.is_err() {
+        // Only a closed direction is forgotten. A write that came before the sink was ready is rejected,
+        // and the stream stays: dropping the sink must still close it.
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
+        {
             this.shared = None;
         }
         result

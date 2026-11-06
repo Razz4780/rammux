@@ -7,7 +7,7 @@ use std::{
 };
 
 use futures::FutureExt;
-use tokio::time::{Instant, Sleep};
+use tokio::time::Sleep;
 
 use crate::wire::header::Pong;
 
@@ -106,7 +106,7 @@ impl PingSchedule {
     /// Records that a `PING` is being sent.
     pub fn sent(&mut self) {
         self.unpinged_bytes = 0;
-        self.sleep.as_mut().reset(Instant::now() + self.interval);
+        self.sleep.as_mut().reset(crate::deadline(self.interval));
     }
 
     /// Records that `DATA` is being sent.
