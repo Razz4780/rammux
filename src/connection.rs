@@ -230,7 +230,10 @@ mod test {
     use bytes::Bytes;
     use futures::{FutureExt, SinkExt, StreamExt, stream::FuturesUnordered};
     use rstest::rstest;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt, DuplexStream},
+        runtime::Builder,
+    };
 
     use crate::{
         config::{RammuxConfig, RammuxRole},
@@ -250,9 +253,7 @@ mod test {
     #[test]
     #[should_panic(expected = "timers are disabled")]
     fn new_panics_without_the_time_driver() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
+        let runtime = Builder::new_current_thread().build().unwrap();
         let _guard = runtime.enter();
         let (io, _peer) = tokio::io::duplex(64);
         let _ = RammuxConnection::new(RammuxRole::Client, io, RammuxConfig::new());

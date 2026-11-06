@@ -1,10 +1,17 @@
 //! Tests of the connection against a hand-driven peer, frame by frame.
 
-use std::{future::Future, num::NonZeroU16, num::NonZeroU32, time::Duration};
+use std::{
+    future::Future,
+    io,
+    num::{NonZeroU16, NonZeroU32},
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use bytes::Bytes;
 use futures::{FutureExt, SinkExt, StreamExt};
-use tokio::io::{AsyncWriteExt, DuplexStream, WriteHalf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, ReadHalf, WriteHalf};
 
 use crate::{
     StreamId,
@@ -22,7 +29,7 @@ use crate::{
 /// A rammux connection and a peer that reads its frames and writes raw bytes to it.
 struct Rig {
     conn: RammuxConnection<DuplexStream>,
-    peer_in: RammuxCodec<tokio::io::ReadHalf<DuplexStream>>,
+    peer_in: RammuxCodec<ReadHalf<DuplexStream>>,
     peer_out: WriteHalf<DuplexStream>,
 }
 
@@ -462,37 +469,31 @@ struct Pipes {
     write: DuplexStream,
 }
 
-impl tokio::io::AsyncRead for Pipes {
+impl AsyncRead for Pipes {
     fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.read).poll_read(cx, buf)
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.read).poll_read(cx, buf)
     }
 }
 
-impl tokio::io::AsyncWrite for Pipes {
+impl AsyncWrite for Pipes {
     fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.write).poll_write(cx, buf)
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.write).poll_write(cx, buf)
     }
 
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.write).poll_flush(cx)
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.write).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.write).poll_shutdown(cx)
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.write).poll_shutdown(cx)
     }
 }
 

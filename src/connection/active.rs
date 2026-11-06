@@ -24,6 +24,9 @@ use crate::{
     },
 };
 
+#[cfg(test)]
+use crate::wire::header::Pong;
+
 /// A running rammux connection.
 ///
 /// It reads and processes the inbound frames, and writes what the streams and the `PING`/`PONG`
@@ -76,7 +79,7 @@ impl<IO> Active<IO> {
 
     /// Returns the `PONG` we owe.
     #[cfg(test)]
-    pub fn owed_pong(&self) -> Option<crate::wire::header::Pong> {
+    pub fn owed_pong(&self) -> Option<Pong> {
         self.pings.owed_pong()
     }
 }

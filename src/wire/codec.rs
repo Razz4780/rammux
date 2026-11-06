@@ -299,10 +299,11 @@ mod tests {
     use bytes::Bytes;
     use futures::{FutureExt, SinkExt, StreamExt};
     use rstest::rstest;
-    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
     use crate::{
         StreamId,
+        error::ErrorKind,
         wire::{
             codec::{
                 RammuxCodec,
@@ -422,7 +423,7 @@ mod tests {
         fn poll_read(
             self: Pin<&mut Self>,
             _: &mut Context<'_>,
-            _: &mut tokio::io::ReadBuf<'_>,
+            _: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
             Poll::Pending
         }
@@ -514,7 +515,7 @@ mod tests {
     }
 
     /// Feeds raw bytes to a codec and returns the first result.
-    async fn decode(bytes: &[u8]) -> Option<Result<DecodedFrame, crate::error::ErrorKind>> {
+    async fn decode(bytes: &[u8]) -> Option<Result<DecodedFrame, ErrorKind>> {
         let (mut writer, reader) = tokio::io::duplex(256);
         writer.write_all(bytes).await.unwrap();
         writer.shutdown().await.unwrap();
@@ -543,9 +544,7 @@ mod tests {
     #[tokio::test]
     async fn truncated(#[case] bytes: &[u8]) {
         let error = decode(bytes).await.unwrap().unwrap_err();
-        assert!(
-            matches!(error, crate::error::ErrorKind::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof)
-        );
+        assert!(matches!(error, ErrorKind::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof));
     }
 
     #[tokio::test]

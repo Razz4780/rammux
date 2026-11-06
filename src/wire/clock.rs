@@ -41,6 +41,8 @@ pub fn elapsed(now: u32, then: u32) -> Duration {
 mod test {
     use std::time::Duration;
 
+    use tokio::time::Instant;
+
     use crate::wire::clock::{Clock, elapsed};
 
     #[test]
@@ -53,9 +55,9 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn clock_truncates_to_u32() {
         let clock = Clock::new();
-        assert_eq!(clock.micros(tokio::time::Instant::now()), 0);
+        assert_eq!(clock.micros(Instant::now()), 0);
         let wrap = Duration::from_micros(1 << 32);
         tokio::time::advance(wrap + Duration::from_micros(7)).await;
-        assert_eq!(clock.micros(tokio::time::Instant::now()), 7);
+        assert_eq!(clock.micros(Instant::now()), 7);
     }
 }
