@@ -9,7 +9,7 @@ use std::{
 use futures::FutureExt;
 use tokio::time::{Instant, Sleep};
 
-use crate::wire::header::Pong;
+use crate::wire::{clock, header::Pong};
 
 /// Our side of the `PING`/`PONG` exchange: the `PING`s we send and the `PONG`s we owe.
 ///
@@ -26,8 +26,8 @@ pub struct Pings {
     /// 3. Nothing on the sender's side needs one `PONG` per `PING`: every `PONG` is an independent sample.
     /// 4. No deadlock: a cap on owed `PONG`s could stop both sides from reading at the same time.
     owed_pong: Option<Pong>,
-    /// The full stamp of the `PING` that the last accepted `PONG` answered.
-    last_echo: Option<u64>,
+    /// The `t_echo` of the last `PONG` we accepted as a sample.
+    last_echo: Option<u32>,
 }
 
 impl Pings {
@@ -45,21 +45,31 @@ impl Pings {
         self.owed_pong = Some(Pong { t_echo: t_ping });
     }
 
-    /// The peer sent a `PONG` that answers our `PING` stamped `sent`, and we read it at `now`.
-    /// Both are full timestamps of our clock, see [`PingStamps`](crate::wire::clock::PingStamps).
+    /// The peer sent a `PONG`, which we read at `now` on our clock.
+    /// `newest_ping` is the `t_ping` of the newest `PING` we sent.
     ///
     /// Returns the round trip time that the `PONG` measures, unless it is not a sample.
     ///
     /// The peer answers only the latest `PING` it has read, so the echoes of a sound peer strictly increase.
-    /// Whatever is not later than the last accepted echo (a duplicate, a reordered `PONG`) is not a sample.
+    /// Whatever is not later than the last accepted echo (a duplicate, a reordered `PONG`), or later than
+    /// the newest `PING` we sent (an echo of a `PING` that never existed), is not a sample.
     /// The age of the echo does not matter: a `PONG` can wait in a queue for as long as the queue is.
-    pub fn received_pong(&mut self, sent: u64, now: u64) -> Option<Duration> {
-        if self.last_echo.is_some_and(|last| sent <= last) {
+    pub fn received_pong(
+        &mut self,
+        pong: Pong,
+        newest_ping: Option<u32>,
+        now: u32,
+    ) -> Option<Duration> {
+        let fresh = self
+            .last_echo
+            .is_none_or(|last| clock::diff(pong.t_echo, last) > 0);
+        let sent = newest_ping.is_some_and(|sent| clock::diff(pong.t_echo, sent) <= 0);
+        if !fresh || !sent {
             return None;
         }
-        let rtt = now.checked_sub(sent)?;
-        self.last_echo = Some(sent);
-        Some(Duration::from_micros(rtt))
+        let rtt = clock::elapsed(now, pong.t_echo)?;
+        self.last_echo = Some(pong.t_echo);
+        Some(rtt)
     }
 
     /// Returns what the next outgoing frame carries of the exchange: the `PONG` we owe,

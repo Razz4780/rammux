@@ -16,7 +16,7 @@ use crate::{
     buffer::Buffer,
     error::{DecodeError, ErrorKind},
     wire::{
-        clock::{self, Clock, PingStamps},
+        clock::{Clock, PingStamps},
         codec::{
             decoder::{DecodedFrame, DecoderState, InboundFrame},
             encoder::{EncoderItem, OutFrame},
@@ -84,10 +84,9 @@ impl<IO> RammuxCodec<IO> {
         self.clock
     }
 
-    /// Returns the full stamp of the `PING` that went out with the given `t_ping`,
-    /// unless it cannot be one of ours, see [`PingStamps::sent`].
-    pub fn ping_sent(&self, t_ping: u32) -> Option<u64> {
-        self.ping_stamps.sent(t_ping)
+    /// Returns the `t_ping` of the newest `PING` that went out, if any.
+    pub fn newest_ping_stamp(&self) -> Option<u32> {
+        self.ping_stamps.newest()
     }
 
     pub fn into_inner(self) -> IO {
@@ -237,7 +236,7 @@ where
             // Until the transport accepts a byte of the frame, the timestamp is whatever the time is now.
             let stamp = (item.has_ping() && !item.is_started()).then(|| {
                 let stamp = self.ping_stamps.next(self.clock.micros(Instant::now()));
-                item.stamp(clock::to_wire(stamp));
+                item.stamp(stamp);
                 stamp
             });
             // The header and the payload go to the transport together. A transport without

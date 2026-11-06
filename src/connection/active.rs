@@ -98,13 +98,10 @@ where
             DecodedFrame::Terminate => return Poll::Ready(Ok(Received::Term)),
         };
 
-        // An echo of a `PING` that we never sent is not a sample.
-        if let Some(sent) = header
-            .pong
-            .and_then(|pong| self.codec.ping_sent(pong.t_echo))
-        {
+        if let Some(pong) = header.pong {
             let now = self.codec.clock().micros(header_at);
-            if let Some(rtt) = self.pings.received_pong(sent, now) {
+            let newest_ping = self.codec.newest_ping_stamp();
+            if let Some(rtt) = self.pings.received_pong(pong, newest_ping, now) {
                 self.streams.flow_mut().srtt.observe(rtt);
             }
         }
