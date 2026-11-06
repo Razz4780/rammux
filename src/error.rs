@@ -14,7 +14,7 @@ pub struct RammuxError(#[from] pub(crate) ErrorKind);
 impl RammuxError {
     /// Returns whether this error originates from misuse of this crate.
     pub fn is_user(&self) -> bool {
-        matches!(&self.0, ErrorKind::AlreadyDowngraded | ErrorKind::Poisoned)
+        self.0.is_misuse()
     }
 
     /// Returns whether this error originates from an IO failure in the supplied transport.
@@ -79,6 +79,13 @@ pub enum ErrorKind {
     AlreadyDowngraded,
     #[error("connection poisoned")]
     Poisoned,
+}
+
+impl ErrorKind {
+    /// Returns whether the connection was used after it stopped working.
+    pub fn is_misuse(&self) -> bool {
+        matches!(self, Self::AlreadyDowngraded | Self::Poisoned)
+    }
 }
 
 impl From<io::ErrorKind> for ErrorKind {

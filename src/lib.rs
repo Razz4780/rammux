@@ -44,20 +44,19 @@
     unused_crate_dependencies,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
+    clippy::undocumented_unsafe_blocks,
     missing_docs
 )]
 
 mod buffer;
-mod clock;
-mod codec;
 pub mod config;
 pub mod connection;
 mod error;
-mod global_pool;
-mod header;
+mod flow;
+mod pin_list;
 pub mod stream;
 mod stream_id;
-mod transit;
+mod wire;
 
 pub use crate::{error::RammuxError, stream_id::StreamId};
 
@@ -67,7 +66,7 @@ static_assertions::const_assert!(std::mem::size_of::<u32>() <= std::mem::size_of
 ///
 /// The cast never truncates, as statically asserted above.
 ///
-/// This trait exists only to avoid commenting in all of the places where this cast is used.
+/// It exists only to avoid commenting in all of the places where this cast is used.
 const fn safe_cast_usize(value: u32) -> usize {
     value as usize
 }

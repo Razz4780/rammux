@@ -20,8 +20,9 @@ use crate::{
     StreamId,
     buffer::Data,
     config::RammuxConfig,
-    global_pool::GlobalPool,
-    stream::{RammuxDuplex, handle::StreamHandle, updates::StreamUpdates},
+    flow::Srtt,
+    stream::{ConnFlow, RammuxDuplex, handle::StreamHandle, updates::StreamUpdates},
+    wire::header::ControlFlags,
 };
 
 const POOL: u32 = 40;
@@ -61,7 +62,7 @@ struct InFlight {
 
 /// One end of the link: streams with both directions.
 struct End {
-    selector: Selector<StreamUpdates, GlobalPool>,
+    selector: Selector<StreamUpdates, ConnFlow>,
     handles: Vec<StreamHandle>,
     duplexes: Vec<RammuxDuplex>,
     ids: Vec<StreamId>,
@@ -70,10 +71,10 @@ struct End {
 
 impl End {
     fn new(initiator: bool) -> Self {
-        let mut global = GlobalPool::new(POOL, POOL);
-        global.srtt = Some(Duration::from_millis(100));
+        let mut flow = ConnFlow::new(POOL, POOL);
+        flow.srtt = Srtt::of(Duration::from_millis(100));
         let mut end = Self {
-            selector: Selector::new(global),
+            selector: Selector::new(flow),
             handles: Vec::new(),
             duplexes: Vec::new(),
             ids: Vec::new(),
@@ -103,7 +104,7 @@ impl End {
                     self.outgoing.push_back(InFlight {
                         at: Instant::now() + delay,
                         stream,
-                        credit: update.window_update,
+                        credit: update.credit,
                         data: update.data,
                         fin_write: update.flags.fin_write,
                         fin_read: update.flags.fin_read,
@@ -124,8 +125,7 @@ impl End {
                 .received(
                     NonZeroU32::new(f.credit),
                     Data::copy_from_slice(&f.data),
-                    f.fin_write,
-                    f.fin_read,
+                    fins(f.fin_write, f.fin_read),
                     self.selector.strategy_mut(),
                 )
                 .expect("the peer follows the rules");
@@ -133,11 +133,11 @@ impl End {
     }
 
     fn unacked_tx(&self, s: usize) -> u64 {
-        self.handles[s].0.lock().unwrap().outbound.unacked()
+        self.handles[s].0.lock().outbound.unacked()
     }
 
     fn unacked_rx(&self, s: usize) -> u64 {
-        self.handles[s].0.lock().unwrap().inbound.unacked()
+        self.handles[s].0.lock().inbound.unacked()
     }
 }
 
@@ -212,11 +212,11 @@ async fn run(seed: u64, steps: usize) -> u64 {
             sum_rx += rx.saturating_sub(u64::from(BASE));
         }
         let (g_tx, g_rx) = (left.selector.strategy(), right.selector.strategy());
-        assert_eq!(g_tx.tx_used, sum_tx);
-        assert_eq!(g_rx.rx_used, sum_rx);
-        assert!(g_tx.tx_used >= g_rx.rx_used);
-        assert!(g_tx.tx_used <= u64::from(POOL));
-        max_used = max_used.max(g_tx.tx_used);
+        assert_eq!(g_tx.tx_pool.used(), sum_tx);
+        assert_eq!(g_rx.rx_pool.used(), sum_rx);
+        assert!(g_tx.tx_pool.used() >= g_rx.rx_pool.used());
+        assert!(g_tx.tx_pool.used() <= u64::from(POOL));
+        max_used = max_used.max(g_tx.tx_pool.used());
     }
 
     // Stop writing and let everything drain: nothing is stranded.
@@ -234,9 +234,9 @@ async fn run(seed: u64, steps: usize) -> u64 {
         );
         assert_eq!(left.unacked_tx(s), right.unacked_rx(s));
     }
-    assert_eq!(left.selector.strategy().tx_used, 0);
-    assert_eq!(right.selector.strategy().rx_used, 0);
-    assert_eq!(left.selector.strategy().turns_len(), 0);
+    assert_eq!(left.selector.strategy().tx_pool.used(), 0);
+    assert_eq!(right.selector.strategy().rx_pool.used(), 0);
+    assert_eq!(left.selector.strategy().turns.len(), 0);
     max_used
 }
 
@@ -249,4 +249,12 @@ async fn sender_never_counts_less_than_receiver() {
     }
     // The runs do use the pool, up to its size.
     assert_eq!(max_used, u64::from(POOL));
+}
+
+fn fins(fin_write: bool, fin_read: bool) -> ControlFlags {
+    ControlFlags {
+        syn: false,
+        fin_read,
+        fin_write,
+    }
 }

@@ -1,131 +1,90 @@
+//! The receiving direction of a stream.
+
 use std::task::{Poll, Waker};
+
+use futures::task::AtomicWaker;
 
 use crate::{
     buffer::{Data, DataList},
     error::StreamError,
-    global_pool::GlobalPool,
+    flow::{self, Pool, Window},
     stream::{FinState, waker::WakerSlot},
-    transit,
 };
 
 /// The receiving direction of a stream.
 ///
-/// The receive window is fixed: the stream may have `base_window` bytes unread,
-/// and more only from the connection's pool, if the sender is allowed to use it (see `TRANSIT_CONTROL.md`).
-/// The receiver does not tune anything. It counts what was received and not credited back (`unacked`),
-/// checks the pool, and returns credit as the application reads.
+/// The receive window is fixed: the stream may have `B` bytes unread, and more only from the connection's pool,
+/// if the sender is allowed to use it (see `TRANSIT_CONTROL.md`). The receiver does not tune anything.
+/// It counts what was received and not credited back, checks the pool, and returns credit as the application reads.
 pub struct InboundTraffic {
     state: InboundState,
-    /// Credit is sent when this much accumulates.
-    credit_threshold: u64,
-    /// Bytes received on this stream and not credited back to the sender (yet).
+    /// Bytes received and not credited back.
     ///
     /// Never smaller than the same counter of the sender, see `TRANSIT_CONTROL.md`.
-    unacked: Unacked,
-    /// Bytes read by the application and not credited back yet.
-    ///
-    /// Always <= [`Self::unacked`].
+    window: Window,
+    /// Bytes read by the application and not credited back yet. Never more than the bytes in [`Self::window`].
     credit: u64,
+    /// Credit is sent when this much accumulates.
+    credit_threshold: u64,
+}
+
+enum InboundState {
+    /// The peer may send.
+    Open {
+        /// Data received and not read by the application yet.
+        ready_data: DataList,
+        /// Waits for [`Self::Open::ready_data`].
+        reader: WakerSlot,
+    },
+    /// `FIN_WRITE` was received, and the application still reads the rest of the data.
+    ///
+    /// `FIN_READ` is sent, and the stream can close, only once everything is read.
+    HalfClosed {
+        /// Never empty.
+        ready_data: DataList,
+    },
+    /// Nothing more will be read. `FIN_READ` is sent if it was not sent yet.
+    Closed { fin_state: FinState },
 }
 
 impl InboundTraffic {
     pub fn new(base_window: u32) -> Self {
         Self {
             state: InboundState::Open {
-                ready_data: Default::default(),
-                reader: Default::default(),
+                ready_data: DataList::default(),
+                reader: WakerSlot::default(),
             },
-            credit_threshold: transit::credit_threshold(base_window),
-            unacked: Unacked {
-                base_window: u64::from(base_window),
-                bytes: 0,
-            },
+            window: Window::new(base_window),
             credit: 0,
+            credit_threshold: flow::credit_threshold(base_window),
         }
     }
 
-    /// Polls the next inbound traffic update.
-    ///
-    /// Returns ready credit and `FIN_READ`.
-    ///
-    /// Notes:
-    /// 1. If `FIN_READ` has already been sent, this method will return [`Poll::Pending`].
-    /// 2. This method is not responsible for registering the [`Waker`].
-    pub fn poll_update(&mut self, global: &mut GlobalPool) -> Poll<(u32, bool)> {
-        match &mut self.state {
-            InboundState::Open { .. } | InboundState::HalfClosed { .. } => {
-                if self.credit < self.credit_threshold {
-                    return Poll::Pending;
-                }
-                let credit = u32::try_from(self.credit).unwrap_or(u32::MAX);
-                self.credit -= u64::from(credit);
-                self.unacked
-                    .set(global, self.unacked.bytes - u64::from(credit));
-                Poll::Ready((credit, false))
-            },
-
-            InboundState::Closed { fin_state, .. } => {
-                if fin_state.sent {
-                    return Poll::Pending;
-                }
-                fin_state.sent = true;
-                // The sender zeroes its counter when it reads `FIN_READ`, and the rest of the data is discarded.
-                self.credit = 0;
-                self.unacked.set(global, 0);
-                Poll::Ready((0, true))
-            },
+    /// Returns the `FIN_*` state of this direction.
+    pub fn fin_state(&self) -> FinState {
+        match &self.state {
+            InboundState::Open { .. } | InboundState::HalfClosed { .. } => FinState::default(),
+            InboundState::Closed { fin_state } => *fin_state,
         }
     }
 
-    pub fn close_reading(&mut self, updates_poller: &mut WakerSlot) {
-        match &mut self.state {
-            InboundState::Open { .. } => {
-                self.state = InboundState::Closed {
-                    fin_state: FinState {
-                        sent: false,
-                        received: false,
-                    },
-                };
-                updates_poller.wake();
-            },
+    // The application side.
 
-            InboundState::HalfClosed { .. } => {
-                self.state = InboundState::Closed {
-                    fin_state: FinState {
-                        sent: false,
-                        received: true,
-                    },
-                };
-                updates_poller.wake();
-            },
-
-            InboundState::Closed { .. } => {},
-        }
-    }
-
-    pub fn poll_read(
-        &mut self,
-        waker: &Waker,
-        updates_poller: &mut WakerSlot,
-    ) -> Poll<Option<Data>> {
-        match &mut self.state {
+    /// Returns the next chunk of data for the application, or [`None`] at the end of the stream.
+    pub fn poll_read(&mut self, waker: &Waker, updates: &AtomicWaker) -> Poll<Option<Data>> {
+        let data = match &mut self.state {
             InboundState::Open { ready_data, reader } => {
                 let Some(data) = ready_data.pop_front() else {
                     reader.register(waker);
                     return Poll::Pending;
                 };
-                self.credit += data.as_ref().len() as u64;
-                if self.credit >= self.credit_threshold {
-                    updates_poller.wake();
-                }
-                Poll::Ready(Some(data))
+                data
             },
 
             InboundState::HalfClosed { ready_data } => {
                 let data = ready_data
                     .pop_front()
-                    .expect("a half-closed stream with unread data has some chunk ready");
-                self.credit += data.as_ref().len() as u64;
+                    .expect("a half-closed direction has data to read");
                 if ready_data.is_empty() {
                     // Everything is read. The sender gets `FIN_READ` (and the stream's share of the pool back).
                     self.state = InboundState::Closed {
@@ -134,36 +93,123 @@ impl InboundTraffic {
                             received: true,
                         },
                     };
-                    updates_poller.wake();
-                } else if self.credit >= self.credit_threshold {
-                    updates_poller.wake();
+                    updates.wake();
                 }
-                Poll::Ready(Some(data))
+                data
             },
 
-            InboundState::Closed { .. } => Poll::Ready(None),
+            InboundState::Closed { .. } => return Poll::Ready(None),
+        };
+
+        self.credit += data.as_ref().len() as u64;
+        if self.credit >= self.credit_threshold {
+            updates.wake();
+        }
+        Poll::Ready(Some(data))
+    }
+
+    /// The application stops reading. `FIN_READ` follows, and the data that arrives is discarded.
+    pub fn close_reading(&mut self, updates: &AtomicWaker) {
+        let received = match &self.state {
+            InboundState::Open { .. } => false,
+            InboundState::HalfClosed { .. } => true,
+            InboundState::Closed { .. } => return,
+        };
+        self.state = InboundState::Closed {
+            fin_state: FinState {
+                sent: false,
+                received,
+            },
+        };
+        updates.wake();
+    }
+
+    // The connection side.
+
+    /// Polls for what this direction sends next: credit, and whether it is `FIN_READ`.
+    ///
+    /// Returns [`Poll::Pending`] when there is nothing to send. Registering the waker is up to the caller.
+    pub fn poll_update(&mut self, pool: &mut Pool) -> Poll<(u32, bool)> {
+        match &mut self.state {
+            InboundState::Open { .. } | InboundState::HalfClosed { .. } => {
+                if self.credit < self.credit_threshold {
+                    return Poll::Pending;
+                }
+                let credit = u32::try_from(self.credit).unwrap_or(u32::MAX);
+                self.credit -= u64::from(credit);
+                self.window
+                    .set(pool, self.window.unacked() - u64::from(credit));
+                Poll::Ready((credit, false))
+            },
+
+            InboundState::Closed { fin_state } => {
+                if fin_state.sent {
+                    return Poll::Pending;
+                }
+                fin_state.sent = true;
+                // The sender forgets the bytes in flight when it reads `FIN_READ`, and the rest of the data is discarded.
+                self.credit = 0;
+                self.window.set(pool, 0);
+                Poll::Ready((0, true))
+            },
         }
     }
 
-    pub fn received_fin_write(
-        &mut self,
-        updates_poller: &mut WakerSlot,
-    ) -> Result<(), StreamError> {
+    /// The peer sent data.
+    pub fn received_data(&mut self, data: Data, pool: &mut Pool) -> Result<(), StreamError> {
+        let len = data.as_ref().len() as u64;
+        if len == 0 {
+            return Ok(());
+        }
+
         match &mut self.state {
             InboundState::Open { ready_data, reader } => {
-                self.state = if ready_data.is_empty() {
-                    updates_poller.wake();
-                    reader.wake();
-                    InboundState::Closed {
-                        fin_state: FinState {
-                            sent: false,
-                            received: true,
-                        },
-                    }
-                } else {
-                    InboundState::HalfClosed {
-                        ready_data: std::mem::take(ready_data),
-                    }
+                count(&mut self.window, pool, len)?;
+                ready_data.push_back(data);
+                reader.wake();
+                Ok(())
+            },
+
+            InboundState::HalfClosed { .. }
+            | InboundState::Closed {
+                fin_state: FinState { received: true, .. },
+            } => Err(StreamError("sent data after FIN_WRITE")),
+
+            InboundState::Closed {
+                fin_state: FinState { sent: false, .. },
+            } => {
+                // We stopped reading, but the sender does not know yet.
+                // The data counts against the pool until `FIN_READ` is written, but we drop it.
+                count(&mut self.window, pool, len)
+            },
+
+            InboundState::Closed {
+                fin_state: FinState { sent: true, .. },
+            } => {
+                // The sender has not read our `FIN_READ` yet.
+                Ok(())
+            },
+        }
+    }
+
+    /// The peer stopped writing.
+    pub fn received_fin_write(&mut self, updates: &AtomicWaker) -> Result<(), StreamError> {
+        match &mut self.state {
+            InboundState::Open { ready_data, .. } if !ready_data.is_empty() => {
+                self.state = InboundState::HalfClosed {
+                    ready_data: std::mem::take(ready_data),
+                };
+                Ok(())
+            },
+
+            InboundState::Open { reader, .. } => {
+                updates.wake();
+                reader.wake();
+                self.state = InboundState::Closed {
+                    fin_state: FinState {
+                        sent: false,
+                        received: true,
+                    },
                 };
                 Ok(())
             },
@@ -180,107 +226,17 @@ impl InboundTraffic {
         }
     }
 
-    pub fn received_data(
-        &mut self,
-        data: Data,
-        global: &mut GlobalPool,
-    ) -> Result<(), StreamError> {
-        let len = data.as_ref().len() as u64;
-        if len == 0 {
-            return Ok(());
-        }
-
-        match &mut self.state {
-            InboundState::Open { ready_data, reader } => {
-                self.unacked.count(global, len)?;
-                ready_data.push_back(data);
-                reader.wake();
-                Ok(())
-            },
-
-            InboundState::HalfClosed { .. }
-            | InboundState::Closed {
-                fin_state: FinState { received: true, .. },
-            } => Err(StreamError("sent data after FIN_WRITE")),
-
-            InboundState::Closed {
-                fin_state:
-                    FinState {
-                        sent: false,
-                        received: false,
-                    },
-            } => {
-                // We stopped reading, but the sender does not know yet.
-                // The data counts against the pool until `FIN_READ` is written, but we drop it.
-                self.unacked.count(global, len)
-            },
-
-            InboundState::Closed {
-                fin_state:
-                    FinState {
-                        sent: true,
-                        received: false,
-                    },
-            } => {
-                // The sender has not read our `FIN_READ` yet.
-                Ok(())
-            },
-        }
-    }
-
     #[cfg(test)]
     pub fn unacked(&self) -> u64 {
-        self.unacked.bytes
-    }
-
-    pub fn fin_state(&self) -> FinState {
-        match &self.state {
-            InboundState::Open { .. } | InboundState::HalfClosed { .. } => FinState::default(),
-            InboundState::Closed { fin_state, .. } => *fin_state,
-        }
+        self.window.unacked()
     }
 }
 
-/// Bytes received and not credited back, and the part of them that is owed to the pool.
-struct Unacked {
-    /// The base window `B`.
-    base_window: u64,
-    bytes: u64,
-}
-
-impl Unacked {
-    /// Accounts for received data, and checks that the sender stays within the pool.
-    fn count(&mut self, global: &mut GlobalPool, len: u64) -> Result<(), StreamError> {
-        self.set(global, self.bytes + len);
-        if global.rx_used > global.rx_pool {
-            return Err(StreamError("exceeded the receive pool"));
-        }
-        Ok(())
+/// Accounts for received data, and checks that the sender stays within the pool.
+fn count(window: &mut Window, pool: &mut Pool, len: u64) -> Result<(), StreamError> {
+    window.add(pool, len);
+    if pool.is_overdrawn() {
+        return Err(StreamError("exceeded the receive pool"));
     }
-
-    /// Sets the counter, and keeps the pool usage in sync.
-    fn set(&mut self, global: &mut GlobalPool, bytes: u64) {
-        let old = transit::borrowed(self.bytes, self.base_window);
-        let new = transit::borrowed(bytes, self.base_window);
-        transit::rebalance(&mut global.rx_used, old, new);
-        self.bytes = bytes;
-    }
-}
-
-enum InboundState {
-    /// Traffic direction is fully open.
-    Open {
-        ready_data: DataList,
-        reader: WakerSlot,
-    },
-    /// `FIN_WRITE` was received, but the local reader is still draining the data.
-    ///
-    /// We only send `FIN_READ` and allow for the stream to be closed
-    /// when the reader has consumed all pending data.
-    HalfClosed {
-        // Never empty.
-        ready_data: DataList,
-    },
-    /// One of the sides closed and there's no pending data.
-    Closed { fin_state: FinState },
+    Ok(())
 }

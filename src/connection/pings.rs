@@ -1,3 +1,5 @@
+//! The `PING`/`PONG` exchange, see `PROTOCOL.md`.
+
 use std::{
     pin::Pin,
     task::{Context, Poll},
@@ -6,6 +8,94 @@ use std::{
 
 use futures::FutureExt;
 use tokio::time::{Instant, Sleep};
+
+use crate::wire::{clock, header::Pong};
+
+/// Our side of the `PING`/`PONG` exchange: the `PING`s we send and the `PONG`s we owe.
+///
+/// `PING`s and `PONG`s have no identity, and nothing waits for them.
+pub struct Pings {
+    schedule: PingSchedule,
+    /// The answer to the latest `PING` we read, if it is not written yet. The next outgoing frame takes it.
+    ///
+    /// Only the latest `PING` is answered; a newer one overwrites an unanswered one. Why:
+    /// 1. The memory is O(1), with no cap and no read stall: a flood of `PING`s costs only CPU, like
+    ///    any flood of frames.
+    /// 2. An answer that waits in a queue carries our queueing in the peer's back-delay sample.
+    ///    The latest `PING` is the freshest sample.
+    /// 3. Nothing on the sender's side needs one `PONG` per `PING`: every `PONG` is an independent sample.
+    /// 4. No deadlock: a cap on owed `PONG`s could stop both sides from reading at the same time.
+    owed_pong: Option<Pong>,
+    /// The `t_echo` of the last `PONG` we accepted as a sample.
+    last_echo: Option<u32>,
+}
+
+impl Pings {
+    /// Creates the exchange of a new connection. The first `PING` is due immediately.
+    pub fn new(interval: Duration, ping_bytes: u32) -> Self {
+        Self {
+            schedule: PingSchedule::new(interval, ping_bytes),
+            owed_pong: None,
+            last_echo: None,
+        }
+    }
+
+    /// The peer sent a `PING`.
+    pub fn received_ping(&mut self, t_ping: u32) {
+        self.owed_pong = Some(Pong { t_echo: t_ping });
+    }
+
+    /// The peer sent a `PONG`, which we read at `now` on our clock.
+    /// `newest_ping` is the `t_ping` of the newest `PING` we sent.
+    ///
+    /// Returns the round trip time that the `PONG` measures, unless it is not a sample.
+    ///
+    /// The peer answers only the latest `PING` it has read, so the echoes of a sound peer strictly increase.
+    /// Whatever is not later than the last accepted echo (a duplicate, a reordered `PONG`), or later than
+    /// the newest `PING` we sent (an echo of a `PING` that never existed), is not a sample.
+    /// The age of the echo does not matter: a `PONG` can wait in a queue for as long as the queue is.
+    pub fn received_pong(
+        &mut self,
+        pong: Pong,
+        newest_ping: Option<u32>,
+        now: u32,
+    ) -> Option<Duration> {
+        let fresh = self
+            .last_echo
+            .is_none_or(|last| clock::diff(pong.t_echo, last) > 0);
+        let sent = newest_ping.is_some_and(|sent| clock::diff(pong.t_echo, sent) <= 0);
+        if !fresh || !sent {
+            return None;
+        }
+        let rtt = clock::elapsed(now, pong.t_echo)?;
+        self.last_echo = Some(pong.t_echo);
+        Some(rtt)
+    }
+
+    /// Returns what the next outgoing frame carries of the exchange: the `PONG` we owe,
+    /// and whether it carries a `PING`.
+    ///
+    /// Taking a `PING` records that it is sent.
+    pub fn take_frame_part(&mut self, cx: &mut Context<'_>) -> (Option<Pong>, bool) {
+        let pong = self.owed_pong.take();
+        let ping = self.schedule.poll_due(cx).is_ready();
+        if ping {
+            self.schedule.sent();
+        }
+        (pong, ping)
+    }
+
+    /// Records that `DATA` is being sent.
+    pub fn data_sent(&mut self, len: usize) {
+        self.schedule.data_sent(len);
+    }
+
+    /// Returns the `PONG` we owe.
+    #[cfg(test)]
+    pub fn owed_pong(&self) -> Option<Pong> {
+        self.owed_pong
+    }
+}
 
 /// Decides when to send `PING`s.
 ///
@@ -18,8 +108,8 @@ pub struct PingSchedule {
     interval: Duration,
     /// How many bytes of data trigger a `PING`.
     ping_bytes: u32,
-    /// Value of the transmitted bytes counter when the last `PING` was sent.
-    tx_bytes_at_ping: u32,
+    /// Bytes of `DATA` written since the last `PING`.
+    unpinged_bytes: u32,
 }
 
 impl PingSchedule {
@@ -29,25 +119,30 @@ impl PingSchedule {
             sleep: Box::pin(tokio::time::sleep(Duration::ZERO)),
             interval,
             ping_bytes,
-            tx_bytes_at_ping: 0,
+            unpinged_bytes: 0,
         }
     }
 
     /// Polls until a `PING` should be sent.
     ///
-    /// `tx_bytes` is the counter of `DATA` bytes written so far.
     /// When this returns [`Poll::Ready`], the caller must send the `PING` and call [`Self::sent`].
-    pub fn poll_due(&mut self, cx: &mut Context<'_>, tx_bytes: u32) -> Poll<()> {
-        if tx_bytes.wrapping_sub(self.tx_bytes_at_ping) >= self.ping_bytes {
+    pub fn poll_due(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.unpinged_bytes >= self.ping_bytes {
             return Poll::Ready(());
         }
         self.sleep.poll_unpin(cx)
     }
 
-    /// Notifies this struct that a `PING` is being sent.
-    pub fn sent(&mut self, tx_bytes: u32) {
-        self.tx_bytes_at_ping = tx_bytes;
+    /// Records that a `PING` is being sent.
+    pub fn sent(&mut self) {
+        self.unpinged_bytes = 0;
         self.sleep.as_mut().reset(Instant::now() + self.interval);
+    }
+
+    /// Records that `DATA` is being sent.
+    pub fn data_sent(&mut self, len: usize) {
+        let len = u32::try_from(len).unwrap_or(u32::MAX);
+        self.unpinged_bytes = self.unpinged_bytes.saturating_add(len);
     }
 }
 
@@ -55,10 +150,18 @@ impl PingSchedule {
 mod test {
     use std::time::Duration;
 
+    use std::task::{Context, Waker};
+
     use futures::future::poll_fn;
     use tokio::time::Instant;
 
     use crate::connection::pings::PingSchedule;
+
+    fn is_due(schedule: &mut PingSchedule) -> bool {
+        schedule
+            .poll_due(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+    }
 
     #[tokio::test(start_paused = true)]
     async fn pings_on_interval() {
@@ -69,33 +172,39 @@ mod test {
             now + Duration::from_secs(5),
             now + Duration::from_secs(10),
         ] {
-            poll_fn(|cx| schedule.poll_due(cx, 0)).await;
+            poll_fn(|cx| schedule.poll_due(cx)).await;
             assert_eq!(Instant::now(), ready_at);
-            schedule.sent(0);
+            schedule.sent();
         }
     }
 
     #[tokio::test(start_paused = true)]
     async fn pings_on_bytes() {
         let mut schedule = PingSchedule::new(Duration::from_secs(5), 1000);
-        poll_fn(|cx| schedule.poll_due(cx, 0)).await;
-        schedule.sent(0);
+        poll_fn(|cx| schedule.poll_due(cx)).await;
+        schedule.sent();
 
         let now = Instant::now();
-        assert!(!poll_fn(|cx| std::task::Poll::Ready(schedule.poll_due(cx, 999).is_ready())).await);
-        poll_fn(|cx| schedule.poll_due(cx, 1000)).await;
+        schedule.data_sent(999);
+        assert!(!is_due(&mut schedule));
+        schedule.data_sent(1);
+        poll_fn(|cx| schedule.poll_due(cx)).await;
         assert_eq!(Instant::now(), now);
-        schedule.sent(1000);
-
-        // The counter wraps.
-        schedule.sent(u32::MAX - 10);
-        assert!(!poll_fn(|cx| std::task::Poll::Ready(schedule.poll_due(cx, 500).is_ready())).await);
-        poll_fn(|cx| schedule.poll_due(cx, 989)).await;
-        assert_eq!(Instant::now(), now);
+        schedule.sent();
+        assert!(!is_due(&mut schedule), "the bytes start over");
 
         // Sending a ping postpones the next one on the clock.
-        schedule.sent(989);
-        poll_fn(|cx| schedule.poll_due(cx, 989)).await;
+        poll_fn(|cx| schedule.poll_due(cx)).await;
         assert_eq!(Instant::now(), now + Duration::from_secs(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_byte_count_saturates() {
+        let mut schedule = PingSchedule::new(Duration::from_secs(5), u32::MAX);
+        poll_fn(|cx| schedule.poll_due(cx)).await;
+        schedule.sent();
+        schedule.data_sent(usize::MAX);
+        schedule.data_sent(1);
+        assert!(is_due(&mut schedule));
     }
 }

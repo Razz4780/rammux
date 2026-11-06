@@ -4,7 +4,7 @@ use bytes::Bytes;
 
 use crate::{
     StreamId,
-    header::{ControlFlags, Header, MAX_HEADER_LEN, Pong, StreamHeader},
+    wire::header::{ControlFlags, Header, MAX_HEADER_LEN, Pong, StreamHeader},
 };
 
 /// A frame to be written, before its header is encoded.
@@ -158,8 +158,10 @@ mod test {
 
     use crate::{
         StreamId,
-        codec::encoder::{EncoderItem, OutFrame, OutStream},
-        header::{ControlFlags, Pong},
+        wire::{
+            codec::encoder::{EncoderItem, OutFrame, OutStream},
+            header::{ControlFlags, Pong},
+        },
     };
 
     fn collect(item: &EncoderItem) -> Vec<u8> {

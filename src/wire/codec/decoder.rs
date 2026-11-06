@@ -4,7 +4,7 @@ use tokio::time::Instant;
 
 use crate::{
     buffer::{Buffer, Data},
-    header::{Flags, Header, MAX_HEADER_LEN},
+    wire::header::{Flags, Header, MAX_HEADER_LEN},
 };
 
 pub enum DecoderState {

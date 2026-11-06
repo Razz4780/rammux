@@ -8,8 +8,8 @@ use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{
-    codec::{RammuxCodec, decoder::DecodedFrame, encoder::OutFrame},
     error::{ErrorKind, RammuxError},
+    wire::codec::{RammuxCodec, decoder::DecodedFrame, encoder::OutFrame},
 };
 
 /// [`Future`] that handles the rammux connection downgrade.
@@ -20,7 +20,7 @@ use crate::{
 /// This future should be polled to completion in order to avoid errors on the other side.
 #[must_use = "downgrade should be polled to unblock the rammux peer"]
 pub struct Downgraded<IO> {
-    /// Recovered from [`Active::codec`](super::state::Active::codec).
+    /// Recovered from the [`Active`](super::active::Active) connection.
     ///
     /// Boxed: the codec holds a decoder buffer and a pending frame, which would make every future
     /// that holds a [`Downgraded`] large.

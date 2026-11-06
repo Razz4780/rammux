@@ -23,8 +23,9 @@ use crate::{
     StreamId,
     buffer::Data,
     config::RammuxConfig,
-    global_pool::GlobalPool,
-    stream::{RammuxDuplex, StreamRef, handle::StreamHandle, updates::StreamUpdates},
+    flow::Srtt,
+    stream::{ConnFlow, RammuxDuplex, StreamRef, handle::StreamHandle, updates::StreamUpdates},
+    wire::header::ControlFlags,
 };
 
 const CONFIG: RammuxConfig = RammuxConfig {
@@ -60,17 +61,17 @@ struct Strm {
 }
 
 struct Bed {
-    selector: Selector<StreamUpdates, GlobalPool>,
+    selector: Selector<StreamUpdates, ConnFlow>,
     streams: Vec<Strm>,
 }
 
 impl Bed {
     /// Creates a bed where the peer's pool is `tx_pool` bytes.
     fn new(tx_pool: u32) -> Self {
-        let mut global = GlobalPool::new(1 << 20, tx_pool);
-        global.srtt = Some(Duration::from_secs(1));
+        let mut flow = ConnFlow::new(1 << 20, tx_pool);
+        flow.srtt = Srtt::of(Duration::from_secs(1));
         Self {
-            selector: Selector::new(global),
+            selector: Selector::new(flow),
             streams: Vec::new(),
         }
     }
@@ -100,13 +101,13 @@ impl Bed {
         usize::from(n)
     }
 
-    fn global(&self) -> &GlobalPool {
+    fn flow(&self) -> &ConnFlow {
         self.selector.strategy()
     }
 
     /// Gives the stream an allowance of `bytes`, as if the peer's reader had just read that much.
     fn prime(&self, s: usize, bytes: u32) {
-        let mut state = self.streams[s].me.lock().unwrap();
+        let mut state = self.streams[s].me.lock();
         state.outbound.prime(bytes, SRTT, Instant::now());
     }
 
@@ -127,8 +128,7 @@ impl Bed {
             .received(
                 NonZeroU32::new(credit),
                 Data::default(),
-                false,
-                false,
+                fins(false, false),
                 self.selector.strategy_mut(),
             )
             .unwrap();
@@ -171,25 +171,25 @@ impl Bed {
     }
 
     fn queue(&self) -> Vec<usize> {
-        self.global()
-            .turn_order()
+        self.flow()
+            .turns
             .iter()
             .map(|queued| {
                 self.streams
                     .iter()
-                    .position(|s| Arc::ptr_eq(&s.me, queued))
+                    .position(|s| std::ptr::eq(Arc::as_ptr(&s.me), queued))
                     .expect("a queued stream is a stream of the bed")
             })
             .collect()
     }
 
     fn is_queued(&self, s: usize) -> bool {
-        self.streams[s].me.lock().unwrap().outbound.is_queued()
+        self.flow().turns.contains(&self.streams[s].me)
     }
 }
 
 /// The guard of the rule "free room never lets a stream skip the queue": it fails (and it is the only test
-/// that does) if `GlobalPool::has_turn` is forced to true. The equal-share sim tests do not tell,
+/// that does) if `ConnFlow::has_turn` is forced to true. The equal-share sim tests do not tell,
 /// because the front is woken before the stream that got the credit, and no scenario with equal writes
 /// that was tried (staggered starts, throttled readers, flushed or not) separates them.
 #[tokio::test(start_paused = true)]
@@ -203,7 +203,7 @@ async fn a_stream_woken_by_its_own_credit_does_not_take_free_room_while_others_w
     // X takes the whole pool, and waits for more.
     bed.write(x, 32);
     assert_eq!(bed.drain(), [(x, 8), (x, 8), (x, 8)]);
-    assert_eq!(bed.global().tx_used, 8);
+    assert_eq!(bed.flow().tx_pool.used(), 8);
     assert_eq!(bed.queue(), [x]);
     // Y and Z use their base windows and queue up behind X.
     bed.write(y, 32);
@@ -214,11 +214,11 @@ async fn a_stream_woken_by_its_own_credit_does_not_take_free_room_while_others_w
     // Y gets a little credit, which is not enough for a frame, and then X returns what it borrowed.
     bed.credit(y, 3);
     bed.credit(x, 8);
-    assert_eq!(bed.global().tx_used, 0, "the pool is free");
+    assert_eq!(bed.flow().tx_pool.used(), 0, "the pool is free");
     // Y is woken first, but it is not its turn: it only uses its base window.
     // Then X takes the room.
     assert_eq!(bed.drain(), [(y, 3), (x, 8)]);
-    assert_eq!(bed.global().tx_used, 8);
+    assert_eq!(bed.flow().tx_pool.used(), 8);
     // Y keeps its place in the queue, and X is done.
     assert_eq!(bed.queue(), [y, z]);
 }
@@ -283,7 +283,7 @@ async fn a_slow_reader_uses_the_pool_in_proportion_to_its_rate() {
         bed.credit(slow, 1);
         let sent = bed.drain();
         assert!(sent.iter().all(|(s, n)| *s == slow && *n <= 2), "{sent:?}");
-        let unacked = bed.streams[slow].me.lock().unwrap().outbound.unacked();
+        let unacked = bed.streams[slow].me.lock().outbound.unacked();
         assert!(unacked <= 16 + 2, "{unacked}");
         tokio::time::advance(Duration::from_secs(1)).await;
     }
@@ -298,7 +298,7 @@ async fn a_small_allowance_or_pool_is_used_in_smaller_frames() {
     bed.prime(x, 5);
     bed.write(x, 32);
     assert_eq!(bed.drain(), [(x, 8), (x, 8), (x, 5)]);
-    assert_eq!(bed.global().tx_used, 5);
+    assert_eq!(bed.flow().tx_pool.used(), 5);
     // And then waits for its own credit, outside of the queue.
     assert!(!bed.is_queued(x));
 
@@ -308,7 +308,7 @@ async fn a_small_allowance_or_pool_is_used_in_smaller_frames() {
     bed.prime(y, 1000);
     bed.write(y, 32);
     assert_eq!(bed.drain(), [(y, 8), (y, 8), (y, 5)]);
-    assert_eq!(bed.global().tx_used, 5);
+    assert_eq!(bed.flow().tx_pool.used(), 5);
     assert_eq!(bed.queue(), [y], "Y waits at the front for room");
 
     // A pool and a base window smaller than a frame still work.
@@ -332,7 +332,7 @@ async fn a_message_shorter_than_a_frame_is_sent_whole_from_shared_room() {
     // Base room is 3, the message is 5 bytes: it is sent whole, 2 bytes from the pool.
     bed.write(x, 5);
     assert_eq!(bed.drain(), [(x, 5)]);
-    assert_eq!(bed.global().tx_used, 2);
+    assert_eq!(bed.flow().tx_pool.used(), 2);
 }
 
 #[tokio::test(start_paused = true)]
@@ -374,8 +374,7 @@ async fn a_queued_stream_that_closes_leaves_the_queue() {
         .received(
             None,
             Data::default(),
-            false,
-            true,
+            fins(false, true),
             bed.selector.strategy_mut(),
         )
         .unwrap();
@@ -386,7 +385,7 @@ async fn a_queued_stream_that_closes_leaves_the_queue() {
     // Z gets the room X frees.
     bed.credit(x, 8);
     assert_eq!(bed.drain(), [(z, 8)]);
-    assert_eq!(bed.global().tx_used, 8);
+    assert_eq!(bed.flow().tx_pool.used(), 8);
 }
 
 #[tokio::test(start_paused = true)]
@@ -399,7 +398,7 @@ async fn fin_read_returns_the_pool_and_wakes_the_queue() {
     bed.write(y, 32);
     bed.drain();
     assert_eq!(bed.queue(), [y]);
-    assert_eq!(bed.global().tx_used, 8);
+    assert_eq!(bed.flow().tx_pool.used(), 8);
 
     // The reader of X is gone: the pool is free without any credit.
     bed.streams[x]
@@ -407,12 +406,11 @@ async fn fin_read_returns_the_pool_and_wakes_the_queue() {
         .received(
             None,
             Data::default(),
-            false,
-            true,
+            fins(false, true),
             bed.selector.strategy_mut(),
         )
         .unwrap();
-    assert_eq!(bed.global().tx_used, 0);
+    assert_eq!(bed.flow().tx_pool.used(), 0);
     assert_eq!(bed.drain(), [(y, 8)]);
 }
 
@@ -427,8 +425,7 @@ async fn credit_larger_than_the_data_in_flight_is_a_violation() {
         .received(
             NonZeroU32::new(9),
             Data::default(),
-            false,
-            false,
+            fins(false, false),
             bed.selector.strategy_mut(),
         )
         .unwrap_err();
@@ -444,29 +441,28 @@ async fn the_pool_is_never_overdrawn() {
         bed.write(s, 64);
     }
     bed.drain();
-    assert_eq!(bed.global().tx_used, 24);
-    assert_eq!(bed.global().turns_len(), 6);
+    assert_eq!(bed.flow().tx_pool.used(), 24);
+    assert_eq!(bed.flow().turns.len(), 6);
     for round in 0..50 {
         let s = streams[round % streams.len()];
-        let unacked = bed.streams[s].me.lock().unwrap().outbound.unacked();
+        let unacked = bed.streams[s].me.lock().outbound.unacked();
         if unacked > 0 {
             bed.credit(s, u32::try_from(unacked.min(8)).unwrap());
         }
         bed.drain();
-        assert!(bed.global().tx_used <= 24);
+        assert!(bed.flow().tx_pool.used() <= 24);
         let borrowed = streams
             .iter()
             .map(|&s| {
                 bed.streams[s]
                     .me
                     .lock()
-                    .unwrap()
                     .outbound
                     .unacked()
                     .saturating_sub(16)
             })
             .sum::<u64>();
-        assert_eq!(borrowed, bed.global().tx_used);
+        assert_eq!(borrowed, bed.flow().tx_pool.used());
     }
 }
 
@@ -487,13 +483,12 @@ async fn a_reused_stream_id_does_not_confuse_the_queue() {
         .received(
             None,
             Data::default(),
-            true,
-            true,
+            fins(true, true),
             bed.selector.strategy_mut(),
         )
         .unwrap();
     bed.drain();
-    assert_eq!(bed.global().turns_len(), 0);
+    assert_eq!(bed.flow().turns.len(), 0);
 
     // Another stream gets the ID, and waits for the pool.
     let new = bed.add_reusing(old);
@@ -513,10 +508,10 @@ async fn a_base_window_smaller_than_a_frame_works() {
         remote_recv_window: NonZeroU32::new(5).unwrap(),
         ..CONFIG
     };
-    let mut global = GlobalPool::new(1 << 20, 0);
-    global.srtt = Some(Duration::from_secs(1));
-    let mut selector = Selector::new(global);
-    let (mut handle, updates, mut duplex) =
+    let mut flow = ConnFlow::new(1 << 20, 0);
+    flow.srtt = Srtt::of(Duration::from_secs(1));
+    let mut selector = Selector::new(flow);
+    let (handle, updates, mut duplex) =
         crate::stream::new(StreamId::from_be_bytes([0, 0]), true, &config);
     selector.push(updates);
     duplex
@@ -531,11 +526,18 @@ async fn a_base_window_smaller_than_a_frame_works() {
         .received(
             NonZeroU32::new(5),
             Data::default(),
-            false,
-            false,
+            fins(false, false),
             selector.strategy_mut(),
         )
         .unwrap();
     let (update, _) = selector.next().await.unwrap();
     assert_eq!(update.data.len(), 5);
+}
+
+fn fins(fin_write: bool, fin_read: bool) -> ControlFlags {
+    ControlFlags {
+        syn: false,
+        fin_read,
+        fin_write,
+    }
 }

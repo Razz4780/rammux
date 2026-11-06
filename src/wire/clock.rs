@@ -84,7 +84,7 @@ mod test {
 
     use rstest::rstest;
 
-    use crate::clock::{Clock, PingStamps, diff, elapsed};
+    use crate::wire::clock::{Clock, PingStamps, diff, elapsed};
 
     #[rstest]
     #[case(5, 3, 2)]

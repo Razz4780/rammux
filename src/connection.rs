@@ -1,43 +1,31 @@
 //! Types for running rammux protocol on an IO transport.
 
 use std::{
-    collections::hash_map::Entry,
-    convert::Infallible,
-    io,
     task::{Context, Poll},
     time::Duration,
 };
 
-use async_selector::selector::Selector;
-use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{
-    clock::{self, Clock},
-    codec::{
-        RammuxCodec,
-        decoder::{DecodedFrame, InboundFrame},
-        encoder::OutFrame,
-    },
     config::{ConfigError, RammuxConfig, RammuxRole},
     connection::{
-        pings::PingSchedule,
-        state::{Active, ConnState},
+        active::{Active, Received},
+        state::ConnState,
     },
     error::{ErrorKind, RammuxError},
-    global_pool::GlobalPool,
-    header::Pong,
     stream::RammuxDuplex,
-    stream_id::StreamId,
 };
 
 pub use crate::connection::downgrade::Downgraded;
 
+mod active;
 mod downgrade;
 mod pings;
 #[cfg(test)]
 mod sim_test;
 mod state;
+mod streams;
 #[cfg(test)]
 mod wire_test;
 
@@ -92,25 +80,8 @@ where
     /// Fails if the config is not valid, see [`RammuxConfig::validate`].
     pub fn new(role: RammuxRole, io: IO, config: RammuxConfig) -> Result<Self, ConfigError> {
         config.validate()?;
-        let clock = Clock::new();
         Ok(Self {
-            state: ConnState::Active(Active {
-                codec: RammuxCodec::new(
-                    io,
-                    config.frame_limit,
-                    config.inbound_frame_timeout,
-                    clock,
-                ),
-                streams: Default::default(),
-                selector: Selector::new(GlobalPool::new(
-                    config.local_recv_pool,
-                    config.remote_recv_pool,
-                )),
-                pings: PingSchedule::new(config.ping_interval, config.ping_bytes.get()),
-                pong: None,
-                last_echo: None,
-                clock,
-            }),
+            state: ConnState::Active(Active::new(io, role, &config)),
             config,
             role,
         })
@@ -126,227 +97,32 @@ where
         self.role
     }
 
-    fn poll_inbound_progress(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<RammuxProgress<IO>, ErrorKind>> {
-        let active = self.state.active_mut()?;
-        let frame = std::task::ready!(active.codec.poll_next_unpin(cx))
-            .ok_or(io::ErrorKind::UnexpectedEof)
-            .map_err(io::Error::from)??;
-
-        let frame = match frame {
-            DecodedFrame::Frame(frame) => frame,
-            DecodedFrame::Terminate => {
-                let downgraded = self.state.downgrade(true)?;
-                return Poll::Ready(Ok(RammuxProgress::Downgraded(downgraded)));
-            },
-        };
-        let InboundFrame {
-            header,
-            data,
-            header_at,
-        } = frame;
-
-        // The connection part of the frame comes first.
-        let global = active.selector.strategy_mut();
-        let now = active.clock.micros(header_at);
-        if let Some(pong) = header.pong {
-            // A PONG answers one of our PINGs, and the peer answers only the latest one it has read,
-            // so the echoes of a sound peer strictly increase. Whatever is not later than the last
-            // accepted echo (a duplicate, a reordered PONG), or later than the newest stamp we have
-            // sent (an echo of a PING that never existed), is ignored. The age of the echo does not
-            // matter: a PONG can wait in a queue for as long as the queue is.
-            let sent = active.codec.newest_ping_stamp();
-            let fresh = active
-                .last_echo
-                .is_none_or(|last| clock::diff(pong.t_echo, last) > 0);
-            if fresh
-                && sent.is_some_and(|sent| clock::diff(pong.t_echo, sent) <= 0)
-                && let Some(rtt) = clock::elapsed(now, pong.t_echo)
-            {
-                active.last_echo = Some(pong.t_echo);
-                global.observe_rtt(rtt);
-            }
-        }
-        if let Some(t_ping) = header.ping {
-            // Only the latest PING is answered, see `Active::pong`.
-            active.pong = Some(Pong { t_echo: t_ping });
-        }
-
-        let Some(stream) = header.stream else {
-            return Poll::Ready(Ok(RammuxProgress::Empty));
-        };
-        let stream_id = stream.id;
-        let flags = stream.flags;
-
-        let progress = if stream_id.initiated_by() == self.role {
-            if flags.syn {
-                return Poll::Ready(Err(ErrorKind::Stream {
-                    id: stream_id,
-                    error: "started a new stream with an ID from the wrong pool".into(),
-                }));
-            }
-            let slab_idx = stream_id.slab_idx();
-            let e = active
-                .streams
-                .outbound
-                .get_mut(slab_idx)
-                .ok_or(ErrorKind::Stream {
-                    id: stream_id,
-                    error: "sent a frame for an unknown stream".into(),
-                })?;
-
-            let fin_state = e
-                .received(
-                    stream.credit,
-                    data,
-                    flags.fin_write,
-                    flags.fin_read,
-                    active.selector.strategy_mut(),
-                )
-                .map_err(|error| ErrorKind::Stream {
-                    id: stream_id,
-                    error,
-                })?;
-            if fin_state.is_dead() {
-                active.streams.outbound.remove(slab_idx);
-            }
-
-            RammuxProgress::Empty
-        } else {
-            let stream_count = active.streams.inbound.len();
-            let (mut e, new_stream) = match active.streams.inbound.entry(stream_id) {
-                Entry::Occupied(..) if flags.syn => {
-                    return Poll::Ready(Err(ErrorKind::Stream {
-                        id: stream_id,
-                        error: "started a new stream with an occupied ID".into(),
-                    }));
-                },
-                Entry::Occupied(e) => (e, None),
-                Entry::Vacant(e) if flags.syn => {
-                    if stream_count == crate::safe_cast_usize(self.config.max_inbound_streams) {
-                        return Poll::Ready(Err(ErrorKind::Stream {
-                            id: stream_id,
-                            error: "started a new stream without respecting the configured limit"
-                                .into(),
-                        }));
-                    }
-                    let (handle, updates, duplex) =
-                        crate::stream::new(stream_id, false, &self.config);
-                    active.selector.push(updates);
-                    (e.insert_entry(handle), Some(duplex))
-                },
-                Entry::Vacant(..) => {
-                    return Poll::Ready(Err(ErrorKind::Stream {
-                        id: stream_id,
-                        error: "sent a frame for an unknown stream".into(),
-                    }));
-                },
-            };
-
-            let fin_state = e
-                .get_mut()
-                .received(
-                    stream.credit,
-                    data,
-                    flags.fin_write,
-                    flags.fin_read,
-                    active.selector.strategy_mut(),
-                )
-                .map_err(|error| ErrorKind::Stream {
-                    id: stream_id,
-                    error,
-                })?;
-            if fin_state.is_dead() {
-                e.remove();
-            }
-
-            new_stream
-                .map(RammuxProgress::Inbound)
-                .unwrap_or(RammuxProgress::Empty)
-        };
-
-        Poll::Ready(Ok(progress))
-    }
-
-    fn make_outbound_progress(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Infallible, ErrorKind>> {
-        let active = self.state.active_mut()?;
-
-        loop {
-            std::task::ready!(active.codec.poll_ready_unpin(cx))?;
-
-            // Compose the next frame. The order of importance is:
-            // 1. PONG, the peer measures its round trip with it,
-            // 2. PING, same,
-            // 3. stream control,
-            // 4. stream data.
-            // What goes first cannot wait behind what goes later,
-            // but it rides along if the later frame is going out anyway.
-            let mut frame = OutFrame::default();
-            let tx_bytes = active.selector.strategy().tx_bytes;
-
-            frame.pong = active.pong.take();
-            if active.pings.poll_due(cx, tx_bytes).is_ready() {
-                active.pings.sent(tx_bytes);
-                frame.ping = true;
-            }
-
-            let mut finished = None;
-            if let Poll::Ready(Some((update, fin_state))) = active.selector.poll_next_unpin(cx) {
-                finished = fin_state.is_dead().then_some(update.id);
-                frame.stream = Some(update.into());
-            }
-
-            if frame.is_empty() {
-                let _ = active.codec.poll_flush_unpin(cx)?;
-                break Poll::Pending;
-            }
-
-            let global = active.selector.strategy_mut();
-            global.tx_bytes = global.tx_bytes.wrapping_add(
-                u32::try_from(frame.data_len()).expect("a frame carries at most u16::MAX bytes"),
-            );
-            active.codec.start_send_unpin(frame)?;
-
-            if let Some(id) = finished {
-                if id.initiated_by() == self.role {
-                    active.streams.outbound.remove(id.slab_idx());
-                } else {
-                    active.streams.inbound.remove(&id);
-                }
-            }
-        }
-    }
-
     fn poll_progress_inner(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<RammuxProgress<IO>, ErrorKind>> {
-        let mut inbound = Poll::Pending;
-        // Drain a bounded batch of inbound frames first.
-        // Processing window updates can make several outbound streams writable.
-        // Keep the work bounded so ready reads cannot starve writes.
+        let active = self.state.active_mut()?;
+
+        // Process a bounded batch of inbound frames first: credit can make several streams writable,
+        // and the bound keeps the reads from starving the writes.
+        let mut progress = Poll::Pending;
         for _ in 0..INBOUND_BATCH {
-            match self.poll_inbound_progress(cx)? {
+            match active.poll_receive(cx)? {
                 Poll::Pending => break,
-                Poll::Ready(RammuxProgress::Empty) => {
-                    inbound = Poll::Ready(RammuxProgress::Empty);
-                },
-                Poll::Ready(other) => {
-                    inbound = Poll::Ready(other);
+                Poll::Ready(Received::Frame(None)) => progress = Poll::Ready(RammuxProgress::Empty),
+                Poll::Ready(Received::Frame(Some(stream))) => {
+                    progress = Poll::Ready(RammuxProgress::Inbound(stream));
                     break;
+                },
+                Poll::Ready(Received::Term) => {
+                    let downgraded = self.state.downgrade(true)?;
+                    return Poll::Ready(Ok(RammuxProgress::Downgraded(downgraded)));
                 },
             }
         }
-        if let Poll::Ready(RammuxProgress::Downgraded(..)) = inbound {
-            return inbound.map(Ok);
-        }
-        let _ = self.make_outbound_progress(cx)?;
-        inbound.map(Ok)
+
+        let _ = active.poll_send(cx)?;
+        progress.map(Ok)
     }
 
     /// Makes progress in this connection.
@@ -357,13 +133,11 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<RammuxProgress<IO>, RammuxError>> {
         let result = std::task::ready!(self.poll_progress_inner(cx));
-        match &result {
-            Ok(RammuxProgress::Empty | RammuxProgress::Inbound(..)) => {},
-            Ok(RammuxProgress::Downgraded(..)) => {},
-            Err(ErrorKind::AlreadyDowngraded | ErrorKind::Poisoned) => {},
-            Err(..) => {
-                self.state = ConnState::Poisoned;
-            },
+        // A failure of the connection is final. A misuse leaves the connection as it is.
+        if let Err(error) = &result
+            && !error.is_misuse()
+        {
+            self.state = ConnState::Poisoned;
         }
         Poll::Ready(result.map_err(From::from))
     }
@@ -382,22 +156,7 @@ where
     /// If the configured outbound streams limit is currently exhausted, returns [`None`].
     /// Note that this connection must be polled in order to free IDs of closed streams.
     pub fn try_start_outbound(&mut self) -> Result<Option<RammuxDuplex>, RammuxError> {
-        let active = self.state.active_mut()?;
-
-        if active.streams.outbound.len() >= crate::safe_cast_usize(self.config.max_outbound_streams)
-        {
-            return Ok(None);
-        }
-        let slab_idx = active.streams.outbound.vacant_key();
-        let Some(id) = StreamId::from_slab_idx(slab_idx, self.role) else {
-            return Ok(None);
-        };
-
-        let (handle, updates, duplex) = crate::stream::new(id, true, &self.config);
-        active.selector.push(updates);
-        active.streams.outbound.insert(handle);
-
-        Ok(Some(duplex))
+        Ok(self.state.active_mut()?.open_outbound())
     }
 
     /// Starts the downgrade procedure of this connection.
@@ -409,22 +168,7 @@ where
 
     /// Returns current statistics of this connection.
     pub fn stats(&self) -> RammuxStats {
-        let Ok(active) = self.state.active() else {
-            return RammuxStats::default();
-        };
-        let global = active.selector.strategy();
-        RammuxStats {
-            inbound_streams: u32::try_from(active.streams.inbound.len())
-                .expect("we can't have more than u32 inbound streams"),
-            outbound_streams: u32::try_from(active.streams.outbound.len())
-                .expect("we can't have more than u32 outbound streams"),
-            srtt: global.srtt,
-            pool_tx_used: global.tx_used,
-            pool_rx_used: global.rx_used,
-            turn_queue_len: u32::try_from(global.turns_len()).expect(
-                "at most one queue entry per stream, and there are fewer than u32::MAX streams",
-            ),
-        }
+        self.state.active().map(Active::stats).unwrap_or_default()
     }
 }
 

@@ -282,7 +282,7 @@ mod test {
 
     use crate::{
         StreamId,
-        header::{ControlFlags, Flags, Header, MAX_HEADER_LEN, Pong, StreamHeader},
+        wire::header::{ControlFlags, Flags, Header, MAX_HEADER_LEN, Pong, StreamHeader},
     };
 
     fn stream(flags: ControlFlags, credit: Option<u32>, len: Option<u16>) -> Option<StreamHeader> {

@@ -8,14 +8,15 @@ use tokio::io::{AsyncWriteExt, DuplexStream, WriteHalf};
 
 use crate::{
     StreamId,
-    clock::Clock,
-    codec::{
-        RammuxCodec,
-        decoder::{DecodedFrame, InboundFrame},
-    },
     config::{RammuxConfig, RammuxRole},
     connection::{RammuxConnection, RammuxProgress},
-    header::{ControlFlags, Header, MAX_HEADER_LEN, Pong, StreamHeader},
+    wire::{
+        codec::{
+            RammuxCodec,
+            decoder::{DecodedFrame, InboundFrame},
+        },
+        header::{ControlFlags, Header, MAX_HEADER_LEN, Pong, StreamHeader},
+    },
 };
 
 /// A rammux connection and a peer that reads its frames and writes raw bytes to it.
@@ -38,12 +39,7 @@ fn rig(role: RammuxRole, config: RammuxConfig) -> Rig {
     let (read, write) = tokio::io::split(io_2);
     Rig {
         conn: RammuxConnection::new(role, io_1, config.clone()).unwrap(),
-        peer_in: RammuxCodec::new(
-            read,
-            config.frame_limit,
-            Duration::from_secs(3600),
-            Clock::new(),
-        ),
+        peer_in: RammuxCodec::new(read, config.frame_limit, Duration::from_secs(3600)),
         peer_out: write,
     }
 }
@@ -265,7 +261,7 @@ async fn pings_follow_the_data_and_the_clock() {
     assert!(
         stamps
             .windows(2)
-            .all(|w| crate::clock::diff(w[1], w[0]) > 0)
+            .all(|w| crate::wire::clock::diff(w[1], w[0]) > 0)
     );
 
     // No data, so the clock decides.
@@ -483,7 +479,7 @@ async fn a_flood_of_pings_is_read_without_a_stall_and_answered_with_the_latest()
     let (write, mut peer_in) = tokio::io::duplex(1024);
     let mut conn =
         RammuxConnection::new(RammuxRole::Server, Pipes { read, write }, config()).unwrap();
-    let owed = |conn: &RammuxConnection<Pipes>| conn.state.active().unwrap().pong;
+    let owed = |conn: &RammuxConnection<Pipes>| conn.state.active().unwrap().owed_pong();
     let ping = |t_ping| {
         raw(
             Header {
@@ -513,7 +509,6 @@ async fn a_flood_of_pings_is_read_without_a_stall_and_answered_with_the_latest()
         &mut peer_in,
         config().frame_limit,
         Duration::from_secs(3600),
-        Clock::new(),
     );
     let mut echoes = Vec::new();
     for _ in 0..100 {
@@ -551,7 +546,7 @@ async fn a_blocked_writer_keeps_reading_and_owes_one_pong() {
     let (write, mut peer_in) = tokio::io::duplex(4);
     let mut conn =
         RammuxConnection::new(RammuxRole::Server, Pipes { read, write }, config()).unwrap();
-    let owed = |conn: &RammuxConnection<Pipes>| conn.state.active().unwrap().pong;
+    let owed = |conn: &RammuxConnection<Pipes>| conn.state.active().unwrap().owed_pong();
     let settle = |conn: &mut RammuxConnection<Pipes>| {
         while let Some(result) = tokio::task::unconstrained(conn.progress()).now_or_never() {
             result.unwrap();
@@ -578,7 +573,6 @@ async fn a_blocked_writer_keeps_reading_and_owes_one_pong() {
         &mut peer_in,
         config().frame_limit,
         Duration::from_secs(3600),
-        Clock::new(),
     );
     let mut echoes = Vec::new();
     for _ in 0..16 {

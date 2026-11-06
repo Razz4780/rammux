@@ -1,39 +1,8 @@
-//! Constants and small pieces of the transit control, see `TRANSIT_CONTROL.md`.
-
-use std::time::Duration;
+//! The estimate of the rate at which the reader of a stream reads.
 
 use tokio::time::Instant;
 
-/// `k`: an allowance covers this many loops (smoothed round trip times) of the rate estimate.
-pub const ALLOWANCE_RTTS: f64 = 2.0;
-
-/// Bytes of credit at which the receiver returns credit to the sender, unless the base window is small.
-pub const CREDIT_THRESHOLD: u32 = 32 * 1024;
-
-/// Weight of a new round-trip time sample in the smoothed one.
-pub const SRTT_GAIN: f64 = 1.0 / 8.0;
-
-/// The smallest smoothed round-trip time. Keeps the time constants of the allowances positive
-/// with the microsecond resolution of the clock.
-pub const SRTT_MIN: Duration = Duration::from_micros(1);
-
-/// Returns `T_c`: how much credit has to accumulate on a stream before it is sent to the peer.
-///
-/// It is at most half of the base window, so a stream with less than `T_c` uncredited bytes
-/// always has room in its base window, and credit cannot deadlock.
-pub fn credit_threshold(base_window: u32) -> u64 {
-    u64::from(CREDIT_THRESHOLD.min(base_window / 2).max(1))
-}
-
-/// Returns the part of `unacked` that comes from the shared pool.
-pub fn borrowed(unacked: u64, base_window: u64) -> u64 {
-    unacked.saturating_sub(base_window)
-}
-
-/// Moves the sum of borrowed bytes along with one stream's borrowed bytes.
-pub fn rebalance(sum: &mut u64, old: u64, new: u64) {
-    *sum = *sum - old + new;
-}
+use crate::flow::ALLOWANCE_RTTS;
 
 /// A decaying sum of credit, in bytes per second.
 ///
@@ -71,7 +40,13 @@ impl RateEstimate {
         self.at = now;
     }
 
-    /// Makes the allowance (the estimate times `ALLOWANCE_RTTS * tau`) larger by `allowance` bytes.
+    /// Returns the allowance at `now`: how many bytes the stream may have borrowed,
+    /// the estimate over `ALLOWANCE_RTTS` loops of `srtt` seconds.
+    pub fn allowance(&self, now: Instant, srtt: f64) -> f64 {
+        self.value(now, srtt) * ALLOWANCE_RTTS * srtt
+    }
+
+    /// Makes the allowance larger by `allowance` bytes.
     #[cfg(test)]
     pub fn grant_allowance(&mut self, allowance: f64, now: Instant, tau: f64) {
         self.add_amount(allowance / ALLOWANCE_RTTS, now, tau);
@@ -82,11 +57,9 @@ impl RateEstimate {
 mod test {
     use std::time::Duration;
 
-    use crate::{
-        global_pool::GlobalPool,
-        transit::{RateEstimate, SRTT_MIN, borrowed, credit_threshold, rebalance},
-    };
     use tokio::time::Instant;
+
+    use crate::flow::RateEstimate;
 
     #[tokio::test(start_paused = true)]
     async fn steady_credit_gives_the_rate() {
@@ -167,51 +140,5 @@ mod test {
             bursty > steady && bursty < steady * 1.37,
             "{bursty} {steady}"
         );
-    }
-
-    #[test]
-    fn srtt_is_an_ewma_and_never_zero() {
-        let mut global = GlobalPool::default();
-        assert_eq!(global.srtt, None);
-        global.observe_rtt(Duration::from_millis(80));
-        assert_eq!(global.srtt, Some(Duration::from_millis(80)));
-        global.observe_rtt(Duration::from_millis(160));
-        assert_eq!(global.srtt, Some(Duration::from_millis(90)));
-        for _ in 0..200 {
-            global.observe_rtt(Duration::ZERO);
-        }
-        assert_eq!(global.srtt, Some(SRTT_MIN));
-    }
-
-    #[test]
-    fn threshold_is_half_the_window_at_most_32k() {
-        assert_eq!(credit_threshold(64 * 1024), 32 * 1024);
-        assert_eq!(credit_threshold(1024 * 1024), 32 * 1024);
-        assert_eq!(credit_threshold(16 * 1024), 8 * 1024);
-        assert_eq!(credit_threshold(12), 6);
-        assert_eq!(credit_threshold(1), 1);
-    }
-
-    #[test]
-    fn sums_do_not_overflow_u32() {
-        // 32 768 streams that borrow 128 KiB each: 4 GiB.
-        let mut sum = 0;
-        for _ in 0..32_768 {
-            rebalance(&mut sum, 0, borrowed(64 * 1024 + 128 * 1024, 64 * 1024));
-        }
-        assert_eq!(sum, 4 * 1024 * 1024 * 1024);
-        assert!(sum > u64::from(u32::MAX));
-    }
-
-    #[test]
-    fn borrowing_never_goes_below_zero() {
-        assert_eq!(borrowed(10, 64), 0);
-        assert_eq!(borrowed(64, 64), 0);
-        assert_eq!(borrowed(100, 64), 36);
-        let mut sum = 40;
-        rebalance(&mut sum, 36, 0);
-        assert_eq!(sum, 4);
-        rebalance(&mut sum, 0, 10);
-        assert_eq!(sum, 14);
     }
 }

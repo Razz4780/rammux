@@ -14,13 +14,15 @@ use tokio::{
 
 use crate::{
     buffer::Buffer,
-    clock::{Clock, PingStamps},
-    codec::{
-        decoder::{DecodedFrame, DecoderState, InboundFrame},
-        encoder::{EncoderItem, OutFrame},
-    },
     error::{DecodeError, ErrorKind},
-    header::{Flags, Header},
+    wire::{
+        clock::{Clock, PingStamps},
+        codec::{
+            decoder::{DecodedFrame, DecoderState, InboundFrame},
+            encoder::{EncoderItem, OutFrame},
+        },
+        header::{Flags, Header},
+    },
 };
 
 pub mod decoder;
@@ -64,22 +66,22 @@ pub struct RammuxCodec<IO> {
 }
 
 impl<IO> RammuxCodec<IO> {
-    pub fn new(
-        io: IO,
-        frame_limit: NonZeroU16,
-        inbound_frame_timeout: Duration,
-        clock: Clock,
-    ) -> Self {
+    pub fn new(io: IO, frame_limit: NonZeroU16, inbound_frame_timeout: Duration) -> Self {
         Self {
             io,
             pending: None,
             decoder: Default::default(),
             frame_limit,
-            clock,
+            clock: Clock::new(),
             ping_stamps: Default::default(),
             inbound_frame_sleep: Box::pin(tokio::time::sleep(inbound_frame_timeout)),
             inbound_frame_timeout,
         }
+    }
+
+    /// Returns the private clock of this side, which stamps the `PING`s.
+    pub fn clock(&self) -> Clock {
+        self.clock
     }
 
     /// Returns the `t_ping` of the newest `PING` that went out, if any.
@@ -158,7 +160,7 @@ where
                         header,
                         header_at,
                         filled: 0,
-                        buffer: Buffer::with_capactiy(usize::from(len.get())),
+                        buffer: Buffer::with_capacity(usize::from(len.get())),
                     };
                 },
 
@@ -180,6 +182,7 @@ where
 
                     *filled += read;
                     if *filled == buffer.as_slice().len() {
+                        // SAFETY: the whole buffer was filled by the reads.
                         let data = unsafe { std::mem::take(buffer).assume_init() };
                         let output = DecodedFrame::Frame(InboundFrame {
                             header: *header,
@@ -310,19 +313,20 @@ mod tests {
 
     use crate::{
         StreamId,
-        clock::Clock,
-        codec::{
-            RammuxCodec,
-            decoder::DecodedFrame,
-            encoder::{OutFrame, OutStream},
+        wire::{
+            codec::{
+                RammuxCodec,
+                decoder::DecodedFrame,
+                encoder::{OutFrame, OutStream},
+            },
+            header::{ControlFlags, Pong},
         },
-        header::{ControlFlags, Pong},
     };
 
     const LIMIT: NonZeroU16 = NonZeroU16::new(11).unwrap();
 
     fn codec<IO>(io: IO) -> RammuxCodec<IO> {
-        RammuxCodec::new(io, LIMIT, Duration::from_secs(1), Clock::new())
+        RammuxCodec::new(io, LIMIT, Duration::from_secs(1))
     }
 
     fn stream_frame(id: u16, flags: ControlFlags, credit: u32, data: &'static [u8]) -> OutFrame {
