@@ -219,6 +219,22 @@ async fn a_pong_that_waited_longer_than_the_frame_timeout_is_a_sample() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn samples_stay_right_across_the_wrap_of_the_clock() {
+    let mut config = config();
+    config.inbound_frame_timeout = Duration::from_secs(10);
+    config.ping_interval = Duration::from_secs(5);
+    let mut rig = rig(RammuxRole::Server, config);
+    rig.frames();
+    // The clock wraps after 2^32 us, about 71.6 minutes. Every PING is answered after 5 ms.
+    for _ in 0..(75 * 60 / 5) {
+        let t_ping = rig.send_ping(Duration::from_secs(5)).await;
+        tokio::time::advance(Duration::from_millis(5)).await;
+        rig.write(pong_of(t_ping)).await;
+        assert_eq!(rig.conn.stats().srtt, Some(Duration::from_millis(5)));
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn the_reserved_bit_is_a_protocol_violation() {
     let mut rig = rig(RammuxRole::Server, config());
     rig.frames();
