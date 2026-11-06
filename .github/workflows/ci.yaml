@@ -53,4 +53,3 @@ jobs:
           cargo run ${{ matrix.profile }} --example downgrade
           cargo run ${{ matrix.profile }} --example flow_control
           cargo run ${{ matrix.profile }} --example negotiation
-          cargo run ${{ matrix.profile }} --example heavy_io -- --transport unix rammux

@@ -1,8 +1,7 @@
 //! Tokio-based asynchronous stream multiplexing over a single byte transport.
 //!
 //! rammux lets two peers open many independent virtual byte streams inside one
-//! reliable byte stream transport, for example a TCP (mind the head-of-line blocking issue)
-//! or a UNIX connection.
+//! reliable byte stream transport, for example a TCP or a UNIX connection.
 //!
 //! Each virtual stream is exposed as a [`RammuxDuplex`](stream::RammuxDuplex),
 //! which implements both [`Sink`](futures::Sink) and [`Stream`](futures::Stream).
@@ -38,7 +37,6 @@
 //! - `negotiation.rs`: out-of-band config negotiation
 //! - `flow_control.rs`: per-stream flow control and fairness
 //! - `downgrade.rs`: graceful downgrade and transport recovery
-//! - `heavy_io.rs`: heavier traffic and transport comparisons
 
 #![deny(
     unused_crate_dependencies,
@@ -70,7 +68,3 @@ static_assertions::const_assert!(std::mem::size_of::<u32>() <= std::mem::size_of
 const fn safe_cast_usize(value: u32) -> usize {
     value as usize
 }
-
-// clap is used in examples.
-#[cfg(test)]
-use clap as _;
