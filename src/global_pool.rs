@@ -17,8 +17,6 @@ pub struct GlobalPool {
     pub srtt: Option<Duration>,
     /// Bytes of `DATA` written to the transport. Wraps.
     pub tx_bytes: u32,
-    /// Bytes of `DATA` read from the transport, including discarded ones. Wraps.
-    pub rx_bytes: u32,
     /// Size of our receive pool, `P_rx`.
     pub rx_pool: u64,
     /// Bytes of our receive pool used by the inbound streams, `U_rx`.

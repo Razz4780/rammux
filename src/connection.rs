@@ -4,7 +4,6 @@ use std::{
     collections::hash_map::Entry,
     convert::Infallible,
     io,
-    num::NonZeroU16,
     task::{Context, Poll},
     time::Duration,
 };
@@ -172,12 +171,7 @@ where
         }
         if let Some(t_ping) = header.ping {
             // Only the latest PING is answered, see `Active::pong`.
-            // The counter does not include the payload of this frame.
-            active.pong = Some(Pong {
-                t_echo: t_ping,
-                t_read: now,
-                rx_bytes: global.rx_bytes,
-            });
+            active.pong = Some(Pong { t_echo: t_ping });
         }
 
         let Some(stream) = header.stream else {
@@ -185,9 +179,6 @@ where
         };
         let stream_id = stream.id;
         let flags = stream.flags;
-        global.rx_bytes = global
-            .rx_bytes
-            .wrapping_add(u32::from(stream.data_len.map_or(0, NonZeroU16::get)));
 
         let progress = if stream_id.initiated_by() == self.role {
             if flags.syn {

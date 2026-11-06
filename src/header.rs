@@ -59,7 +59,7 @@ impl Flags {
             len += 4;
         }
         if self.contains(Self::PONG) {
-            len += 12;
+            len += 4;
         }
         len
     }
@@ -83,17 +83,13 @@ impl Flags {
 }
 
 /// Length of the longest possible header.
-pub const MAX_HEADER_LEN: usize = 26;
+pub const MAX_HEADER_LEN: usize = 18;
 
 /// Fields of a `PONG`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pong {
     /// `t_ping` of the `PING` that is answered.
     pub t_echo: u32,
-    /// Clock of the responder at the moment it read that `PING`.
-    pub t_read: u32,
-    /// Bytes of `DATA` the responder had read before it read that `PING`.
-    pub rx_bytes: u32,
 }
 
 /// Control flags of a stream.
@@ -186,8 +182,6 @@ impl Header {
         }
         if let Some(pong) = &self.pong {
             writer.put(&pong.t_echo.to_be_bytes());
-            writer.put(&pong.t_read.to_be_bytes());
-            writer.put(&pong.rx_bytes.to_be_bytes());
         }
         debug_assert_eq!(writer.at, flags.header_len());
         writer.at
@@ -241,8 +235,6 @@ impl Header {
             .then(|| u32::from_be_bytes(reader.take()));
         let pong = flags.contains(Flags::PONG).then(|| Pong {
             t_echo: u32::from_be_bytes(reader.take()),
-            t_read: u32::from_be_bytes(reader.take()),
-            rx_bytes: u32::from_be_bytes(reader.take()),
         });
         debug_assert_eq!(reader.at, bytes.len());
 
@@ -302,11 +294,7 @@ mod test {
         })
     }
 
-    const PONG: Pong = Pong {
-        t_echo: 0x0A0B0C0D,
-        t_read: 0x01020304,
-        rx_bytes: 0xF0F1F2F3,
-    };
+    const PONG: Pong = Pong { t_echo: 0x0A0B0C0D };
 
     #[test]
     fn longest_header_fits() {
@@ -343,8 +331,6 @@ mod test {
                 0x55, 0x66, // len
                 0x99, 0xAA, 0xBB, 0xCC, // t_ping
                 0x0A, 0x0B, 0x0C, 0x0D, // t_echo
-                0x01, 0x02, 0x03, 0x04, // t_read
-                0xF0, 0xF1, 0xF2, 0xF3, // rx_bytes
             ]
         );
         assert_eq!(len, MAX_HEADER_LEN);
@@ -355,7 +341,7 @@ mod test {
     #[case::ping(Header { ping: Some(7), ..Default::default() }, &[0x00, 0x20, 0, 0, 0, 7])]
     #[case::pong(
         Header { pong: Some(PONG), ..Default::default() },
-        &[0x00, 0x40, 0x0A, 0x0B, 0x0C, 0x0D, 0x01, 0x02, 0x03, 0x04, 0xF0, 0xF1, 0xF2, 0xF3],
+        &[0x00, 0x40, 0x0A, 0x0B, 0x0C, 0x0D],
     )]
     #[case::fin_only(
         Header {

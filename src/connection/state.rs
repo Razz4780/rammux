@@ -67,8 +67,7 @@ pub struct Active<IO> {
     ///    any flood of frames.
     /// 2. An answer that waits in a queue carries our queueing in the peer's back-delay sample.
     ///    The latest `PING` is the freshest sample.
-    /// 3. Nothing on the sender's side needs one `PONG` per `PING`: `rx_bytes` is cumulative, and every
-    ///    `PONG` is an independent sample.
+    /// 3. Nothing on the sender's side needs one `PONG` per `PING`: every `PONG` is an independent sample.
     /// 4. No deadlock: a cap on owed `PONG`s could stop both sides from reading at the same time.
     pub pong: Option<Pong>,
     /// The `t_echo` of the last `PONG` we accepted, see `RammuxConnection::poll_inbound_progress`.

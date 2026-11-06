@@ -104,15 +104,6 @@ impl Rig {
             .filter_map(|frame| frame.header.pong)
             .collect()
     }
-
-    fn global(&mut self) -> &mut crate::global_pool::GlobalPool {
-        self.conn
-            .state
-            .active_mut()
-            .unwrap()
-            .selector
-            .strategy_mut()
-    }
 }
 
 /// Drives the connection until the future completes.
@@ -144,87 +135,11 @@ async fn pings_read_one_by_one_are_each_answered_in_order() {
     assert!(rig.pongs().is_empty(), "no PONG is repeated");
 }
 
-#[tokio::test(start_paused = true)]
-async fn pong_counters_exclude_the_payload_of_the_frame() {
-    let mut rig = rig(RammuxRole::Server, config());
-    rig.frames();
-    tokio::time::advance(Duration::from_micros(1234)).await;
-
-    // 5 bytes of DATA that carry a PING.
-    let header = Header {
-        ping: Some(1),
-        stream: stream_header(0, syn(), 5),
-        ..Default::default()
-    };
-    rig.write(raw(header, b"hello")).await;
-    // Another PING in a frame without data.
-    let header = Header {
-        ping: Some(2),
-        ..Default::default()
-    };
-    rig.write(raw(header, b"")).await;
-
-    let pongs = rig.pongs();
-    assert_eq!(pongs.len(), 2);
-    assert_eq!((pongs[0].t_echo, pongs[0].rx_bytes), (1, 0));
-    assert_eq!((pongs[1].t_echo, pongs[1].rx_bytes), (2, 5));
-    assert_eq!(pongs[0].t_read, 1234);
-    assert_eq!(pongs[1].t_read, 1234);
-}
-
-#[tokio::test(start_paused = true)]
-async fn rx_bytes_wraps() {
-    let mut rig = rig(RammuxRole::Server, config());
-    rig.frames();
-    rig.global().rx_bytes = u32::MAX - 2;
-
-    let header = Header {
-        stream: stream_header(0, syn(), 5),
-        ..Default::default()
-    };
-    rig.write(raw(header, b"hello")).await;
-    let header = Header {
-        ping: Some(1),
-        ..Default::default()
-    };
-    rig.write(raw(header, b"")).await;
-    assert_eq!(rig.pongs()[0].rx_bytes, 2);
-}
-
-#[tokio::test(start_paused = true)]
-async fn rx_bytes_counts_data_the_reader_never_sees() {
-    let mut rig = rig(RammuxRole::Server, config());
-    rig.frames();
-    // The stream is opened and immediately dropped by `settle`, which discards the new stream.
-    let header = Header {
-        stream: stream_header(0, syn(), 3),
-        ..Default::default()
-    };
-    rig.write(raw(header, b"abc")).await;
-    let header = Header {
-        stream: stream_header(0, ControlFlags::default(), 4),
-        ping: Some(1),
-        ..Default::default()
-    };
-    rig.write(raw(header, b"defg")).await;
-    let header = Header {
-        ping: Some(2),
-        ..Default::default()
-    };
-    rig.write(raw(header, b"")).await;
-    let pongs = rig.pongs();
-    assert_eq!(pongs.last().unwrap().rx_bytes, 7);
-}
-
 /// A PONG that carries the given echo.
 fn pong_of(t_echo: u32) -> Vec<u8> {
     raw(
         Header {
-            pong: Some(Pong {
-                t_echo,
-                t_read: 0,
-                rx_bytes: 0,
-            }),
+            pong: Some(Pong { t_echo }),
             ..Default::default()
         },
         b"",
@@ -611,23 +526,19 @@ async fn a_flood_of_pings_is_read_without_a_stall_and_answered_with_the_latest()
     }
     assert_eq!(echoes.last(), Some(&(sent - 1)));
     // The pipe back holds 1024 bytes while the peer does not read: the answers that fit were written
-    // (at most 1024 / PONG frame size of them) and everything after was superseded, so the rest is the
+    // (at most 1024 / PONG frame size of them, rounded up for a frame cut by the pipe) and everything after was superseded, so the rest is the
     // one owed answer. Without the supersession there would be `sent` answers.
     let pong_frame_len = raw(
         Header {
-            pong: Some(Pong {
-                t_echo: 0,
-                t_read: 0,
-                rx_bytes: 0,
-            }),
+            pong: Some(Pong { t_echo: 0 }),
             ..Default::default()
         },
         b"",
     )
     .len();
     assert!(
-        echoes.len() <= 1024 / pong_frame_len + 1,
-        "at most what fit into the pipe, plus the owed one: {} answers",
+        echoes.len() <= 1024usize.div_ceil(pong_frame_len) + 1,
+        "at most what fit into the pipe (the last one may be cut by the pipe), plus the owed one: {} answers",
         echoes.len()
     );
     assert!(owed(&conn).is_none());

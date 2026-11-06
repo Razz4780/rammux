@@ -58,7 +58,7 @@ keeps `U_tx <= P_tx` never makes `U_rx > P_rx`. A frame that does is a protocol 
 - **No deadlock:** `T_c <= B / 2 < B` and the sender can always fill `B`. A stream with less than `T_c` uncredited
   bytes therefore always has room to send.
 - **After `FIN_READ`** the stream's counter is zero (that returns its share of the pool at the sender too), the
-  data that is still in flight is discarded without error, and no credit is sent. Such data still counts in `rx_bytes`.
+  data that is still in flight is discarded without error, and no credit is sent.
 - Nothing is tuned here: no RTT, no rates, no window growth.
 
 ## The sender

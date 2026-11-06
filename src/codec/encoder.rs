@@ -170,11 +170,7 @@ mod test {
     fn frame() -> OutFrame {
         OutFrame {
             ping: true,
-            pong: Some(Pong {
-                t_echo: 1,
-                t_read: 2,
-                rx_bytes: 3,
-            }),
+            pong: Some(Pong { t_echo: 1 }),
             stream: Some(OutStream {
                 id: StreamId::from_be_bytes([0, 6]),
                 flags: ControlFlags {
@@ -193,11 +189,11 @@ mod test {
         let mut item = EncoderItem::new(frame());
         item.stamp(0x0A0B0C0D);
         let all = collect(&item);
-        // 2 flags, 2 id, 4 credit, 2 len, 4 t_ping, 12 pong, 5 payload.
-        assert_eq!(all.len(), 31);
-        assert_eq!(item.remaining(), 31);
+        // 2 flags, 2 id, 4 credit, 2 len, 4 t_ping, 4 pong, 5 payload.
+        assert_eq!(all.len(), 23);
+        assert_eq!(item.remaining(), 23);
         assert_eq!(&all[10..14], &[0x0A, 0x0B, 0x0C, 0x0D]);
-        assert_eq!(&all[26..], b"hello");
+        assert_eq!(&all[18..], b"hello");
         assert_eq!(item.slices().1, 2);
 
         for advanced in 1..=all.len() {

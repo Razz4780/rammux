@@ -443,11 +443,7 @@ mod tests {
                     ..Default::default()
                 },
                 OutFrame {
-                    pong: Some(Pong {
-                        t_echo: 1,
-                        t_read: u32::MAX,
-                        rx_bytes: 3,
-                    }),
+                    pong: Some(Pong { t_echo: 1 }),
                     ..Default::default()
                 },
                 stream_frame(0x0101, syn(), 2137, b""),
@@ -471,11 +467,7 @@ mod tests {
                 ),
                 OutFrame {
                     ping: true,
-                    pong: Some(Pong {
-                        t_echo: 9,
-                        t_read: 8,
-                        rx_bytes: 7,
-                    }),
+                    pong: Some(Pong { t_echo: 9 }),
                     ..stream_frame(
                         0x0404,
                         ControlFlags {
@@ -576,22 +568,13 @@ mod tests {
             0x00, 0x02, // len
             0x99, 0xAA, 0xBB, 0xCC, // t_ping
             0x0A, 0x0B, 0x0C, 0x0D, // t_echo
-            0x01, 0x02, 0x03, 0x04, // t_read
-            0xF0, 0xF1, 0xF2, 0xF3, // rx_bytes
             b'o', b'k',
         ];
         let Some(Ok(DecodedFrame::Frame(frame))) = decode(&bytes).await else {
             panic!("expected a frame");
         };
         assert_eq!(frame.header.ping, Some(0x99AABBCC));
-        assert_eq!(
-            frame.header.pong,
-            Some(Pong {
-                t_echo: 0x0A0B0C0D,
-                t_read: 0x01020304,
-                rx_bytes: 0xF0F1F2F3
-            })
-        );
+        assert_eq!(frame.header.pong, Some(Pong { t_echo: 0x0A0B0C0D }));
         let stream = frame.header.stream.unwrap();
         assert_eq!(stream.id, StreamId::from_be_bytes([0x12, 0x34]));
         assert!(stream.flags.syn && stream.flags.fin_read && !stream.flags.fin_write);

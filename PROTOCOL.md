@@ -52,15 +52,15 @@ There is one frame type. All integers are big-endian.
 | `0x0008` | `WINDOW` | `stream_id`*, `credit: u32` | bytes returned to the peer's transmit window on this stream, at least 1 |
 | `0x0010` | `DATA` | `stream_id`*, `len: u16`, then `len` payload bytes | stream data, `1 <= len <= frame_limit` |
 | `0x0020` | `PING` | `t_ping: u32` | the sender's clock in microseconds, set when the frame is written |
-| `0x0040` | `PONG` | `t_echo: u32`, `t_read: u32`, `rx_bytes: u32` | answer to a `PING` |
+| `0x0040` | `PONG` | `t_echo: u32` | answer to a `PING` |
 | `0x0080` | reserved | none | must be zero |
 | `0x0100` | `TERM` | none | end of the rammux session (downgrade) |
 
 \* `stream_id` is present iff at least one of `SYN`, `FIN_READ`, `FIN_WRITE`, `WINDOW`, `DATA` is set,
 and it appears once.
 
-Wire order of the fields: `stream_id`, `credit`, `len`, `t_ping`, `t_echo`, `t_read`, `rx_bytes`, then the
-payload. The longest header is 26 bytes.
+Wire order of the fields: `stream_id`, `credit`, `len`, `t_ping`, `t_echo`, then the
+payload. The longest header is 18 bytes.
 
 Stream flags, `WINDOW` and `DATA` can be combined in one frame. `PING` and `PONG` can ride on any frame, with or
 without a stream part, but a frame carries at most one of each. `TERM` cannot be combined with anything.
@@ -90,24 +90,16 @@ Each side counts microseconds since its own epoch in a `u32` private clock (it w
 `t_ping` is the value of that clock when the first byte of the frame is accepted by the transport.
 Successive `t_ping`s of one side strictly increase.
 
-Each side also keeps two `u32` counters, `tx_bytes` and `rx_bytes`, which wrap.
-They count the payload bytes of `DATA` frames written and read (including the data discarded by the reader).
+Each side also keeps a `u32` counter, `tx_bytes`, which wraps. It counts the payload bytes of `DATA` frames written.
 
 The responder answers the latest `PING` it has read, as soon as possible, with at most one `PONG` per frame.
-A `PING` that is superseded by a newer one before its answer is written gets no answer. The `PONG` contains:
-
-- `t_echo`, copied from the `PING`,
-- `t_read`, the responder's clock at the moment it read the header of the frame with that `PING`,
-- `rx_bytes`, the responder's counter at the same moment. It does not include the payload of the frame
-  that carried the `PING`.
-
-`t_read` and `rx_bytes` are for the measurements of the sender of the `PING` (how much the peer received, and
-when). The flow control of this version does not use them, but they must be filled in correctly.
+A `PING` that is superseded by a newer one before its answer is written gets no answer. The `PONG` contains
+`t_echo`, copied from the `PING`.
 
 Answering only the latest `PING` keeps the memory of the responder O(1), with no need to stop reading, and an
 answer never waits in a queue behind older ones (that wait would be counted as delay in the sender's samples).
 A sender must not rely on an answer to a `PING` if the transport does not drain, or to every `PING`. Every `PONG`
-is an independent sample, and `rx_bytes` is cumulative. After the responder has sent `TERM`, `PING`s that arrive are
+is an independent sample. After the responder has sent `TERM`, `PING`s that arrive are
 not answered.
 
 The sender of the `PING` accepts a `PONG` whenever it comes. On receiving it at its clock `now`:
@@ -118,8 +110,6 @@ The sender of the `PING` accepts a `PONG` whenever it comes. On receiving it at 
   it has read, so the echoes of a sound peer strictly increase; a duplicate, a reordered `PONG` and an echo
   of a `PING` that was never sent are therefore ignored. The age of `t_echo` is not limited: a `PONG` may
   wait in a queue for as long as the queue is.
-- `now - t_read` is the time from "the peer read our `PING`" to "we got its answer", plus an unknown clock
-  offset. Only differences between such values mean anything.
 
 All arithmetic on timestamps and counters wraps; differences are read as `i32`.
 
