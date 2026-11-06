@@ -1,137 +1,94 @@
+//! The sending direction of a stream.
+
 use std::{
     io,
-    num::NonZeroU32,
-    ops::Not,
+    num::{NonZeroU16, NonZeroU32},
     task::{Poll, Waker},
 };
 
 use bytes::Bytes;
+use futures::task::AtomicWaker;
+use tokio::time::Instant;
 
 use crate::{
     error::StreamError,
-    stream::{FinState, waker::WakerSlot},
+    flow::{RateEstimate, Window},
+    stream::{ConnFlow, FinState, StreamRef, waker::WakerSlot},
 };
 
-pub struct OutboundTraffic(OutboundState);
+/// What the sending direction of a stream needs from the rest of the connection.
+pub struct Ctx<'a> {
+    /// State shared by the streams of the connection.
+    pub flow: &'a mut ConnFlow,
+    /// This stream, as the turn queue knows it. The caller holds the lock of its state.
+    pub me: &'a StreamRef,
+    /// The time.
+    pub now: Instant,
+}
+
+impl Ctx<'_> {
+    /// Wakes the [`StreamUpdates`](super::updates::StreamUpdates) of this stream.
+    fn wake_updates(&self) {
+        self.me.updates.wake();
+    }
+}
+
+/// The sending direction of a stream.
+///
+/// The receiver does not tune its windows. This side decides how much of the peer's pool
+/// the stream uses: in proportion to the rate its reader has proven, and when its turn comes.
+/// See `TRANSIT_CONTROL.md` for the rules and the reasons.
+pub struct OutboundTraffic {
+    state: OutboundState,
+    ledger: Ledger,
+}
+
+enum OutboundState {
+    /// The application may write.
+    Open {
+        /// Data written by the application and not sent yet.
+        ready_data: Bytes,
+        /// Waits for [`Self::Open::ready_data`] to be sent.
+        writer: WakerSlot,
+    },
+    /// The application closed writing, and there is still data to send before `FIN_WRITE`.
+    HalfClosed {
+        /// Never empty.
+        ready_data: Bytes,
+        writer: WakerSlot,
+    },
+    /// Nothing more will be sent but `FIN_WRITE`, if it was not sent yet.
+    Closed { fin_state: FinState },
+}
 
 impl OutboundTraffic {
-    pub fn new(frame_limit: NonZeroU32, recv_window: u32) -> Self {
-        Self(OutboundState::Open {
-            ready_data: Default::default(),
-            frame_limit,
-            recv_window,
-            writer: Default::default(),
-        })
-    }
-
-    /// Polls the next outbound traffic update.
-    ///
-    /// Returns ready outbound frame data and `FIN_WRITE`.
-    ///
-    /// Notes:
-    /// 1. If `FIN_WRITE` has already been sent, this method will return `([], false)`.
-    /// 2. This method is not responsible for registering [`Waker`] for updates.
-    pub fn poll_update(&mut self) -> Poll<(Bytes, bool)> {
-        match &mut self.0 {
-            OutboundState::Open {
-                ready_data,
-                frame_limit,
-                recv_window,
-                writer,
-            } => {
-                if ready_data.is_empty() || *recv_window == 0 {
-                    return Poll::Pending;
-                }
-                let chunk_len = u32::try_from(ready_data.len())
-                    .unwrap_or(u32::MAX)
-                    .min(*recv_window)
-                    .min(frame_limit.get());
-                *recv_window -= chunk_len;
-                let chunk = ready_data.split_to(crate::safe_cast_usize(chunk_len));
-                if ready_data.is_empty() {
-                    writer.wake();
-                }
-                Poll::Ready((chunk, false))
+    pub fn new(frame_limit: NonZeroU16, base_window: u32) -> Self {
+        Self {
+            state: OutboundState::Open {
+                ready_data: Bytes::new(),
+                writer: WakerSlot::default(),
             },
-
-            OutboundState::HalfClosed {
-                ready_data,
-                frame_limit,
-                recv_window,
-                writer,
-            } => {
-                if *recv_window == 0 {
-                    return Poll::Pending;
-                }
-                let chunk_len = u32::try_from(ready_data.len())
-                    .unwrap_or(u32::MAX)
-                    .min(*recv_window)
-                    .min(frame_limit.get());
-                *recv_window -= chunk_len;
-                let chunk = ready_data.split_to(crate::safe_cast_usize(chunk_len));
-                let fin = if ready_data.is_empty() {
-                    writer.wake();
-                    self.0 = OutboundState::Closed {
-                        recv_window: *recv_window,
-                        fin_state: FinState {
-                            sent: true,
-                            received: false,
-                        },
-                    };
-                    true
-                } else {
-                    false
-                };
-                Poll::Ready((chunk, fin))
-            },
-
-            OutboundState::Closed {
-                fin_state: FinState { sent: true, .. },
-                ..
-            } => Poll::Pending,
-
-            OutboundState::Closed { fin_state, .. } => {
-                fin_state.sent = true;
-                Poll::Ready((Default::default(), true))
+            ledger: Ledger {
+                window: Window::new(base_window),
+                frame_limit: u64::from(frame_limit.get()),
+                rate: RateEstimate::new(Instant::now()),
             },
         }
     }
 
-    pub fn close_writing(&mut self, updates_poller: &mut WakerSlot) {
-        let OutboundState::Open {
-            ready_data,
-            frame_limit,
-            recv_window,
-            writer,
-        } = &mut self.0
-        else {
-            return;
-        };
-        let new_state = if ready_data.is_empty() {
-            updates_poller.wake();
-            OutboundState::Closed {
-                recv_window: *recv_window,
-                fin_state: FinState {
-                    sent: false,
-                    received: false,
-                },
-            }
-        } else {
-            OutboundState::HalfClosed {
-                ready_data: std::mem::take(ready_data),
-                frame_limit: *frame_limit,
-                recv_window: *recv_window,
-                writer: std::mem::take(writer),
-            }
-        };
-        self.0 = new_state;
+    /// Returns the `FIN_*` state of this direction.
+    pub fn fin_state(&self) -> FinState {
+        match &self.state {
+            OutboundState::Open { .. } | OutboundState::HalfClosed { .. } => FinState::default(),
+            OutboundState::Closed { fin_state } => *fin_state,
+        }
     }
 
+    // The application side.
+
+    /// Returns whether the application can write.
     pub fn poll_write_ready(&mut self, waker: &Waker) -> Poll<io::Result<()>> {
-        let OutboundState::Open {
-            ready_data, writer, ..
-        } = &mut self.0
-        else {
+        let OutboundState::Open { ready_data, writer } = &mut self.state else {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         };
         if ready_data.is_empty() {
@@ -142,63 +99,158 @@ impl OutboundTraffic {
         }
     }
 
-    pub fn poll_flushed(&mut self, waker: &Waker) -> Poll<()> {
-        match &mut self.0 {
-            OutboundState::Open {
-                ready_data, writer, ..
-            } => {
-                if ready_data.is_empty() {
-                    Poll::Ready(())
-                } else {
-                    writer.register(waker);
-                    Poll::Pending
-                }
-            },
-
-            OutboundState::HalfClosed { writer, .. } => {
-                writer.register(waker);
-                Poll::Pending
-            },
-
-            OutboundState::Closed { .. } => Poll::Ready(()),
-        }
-    }
-
-    pub fn write(&mut self, data: Bytes, updates_poller: &mut WakerSlot) -> io::Result<()> {
-        let OutboundState::Open {
-            ready_data,
-            recv_window,
-            ..
-        } = &mut self.0
-        else {
+    /// Takes data from the application. The direction must be [ready](Self::poll_write_ready).
+    pub fn write(&mut self, data: Bytes, updates: &AtomicWaker) -> io::Result<()> {
+        let OutboundState::Open { ready_data, .. } = &mut self.state else {
             return Err(io::ErrorKind::BrokenPipe.into());
         };
-        if ready_data.is_empty().not() {
+        if !ready_data.is_empty() {
             return Err(io::Error::other("pipe not ready"));
         }
-        *ready_data = data;
-        if ready_data.is_empty().not() && *recv_window > 0 {
-            updates_poller.wake();
+        if !data.is_empty() {
+            *ready_data = data;
+            updates.wake();
         }
         Ok(())
     }
 
-    pub fn received_fin_read(&mut self, updates_poller: &mut WakerSlot) -> Result<(), StreamError> {
-        match &mut self.0 {
-            OutboundState::Open {
-                writer,
-                recv_window,
-                ..
+    /// Returns whether everything the application wrote was handed to the connection.
+    pub fn poll_flushed(&mut self, waker: &Waker) -> Poll<()> {
+        match &mut self.state {
+            OutboundState::Open { ready_data, .. } if ready_data.is_empty() => Poll::Ready(()),
+            OutboundState::Open { writer, .. } | OutboundState::HalfClosed { writer, .. } => {
+                writer.register(waker);
+                Poll::Pending
+            },
+            OutboundState::Closed { .. } => Poll::Ready(()),
+        }
+    }
+
+    /// The application closes writing. `FIN_WRITE` follows the data that is not sent yet.
+    pub fn close_writing(&mut self, updates: &AtomicWaker) {
+        let OutboundState::Open { ready_data, writer } = &mut self.state else {
+            return;
+        };
+        self.state = if ready_data.is_empty() {
+            updates.wake();
+            OutboundState::Closed {
+                fin_state: FinState::default(),
             }
-            | OutboundState::HalfClosed {
-                writer,
-                recv_window,
-                ..
-            } => {
+        } else {
+            OutboundState::HalfClosed {
+                ready_data: std::mem::take(ready_data),
+                writer: std::mem::take(writer),
+            }
+        };
+    }
+
+    // The connection side.
+
+    /// Polls for what this direction sends next: a chunk of data, and whether `FIN_WRITE` follows it.
+    ///
+    /// Returns [`Poll::Pending`] when there is nothing to send. Registering the waker is up to the caller.
+    pub fn poll_update(&mut self, ctx: &mut Ctx<'_>) -> Poll<(Bytes, bool)> {
+        match &mut self.state {
+            OutboundState::Open { ready_data, writer } => {
+                let Some(len) = self.ledger.plan(ctx, ready_data.len()) else {
+                    return Poll::Pending;
+                };
+                let chunk = ready_data.split_to(len);
+                if ready_data.is_empty() {
+                    writer.wake();
+                }
+                Poll::Ready((chunk, false))
+            },
+
+            OutboundState::HalfClosed { ready_data, writer } => {
+                let Some(len) = self.ledger.plan(ctx, ready_data.len()) else {
+                    return Poll::Pending;
+                };
+                let chunk = ready_data.split_to(len);
+                if !ready_data.is_empty() {
+                    return Poll::Ready((chunk, false));
+                }
                 writer.wake();
-                updates_poller.wake();
-                self.0 = OutboundState::Closed {
-                    recv_window: *recv_window,
+                self.state = OutboundState::Closed {
+                    fin_state: FinState {
+                        sent: true,
+                        received: false,
+                    },
+                };
+                Poll::Ready((chunk, true))
+            },
+
+            OutboundState::Closed { fin_state } => {
+                // A closed stream must not hold up the others.
+                ctx.flow.pass_turn(ctx.me);
+                if fin_state.sent {
+                    return Poll::Pending;
+                }
+                fin_state.sent = true;
+                Poll::Ready((Bytes::new(), true))
+            },
+        }
+    }
+
+    /// The peer returned credit. The bytes go back to the shared pool, not to this stream.
+    pub fn received_window_update(
+        &mut self,
+        credit: NonZeroU32,
+        ctx: &mut Ctx<'_>,
+    ) -> Result<(), StreamError> {
+        let credit = credit.get();
+        if let OutboundState::Closed {
+            fin_state: FinState { received: true, .. },
+        } = &self.state
+        {
+            return Err(StreamError("sent window update after FIN_READ"));
+        }
+        let unacked = self
+            .ledger
+            .window
+            .unacked()
+            .checked_sub(u64::from(credit))
+            .ok_or(StreamError("returned more credit than was in flight"))?;
+
+        let freed = self.ledger.window.set(&mut ctx.flow.tx_pool, unacked);
+        // The estimate only runs once the loop time is known, or its time constant is not.
+        if let Some(srtt) = ctx.flow.srtt.secs() {
+            self.ledger.rate.add(credit, ctx.now, srtt);
+        }
+        if freed {
+            ctx.flow.turns.wake_front();
+        }
+        // A larger allowance, and the stream may have been waiting for it.
+        if let OutboundState::Open { ready_data, .. } | OutboundState::HalfClosed { ready_data, .. } =
+            &self.state
+            && !ready_data.is_empty()
+        {
+            ctx.wake_updates();
+        }
+        Ok(())
+    }
+
+    /// The peer stopped reading. The bytes in flight are forgotten,
+    /// which returns the share of the pool that the stream used.
+    pub fn received_fin_read(&mut self, ctx: &mut Ctx<'_>) -> Result<(), StreamError> {
+        self.close_reading_side(&ctx.me.updates)?;
+        if self.ledger.window.set(&mut ctx.flow.tx_pool, 0) {
+            ctx.flow.turns.wake_front();
+        }
+        Ok(())
+    }
+
+    /// Closes the direction without the accounting, when the connection is gone.
+    pub fn abort(&mut self, updates: &AtomicWaker) {
+        let _ = self.close_reading_side(updates);
+    }
+
+    fn close_reading_side(&mut self, updates: &AtomicWaker) -> Result<(), StreamError> {
+        match &mut self.state {
+            OutboundState::Open { writer, .. } | OutboundState::HalfClosed { writer, .. } => {
+                writer.wake();
+                updates.wake();
+                self.state = OutboundState::Closed {
                     fin_state: FinState {
                         sent: false,
                         received: true,
@@ -206,87 +258,109 @@ impl OutboundTraffic {
                 };
                 Ok(())
             },
-
-            OutboundState::Closed { fin_state, .. } => {
-                if fin_state.received {
-                    return Err(StreamError("sent duplicate FIN_READ"));
-                }
+            OutboundState::Closed { fin_state } if fin_state.received => {
+                Err(StreamError("sent duplicate FIN_READ"))
+            },
+            OutboundState::Closed { fin_state } => {
                 fin_state.received = true;
                 Ok(())
             },
         }
     }
 
-    pub fn received_window_update(
-        &mut self,
-        update: u32,
-        updates_poller: &mut WakerSlot,
-    ) -> Result<(), StreamError> {
-        if update == 0 {
-            return Ok(());
-        }
-
-        match &mut self.0 {
-            OutboundState::Open {
-                ready_data,
-                recv_window,
-                ..
-            }
-            | OutboundState::HalfClosed {
-                ready_data,
-                recv_window,
-                ..
-            } => {
-                *recv_window = recv_window
-                    .checked_add(update)
-                    .ok_or(StreamError("triggered receive window overflow"))?;
-                if *recv_window == update && ready_data.is_empty().not() {
-                    updates_poller.wake();
-                }
-                Ok(())
-            },
-            OutboundState::Closed {
-                recv_window,
-                fin_state,
-            } => {
-                if fin_state.received {
-                    return Err(StreamError("sent window update after FIN_READ"));
-                }
-                *recv_window = recv_window
-                    .checked_add(update)
-                    .ok_or(StreamError("triggered receive window overflow"))?;
-                Ok(())
-            },
-        }
+    #[cfg(test)]
+    pub fn unacked(&self) -> u64 {
+        self.ledger.window.unacked()
     }
 
-    pub fn fin_state(&self) -> FinState {
-        match &self.0 {
-            OutboundState::Open { .. } | OutboundState::HalfClosed { .. } => FinState::default(),
-            OutboundState::Closed { fin_state, .. } => *fin_state,
-        }
+    /// Gives the stream an allowance of the given size, to decay from now.
+    #[cfg(test)]
+    pub fn prime(&mut self, allowance: u32, srtt: f64, now: Instant) {
+        self.ledger
+            .rate
+            .grant_allowance(f64::from(allowance), now, srtt);
     }
 }
 
-enum OutboundState {
-    /// Traffic direction is fully open.
-    Open {
-        ready_data: Bytes,
-        frame_limit: NonZeroU32,
-        recv_window: u32,
-        writer: WakerSlot,
-    },
-    /// Local writer closed, but there's still data to be flushed.
-    HalfClosed {
-        /// Never empty.
-        ready_data: Bytes,
-        frame_limit: NonZeroU32,
-        recv_window: u32,
-        writer: WakerSlot,
-    },
-    /// One of the sides closed and there's no pending data.
-    Closed {
-        recv_window: u32,
-        fin_state: FinState,
-    },
+/// What the sender knows about the bytes of a stream in flight, and how it decides what to send.
+struct Ledger {
+    /// Bytes in flight, against the base window the peer grants to the stream and the peer's pool.
+    window: Window,
+    /// Largest `DATA` payload.
+    frame_limit: u64,
+    /// The rate at which the reader of the peer proved to read, `R_s`.
+    rate: RateEstimate,
+}
+
+impl Ledger {
+    /// Decides how many of the `waiting` bytes the stream sends now, and accounts for them.
+    ///
+    /// With `base_room = max(0, B - unacked)` and `full = min(frame_limit, waiting)`:
+    ///
+    /// 1. Nothing waits: nothing to send.
+    /// 2. `full` fits in the base window: send it, no turn needed.
+    /// 3. Otherwise the stream may use `shared` bytes of the pool besides its base window:
+    ///    what its allowance still permits and the pool has room for, but only if it is its turn.
+    ///    It sends `n = min(full, base_room + shared)` bytes if that is any.
+    ///    If it used the pool, it gives the turn away, and takes a new one if it has more to send.
+    ///    - Nothing can be sent because the allowance is used up: only the stream's own credit can help,
+    ///      so it waits for that, outside of the queue.
+    ///    - Nothing can be sent otherwise (not its turn, or the pool is empty): it waits in the queue.
+    ///
+    /// A frame is whatever fits. Waiting for a whole frame would let residue of credit, a small
+    /// pool or a small window block a stream that has room.
+    fn plan(&mut self, ctx: &mut Ctx<'_>, waiting: usize) -> Option<usize> {
+        let waiting = waiting as u64;
+        if waiting == 0 {
+            ctx.flow.pass_turn(ctx.me);
+            return None;
+        }
+
+        let base_room = self.window.base_room();
+        let full = self.frame_limit.min(waiting);
+        if base_room >= full {
+            self.window.add(&mut ctx.flow.tx_pool, full);
+            return Some(to_len(full));
+        }
+
+        let allowance = ctx
+            .flow
+            .srtt
+            .secs()
+            .map_or(0.0, |srtt| self.rate.allowance(ctx.now, srtt));
+        // Whole bytes of the allowance that are not borrowed yet.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let may_borrow = (allowance - self.window.borrowed() as f64).max(0.0) as u64;
+        let shared = if ctx.flow.turns.has_turn(ctx.me) {
+            may_borrow.min(ctx.flow.tx_pool.room())
+        } else {
+            0
+        };
+        let n = full.min(base_room + shared);
+        if n == 0 {
+            if may_borrow == 0 {
+                ctx.flow.pass_turn(ctx.me);
+            } else {
+                ctx.flow.turns.join(ctx.me);
+            }
+            return None;
+        }
+
+        self.window.add(&mut ctx.flow.tx_pool, n);
+        if n > base_room {
+            ctx.flow.turns.leave(ctx.me);
+            if waiting > n {
+                ctx.flow.turns.join(ctx.me);
+            }
+            if ctx.flow.tx_pool.has_room() {
+                ctx.flow.turns.wake_front();
+            }
+        }
+        Some(to_len(n))
+    }
+}
+
+/// Converts a number of bytes to send, which is never more than the bytes waiting.
+fn to_len(bytes: u64) -> usize {
+    usize::try_from(bytes).expect("never more than the bytes waiting")
 }

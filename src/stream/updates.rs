@@ -1,7 +1,8 @@
+//! The task that yields what a stream has to send.
+
 use std::{
     ops::ControlFlow,
     pin::Pin,
-    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
@@ -10,113 +11,122 @@ use async_selector::{
     task::Task,
 };
 use bytes::Bytes;
+use tokio::time::Instant;
 
 use crate::{
     StreamId,
-    codec::encoder::EncoderItem,
-    global_pool::GlobalPool,
-    header::ControlFlags,
-    stream::{FinState, SharedStreamState},
+    stream::{ConnFlow, FinState, StreamRef, outbound::Ctx},
+    wire::{codec::encoder::OutStream, header::ControlFlags},
 };
 
+/// Yields the stream parts of the frames that a stream has to send.
+///
+/// The connection polls it in a selector, with the [`ConnFlow`] as the strategy.
+/// It is done once the stream sent both `FIN_READ` and `FIN_WRITE`.
 pub(crate) struct StreamUpdates {
-    pub(super) id: StreamId,
-    pub(super) syn: bool,
-    pub(super) state: Arc<Mutex<SharedStreamState>>,
+    id: StreamId,
+    /// Whether the next update carries `SYN`.
+    syn: bool,
+    stream: StreamRef,
 }
 
-impl Task<GlobalPool> for StreamUpdates {
+impl StreamUpdates {
+    pub(super) fn new(id: StreamId, syn: bool, stream: StreamRef) -> Self {
+        Self { id, syn, stream }
+    }
+}
+
+impl Task<ConnFlow> for StreamUpdates {
     type Cont = (StreamUpdate, FinState);
     type Break = (StreamUpdate, FinState);
     type Output = (StreamUpdate, FinState);
 
     fn poll_progress(
         self: Pin<&mut Self>,
-        global: &mut GlobalPool,
+        flow: &mut ConnFlow,
         cx: &mut Context<'_>,
     ) -> Poll<ControlFlow<Self::Break, Self::Cont>> {
         let this = self.get_mut();
-        let mut update = StreamUpdate {
-            id: this.id,
-            window_update: 0,
-            data: Default::default(),
-            flags: ControlFlags::default(),
-        };
-        let mut is_pending = true;
+        let mut state = this.stream.lock();
 
-        let mut guard = this.state.lock().unwrap();
-        if let Poll::Ready((window_update, fin_read)) = guard.inbound.poll_update(global) {
-            update.window_update = window_update;
-            update.flags.fin_read = fin_read;
-            is_pending = false;
-        }
-        if let Poll::Ready((data, fin_write)) = guard.outbound.poll_update() {
-            update.data = data;
-            update.flags.fin_write = fin_write;
-            is_pending = false;
-        }
-        if is_pending {
-            guard.updates_poller.register(cx.waker());
+        // Credit and `FIN_READ` never wait for data, or for a turn.
+        let inbound = state.inbound.poll_update(&mut flow.rx_pool);
+        let mut ctx = Ctx {
+            flow,
+            me: &this.stream,
+            now: Instant::now(),
+        };
+        let outbound = state.outbound.poll_update(&mut ctx);
+        if inbound.is_pending() && outbound.is_pending() {
+            // Every change that makes the stream ready wakes it while holding the lock,
+            // or happens in the connection task that is polling it now.
+            this.stream.updates.register(cx.waker());
             return Poll::Pending;
         }
-        let inbound_fin = guard.inbound.fin_state();
-        let outbound_fin = guard.outbound.fin_state();
-        drop(guard);
+        let fin_state = state.fin_state();
+        drop(state);
 
-        // At this point, `update` cannot be empty.
-        update.flags.syn = std::mem::take(&mut this.syn);
-
-        let fin_state = inbound_fin.and(outbound_fin);
-        let update = if fin_state.sent {
-            // If we sent both fins, this stream of updates is done.
+        let (credit, fin_read) = match inbound {
+            Poll::Ready(update) => update,
+            Poll::Pending => (0, false),
+        };
+        let (data, fin_write) = match outbound {
+            Poll::Ready(update) => update,
+            Poll::Pending => (Bytes::new(), false),
+        };
+        let update = StreamUpdate {
+            id: this.id,
+            credit,
+            data,
+            flags: ControlFlags {
+                syn: std::mem::take(&mut this.syn),
+                fin_read,
+                fin_write,
+            },
+        };
+        Poll::Ready(if fin_state.sent {
+            // Both `FIN_*`s are sent, nothing more will come.
             ControlFlow::Break((update, fin_state))
         } else {
-            // Otherwise, this stream of updates should be polled again.
             ControlFlow::Continue((update, fin_state))
-        };
-        Poll::Ready(update)
+        })
     }
 
     fn transform_cont(
         _: BorrowedMut<'_, Self>,
-        _: &mut GlobalPool,
+        _: &mut ConnFlow,
         value: Self::Cont,
     ) -> Option<Self::Output> {
         Some(value)
     }
 
     fn transform_break(
-        _: Removed<Self>,
-        _: &mut GlobalPool,
+        removed: Removed<Self>,
+        flow: &mut ConnFlow,
         value: Self::Break,
     ) -> Option<Self::Output> {
+        // A closed stream waits for nothing, and nobody waits for it.
+        flow.pass_turn(&removed.stream);
         Some(value)
     }
 }
 
+/// The stream part of a frame to send.
 pub struct StreamUpdate {
     pub id: StreamId,
-    pub window_update: u32,
+    /// Bytes returned to the peer's window, 0 for none.
+    pub credit: u32,
     pub data: Bytes,
     pub flags: ControlFlags,
 }
 
-impl From<StreamUpdate> for EncoderItem {
-    fn from(value: StreamUpdate) -> Self {
-        if value.data.is_empty() {
-            // Single WINDOW_UPDATE frame.
-            EncoderItem::new_window_update(value.id, value.flags, value.window_update)
-        } else if value.window_update > 0 {
-            // Two frames, WINDOW_UPDATE and DATA.
-            EncoderItem::new_window_update_and_data(
-                value.id,
-                value.flags,
-                value.window_update,
-                value.data,
-            )
-        } else {
-            // Single DATA frame.
-            EncoderItem::new_data(value.id, value.flags, value.data)
+impl From<StreamUpdate> for OutStream {
+    fn from(update: StreamUpdate) -> Self {
+        Self {
+            id: update.id,
+            flags: update.flags,
+            credit: update.credit,
+            data: update.data,
         }
     }
 }

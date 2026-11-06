@@ -1,78 +1,61 @@
-use std::sync::{Arc, Mutex};
+//! The connection's handle to a stream, which takes the inbound frames.
+
+use std::num::NonZeroU32;
+
+use tokio::time::Instant;
 
 use crate::{
     buffer::Data,
     error::StreamError,
-    stream::{FinState, SharedStreamState},
+    stream::{ConnFlow, FinState, StreamRef, outbound::Ctx},
+    wire::header::ControlFlags,
 };
 
-/// Handle to a virtual rammux stream.
-pub struct StreamHandle(pub(super) Arc<Mutex<SharedStreamState>>);
+/// The connection's handle to a stream.
+pub struct StreamHandle(pub(super) StreamRef);
 
 impl StreamHandle {
-    /// Updates the state of this stream with a received `DATA` frame.
+    /// Updates the stream with the stream part of a received frame.
+    ///
+    /// The parts of the frame are processed in the order of the protocol:
+    /// `WINDOW`, `DATA`, `FIN_WRITE`, `FIN_READ`. `SYN` is the business of the caller.
     ///
     /// Returns the new [`FinState`] of the whole stream.
-    pub fn received_data(
-        &mut self,
+    pub fn received(
+        &self,
+        credit: Option<NonZeroU32>,
         data: Data,
-        fin_read: bool,
-        fin_write: bool,
+        flags: ControlFlags,
+        flow: &mut ConnFlow,
     ) -> Result<FinState, StreamError> {
-        let mut guard = self.0.lock().unwrap();
-        let SharedStreamState {
-            inbound,
-            outbound,
-            updates_poller,
-        } = &mut *guard;
-        inbound.received_data(data)?;
-        if fin_write {
-            inbound.received_fin_write(updates_poller)?;
+        let mut state = self.0.lock();
+        let mut ctx = Ctx {
+            flow,
+            me: &self.0,
+            now: Instant::now(),
+        };
+        if let Some(credit) = credit {
+            state.outbound.received_window_update(credit, &mut ctx)?;
         }
-        if fin_read {
-            outbound.received_fin_read(updates_poller)?;
+        state.inbound.received_data(data, &mut ctx.flow.rx_pool)?;
+        if flags.fin_write {
+            state.inbound.received_fin_write(&self.0.updates)?;
         }
-        Ok(inbound.fin_state().and(outbound.fin_state()))
+        if flags.fin_read {
+            state.outbound.received_fin_read(&mut ctx)?;
+        }
+        Ok(state.fin_state())
     }
 
-    /// Updates the state of this stream with a received `WINDOW_UPDATE` frame.
+    /// Closes the stream, because the connection is gone.
     ///
-    /// Returns the new [`FinState`] of the whole stream.
-    pub fn received_window_update(
-        &mut self,
-        update: u32,
-        fin_read: bool,
-        fin_write: bool,
-    ) -> Result<FinState, StreamError> {
-        let mut guard = self.0.lock().unwrap();
-        let SharedStreamState {
-            inbound,
-            outbound,
-            updates_poller,
-        } = &mut *guard;
-        outbound.received_window_update(update, updates_poller)?;
-        if fin_read {
-            outbound.received_fin_read(updates_poller)?;
-        }
-        if fin_write {
-            inbound.received_fin_write(updates_poller)?;
-        }
-        Ok(inbound.fin_state().and(outbound.fin_state()))
-    }
-
-    /// Attempts to abort this stream.
-    ///
-    /// This is a noop if the stream is already dead or the internal mutex is poisoned.
-    pub fn try_abort(self) {
-        let Ok(mut guard) = self.0.lock() else {
+    /// The application reads the data that arrived, and then the end of the stream. Writing fails.
+    /// Does nothing if another user of the stream panicked while holding its lock.
+    pub fn abort(self) {
+        let Some(mut state) = self.0.try_lock() else {
             return;
         };
-        let SharedStreamState {
-            inbound,
-            outbound,
-            updates_poller,
-        } = &mut *guard;
-        let _ = inbound.received_fin_write(updates_poller);
-        let _ = outbound.received_fin_read(updates_poller);
+        let _ = state.inbound.received_fin_write(&self.0.updates);
+        state.outbound.abort(&self.0.updates);
     }
 }

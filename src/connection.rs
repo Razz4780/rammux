@@ -1,39 +1,36 @@
 //! Types for running rammux protocol on an IO transport.
 
 use std::{
-    collections::hash_map::Entry,
-    convert::Infallible,
-    io,
     task::{Context, Poll},
     time::Duration,
 };
 
-use async_selector::selector::Selector;
-use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{
-    codec::{
-        self, RammuxCodec,
-        decoder::{DecodedFrame, StreamPayload},
-        encoder::EncoderItem,
-    },
-    config::{RammuxConfig, RammuxRole},
+    config::{ConfigError, RammuxConfig, RammuxRole},
     connection::{
-        pings::OutboundPings,
-        state::{Active, ConnState},
+        active::{Active, Received},
+        state::ConnState,
     },
     error::{ErrorKind, RammuxError},
-    global_pool::GlobalPool,
     stream::RammuxDuplex,
-    stream_id::StreamId,
 };
 
 pub use crate::connection::downgrade::Downgraded;
 
+mod active;
 mod downgrade;
 mod pings;
+#[cfg(test)]
+mod sim_test;
 mod state;
+mod streams;
+#[cfg(test)]
+mod wire_test;
+
+/// How many inbound frames are processed in a row before outbound frames get a turn.
+const INBOUND_BATCH: usize = 16;
 
 /// State machine of a single rammux connection.
 ///
@@ -79,21 +76,21 @@ where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
     /// Creates a new rammux connection with clean state.
-    pub fn new(role: RammuxRole, io: IO, config: RammuxConfig) -> Self {
-        Self {
-            state: ConnState::Active(Active {
-                codec: RammuxCodec::new(io, config.frame_limit, config.inbound_frame_timeout),
-                streams: Default::default(),
-                selector: Selector::new(GlobalPool {
-                    rtt: None,
-                    available: config.global_recv_window,
-                }),
-                out_pings: OutboundPings::new(config.ping_interval),
-                in_ping: None,
-            }),
+    ///
+    /// Fails if the config is not valid, see [`RammuxConfig::validate`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside of a Tokio runtime, or in a runtime without the time driver
+    /// (`enable_time` or `enable_all` on the runtime builder). The connection uses Tokio timers
+    /// for the `PING`s and the inbound frame timeout.
+    pub fn new(role: RammuxRole, io: IO, config: RammuxConfig) -> Result<Self, ConfigError> {
+        config.validate()?;
+        Ok(Self {
+            state: ConnState::Active(Active::new(io, role, &config)),
             config,
             role,
-        }
+        })
     }
 
     /// Returns the config of this connection.
@@ -106,212 +103,32 @@ where
         self.role
     }
 
-    fn poll_inbound_progress(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<RammuxProgress<IO>, ErrorKind>> {
-        let active = self.state.active_mut()?;
-        let frame = std::task::ready!(active.codec.poll_next_unpin(cx))
-            .ok_or(io::ErrorKind::UnexpectedEof)
-            .map_err(io::Error::from)??;
-
-        let progress = match frame {
-            DecodedFrame::Ping {
-                payload,
-                is_response: false,
-            } => {
-                if active.in_ping.replace(payload).is_some() {
-                    return Poll::Ready(Err(ErrorKind::UnexpectedPing(payload)));
-                }
-                RammuxProgress::Empty
-            },
-
-            DecodedFrame::Ping {
-                payload,
-                is_response: true,
-            } => {
-                let elapsed = active.out_pings.received_response(payload)?;
-                active.selector.strategy_mut().rtt = Some(elapsed);
-                RammuxProgress::Empty
-            },
-
-            DecodedFrame::Stream {
-                stream_id,
-                flags,
-                payload,
-            } if stream_id.initiated_by() == self.role => {
-                if flags.syn {
-                    return Poll::Ready(Err(ErrorKind::Stream {
-                        id: stream_id,
-                        error: "started a new stream with an ID from the wrong pool".into(),
-                    }));
-                }
-                let slab_idx = stream_id.slab_idx();
-                let e = active
-                    .streams
-                    .outbound
-                    .get_mut(slab_idx)
-                    .ok_or(ErrorKind::Stream {
-                        id: stream_id,
-                        error: "sent a frame for an unknown stream".into(),
-                    })?;
-
-                let fin_state = match payload {
-                    StreamPayload::WindowUpdate(update) => {
-                        e.received_window_update(update, flags.fin_read, flags.fin_write)
-                    },
-                    StreamPayload::Data(data) => {
-                        e.received_data(data, flags.fin_read, flags.fin_write)
-                    },
-                }
-                .map_err(|error| ErrorKind::Stream {
-                    id: stream_id,
-                    error,
-                })?;
-                if fin_state.is_dead() {
-                    active.streams.outbound.remove(slab_idx);
-                }
-
-                RammuxProgress::Empty
-            },
-
-            DecodedFrame::Stream {
-                stream_id,
-                flags,
-                payload,
-            } => {
-                let stream_count = active.streams.inbound.len();
-                let (mut e, new_stream) = match active.streams.inbound.entry(stream_id) {
-                    Entry::Occupied(..) if flags.syn => {
-                        return Poll::Ready(Err(ErrorKind::Stream {
-                            id: stream_id,
-                            error: "started a new stream with an occupied ID".into(),
-                        }));
-                    },
-                    Entry::Occupied(e) => (e, None),
-                    Entry::Vacant(e) if flags.syn => {
-                        if stream_count == crate::safe_cast_usize(self.config.max_inbound_streams) {
-                            return Poll::Ready(Err(ErrorKind::Stream {
-                                id: stream_id,
-                                error:
-                                    "started a new stream without respecting the configured limit"
-                                        .into(),
-                            }));
-                        }
-                        let (handle, updates, duplex) =
-                            crate::stream::new(stream_id, false, &self.config);
-                        active.selector.push(updates);
-                        (e.insert_entry(handle), Some(duplex))
-                    },
-                    Entry::Vacant(..) => {
-                        return Poll::Ready(Err(ErrorKind::Stream {
-                            id: stream_id,
-                            error: "sent a frame for an unknown stream".into(),
-                        }));
-                    },
-                };
-
-                let fin_state = match payload {
-                    StreamPayload::WindowUpdate(update) => {
-                        e.get_mut()
-                            .received_window_update(update, flags.fin_read, flags.fin_write)
-                    },
-                    StreamPayload::Data(data) => {
-                        e.get_mut()
-                            .received_data(data, flags.fin_read, flags.fin_write)
-                    },
-                }
-                .map_err(|error| ErrorKind::Stream {
-                    id: stream_id,
-                    error,
-                })?;
-                if fin_state.is_dead() {
-                    e.remove();
-                }
-
-                new_stream
-                    .map(RammuxProgress::Inbound)
-                    .unwrap_or(RammuxProgress::Empty)
-            },
-
-            DecodedFrame::Terminate => {
-                let downgraded = self.state.downgrade(true)?;
-                RammuxProgress::Downgraded(downgraded)
-            },
-        };
-
-        Poll::Ready(Ok(progress))
-    }
-
-    fn make_outbound_progress(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Infallible, ErrorKind>> {
-        let active = self.state.active_mut()?;
-
-        loop {
-            std::task::ready!(active.codec.poll_ready_unpin(cx))?;
-
-            if let Poll::Ready(payload) = active.out_pings.poll_next(cx) {
-                active
-                    .codec
-                    .start_send_priority(EncoderItem::new_ping(payload, false));
-                continue;
-            }
-
-            if let Some(payload) = active.in_ping.take() {
-                active
-                    .codec
-                    .start_send_priority(EncoderItem::new_ping(payload, true));
-                continue;
-            }
-
-            if let Poll::Ready(Some((update, fin_state))) = active.selector.poll_next_unpin(cx) {
-                let id = update.id;
-                let item = EncoderItem::from(update);
-                active.codec.start_send_unpin(item)?;
-                if fin_state.is_dead() {
-                    if id.initiated_by() == self.role {
-                        let idx = id.slab_idx();
-                        active.streams.outbound.remove(idx);
-                    } else {
-                        active.streams.inbound.remove(&id);
-                    }
-                }
-                continue;
-            } else {
-                let _ = active.codec.poll_flush_unpin(cx)?;
-                break Poll::Pending;
-            }
-        }
-    }
-
     fn poll_progress_inner(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<RammuxProgress<IO>, ErrorKind>> {
-        let mut inbound = Poll::Pending;
-        // Drain up to one encoder batch of inbound frames first.
-        // In particular, processing multiple WINDOW_UPDATEs can make several
-        // outbound streams writable, allowing their frames to be coalesced into
-        // a vectored write. Keep the work bounded so ready reads cannot starve writes.
-        for _ in 0..codec::ENCODER_QUEUE_CAPACITY {
-            match self.poll_inbound_progress(cx)? {
+        let active = self.state.active_mut()?;
+
+        // Process a bounded batch of inbound frames first: credit can make several streams writable,
+        // and the bound keeps the reads from starving the writes.
+        let mut progress = Poll::Pending;
+        for _ in 0..INBOUND_BATCH {
+            match active.poll_receive(cx)? {
                 Poll::Pending => break,
-                Poll::Ready(RammuxProgress::Empty) => {
-                    inbound = Poll::Ready(RammuxProgress::Empty);
-                },
-                Poll::Ready(other) => {
-                    inbound = Poll::Ready(other);
+                Poll::Ready(Received::Frame(None)) => progress = Poll::Ready(RammuxProgress::Empty),
+                Poll::Ready(Received::Frame(Some(stream))) => {
+                    progress = Poll::Ready(RammuxProgress::Inbound(stream));
                     break;
+                },
+                Poll::Ready(Received::Term) => {
+                    let downgraded = self.state.downgrade(true)?;
+                    return Poll::Ready(Ok(RammuxProgress::Downgraded(downgraded)));
                 },
             }
         }
-        if let Poll::Ready(RammuxProgress::Downgraded(..)) = inbound {
-            return inbound.map(Ok);
-        }
-        let _ = self.make_outbound_progress(cx)?;
-        inbound.map(Ok)
+
+        let _ = active.poll_send(cx)?;
+        progress.map(Ok)
     }
 
     /// Makes progress in this connection.
@@ -322,13 +139,11 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<RammuxProgress<IO>, RammuxError>> {
         let result = std::task::ready!(self.poll_progress_inner(cx));
-        match &result {
-            Ok(RammuxProgress::Empty | RammuxProgress::Inbound(..)) => {},
-            Ok(RammuxProgress::Downgraded(..)) => {},
-            Err(ErrorKind::AlreadyDowngraded | ErrorKind::Poisoned) => {},
-            Err(..) => {
-                self.state = ConnState::Poisoned;
-            },
+        // A failure of the connection is final. A misuse leaves the connection as it is.
+        if let Err(error) = &result
+            && !error.is_misuse()
+        {
+            self.state = ConnState::Poisoned;
         }
         Poll::Ready(result.map_err(From::from))
     }
@@ -347,22 +162,7 @@ where
     /// If the configured outbound streams limit is currently exhausted, returns [`None`].
     /// Note that this connection must be polled in order to free IDs of closed streams.
     pub fn try_start_outbound(&mut self) -> Result<Option<RammuxDuplex>, RammuxError> {
-        let active = self.state.active_mut()?;
-
-        if active.streams.outbound.len() >= crate::safe_cast_usize(self.config.max_outbound_streams)
-        {
-            return Ok(None);
-        }
-        let slab_idx = active.streams.outbound.vacant_key();
-        let Some(id) = StreamId::from_slab_idx(slab_idx, self.role) else {
-            return Ok(None);
-        };
-
-        let (handle, updates, duplex) = crate::stream::new(id, true, &self.config);
-        active.selector.push(updates);
-        active.streams.outbound.insert(handle);
-
-        Ok(Some(duplex))
+        Ok(self.state.active_mut()?.open_outbound())
     }
 
     /// Starts the downgrade procedure of this connection.
@@ -374,28 +174,7 @@ where
 
     /// Returns current statistics of this connection.
     pub fn stats(&self) -> RammuxStats {
-        let (inbound_streams, outbound_streams, rtt, available_global_recv_window) = self
-            .state
-            .active()
-            .map(|active| {
-                let global = active.selector.strategy();
-                (
-                    u32::try_from(active.streams.inbound.len())
-                        .expect("we can't have more than u32 inbound streams"),
-                    u32::try_from(active.streams.outbound.len())
-                        .expect("we can't have more than u32 outbound streams"),
-                    global.rtt,
-                    global.available,
-                )
-            })
-            .unwrap_or_default();
-
-        RammuxStats {
-            inbound_streams,
-            outbound_streams,
-            rtt,
-            available_global_recv_window,
-        }
+        self.state.active().map(Active::stats).unwrap_or_default()
     }
 }
 
@@ -414,29 +193,47 @@ pub enum RammuxProgress<IO> {
 }
 
 /// Statistics of a [`RammuxConnection`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct RammuxStats {
     /// Count of currently active inbound streams.
     pub inbound_streams: u32,
     /// Count of currently active outbound streams.
     pub outbound_streams: u32,
-    /// Most recent round trip time, measured with a `PING` exchange.
+    /// Smoothed round trip time, measured with `PING`/`PONG` exchanges.
     ///
-    /// Empty if no `PING` response has been received yet.
-    pub rtt: Option<Duration>,
-    /// Bytes available in the global receive window pool.
-    pub available_global_recv_window: usize,
+    /// It includes the queues on the path in both directions, and the delay in the peer's muxer.
+    /// Empty if no `PONG` has been received yet.
+    pub srtt: Option<Duration>,
+    /// Bytes of the peer's receive pool used by our outbound data.
+    ///
+    /// The sum over the streams of the bytes sent and not credited back, beyond the base window of each stream.
+    /// It never exceeds the configured [`remote_recv_pool`](crate::config::RammuxConfig::remote_recv_pool).
+    pub pool_tx_used: u64,
+    /// Bytes of our receive pool used by the inbound data of the peer.
+    ///
+    /// The sum over the streams of the bytes received and not credited back, beyond the base window of each stream.
+    /// It never exceeds the configured [`local_recv_pool`](crate::config::RammuxConfig::local_recv_pool):
+    /// a peer that would make it do so violates the protocol, and the connection fails.
+    pub pool_rx_used: u64,
+    /// Count of streams waiting for their turn to use the shared pool.
+    pub turn_queue_len: u32,
 }
 
 #[cfg(test)]
 mod test {
-    use std::{num::NonZeroU32, time::Duration};
+    use std::{
+        num::{NonZeroU16, NonZeroU32},
+        time::Duration,
+    };
 
     use bytes::Bytes;
     use futures::{FutureExt, SinkExt, StreamExt, stream::FuturesUnordered};
     use rstest::rstest;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt, DuplexStream},
+        runtime::Builder,
+    };
 
     use crate::{
         config::{RammuxConfig, RammuxRole},
@@ -446,19 +243,35 @@ mod test {
 
     const DATA: Bytes = Bytes::from_static(&[b'A'; 64 * 1024]);
 
+    #[test]
+    #[should_panic(expected = "no reactor running")]
+    fn new_panics_outside_of_a_tokio_runtime() {
+        let (io, _peer) = tokio::io::duplex(64);
+        let _ = RammuxConnection::new(RammuxRole::Client, io, RammuxConfig::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "timers are disabled")]
+    fn new_panics_without_the_time_driver() {
+        let runtime = Builder::new_current_thread().build().unwrap();
+        let _guard = runtime.enter();
+        let (io, _peer) = tokio::io::duplex(64);
+        let _ = RammuxConnection::new(RammuxRole::Client, io, RammuxConfig::new());
+    }
+
     #[rstest]
     #[tokio::test]
     async fn two_sides(#[values(1, 16, 64)] streams: u32) {
         let (io_1, io_2) = tokio::io::duplex(512);
         let mut config = RammuxConfig::new();
-        config.frame_limit = NonZeroU32::new(256).unwrap();
+        config.frame_limit = NonZeroU16::new(256).unwrap();
         config.local_recv_window = NonZeroU32::new(1024).unwrap();
-        config.remote_recv_window = 1024;
+        config.remote_recv_window = NonZeroU32::new(1024).unwrap();
         config.ping_interval = Duration::from_millis(25);
         config.max_inbound_streams = 16;
         config.max_outbound_streams = 16;
-        let conn_1 = RammuxConnection::new(RammuxRole::Client, io_1, config.clone());
-        let conn_2 = RammuxConnection::new(RammuxRole::Server, io_2, config.clone());
+        let conn_1 = RammuxConnection::new(RammuxRole::Client, io_1, config.clone()).unwrap();
+        let conn_2 = RammuxConnection::new(RammuxRole::Server, io_2, config.clone()).unwrap();
         tokio::join!(
             run_rammux(conn_1, streams, 32 * 1024).then(verify_io_clean),
             run_rammux(conn_2, streams, 32 * 1024).then(verify_io_clean),

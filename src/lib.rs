@@ -1,8 +1,7 @@
 //! Tokio-based asynchronous stream multiplexing over a single byte transport.
 //!
 //! rammux lets two peers open many independent virtual byte streams inside one
-//! reliable byte stream transport, for example a TCP (mind the head-of-line blocking issue)
-//! or a UNIX connection.
+//! reliable byte stream transport, for example a TCP or a UNIX connection.
 //!
 //! Each virtual stream is exposed as a [`RammuxDuplex`](stream::RammuxDuplex),
 //! which implements both [`Sink`](futures::Sink) and [`Stream`](futures::Stream).
@@ -12,6 +11,11 @@
 //! That connection owns protocol IO, handles stream creation, applies per-stream flow
 //! control, sends keepalive `PING`s, and performs graceful downgrade back to the
 //! underlying transport when rammux is finished.
+//!
+//! # Runtime
+//!
+//! rammux runs on Tokio. [`RammuxConnection::new`](connection::RammuxConnection::new) must be called
+//! within a Tokio runtime that has the time driver enabled, or it panics.
 //!
 //! # Configuration and negotiation
 //!
@@ -25,6 +29,10 @@
 //! # Protocol
 //!
 //! See [PROTOCOL.md](https://github.com/Razz4780/rammux/blob/main/PROTOCOL.md).
+//! The rules by which the sender decides how much data to put on the path are in
+//! [TRANSIT_CONTROL.md](https://github.com/Razz4780/rammux/blob/main/TRANSIT_CONTROL.md).
+//!
+//! Set `TCP_NODELAY` on the transport if it is a TCP socket: rammux sends small control frames.
 //!
 //! # Examples
 //!
@@ -34,24 +42,28 @@
 //! - `negotiation.rs`: out-of-band config negotiation
 //! - `flow_control.rs`: per-stream flow control and fairness
 //! - `downgrade.rs`: graceful downgrade and transport recovery
-//! - `heavy_io.rs`: heavier traffic and transport comparisons
 
 #![deny(
     unused_crate_dependencies,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
+    clippy::undocumented_unsafe_blocks,
     missing_docs
 )]
 
 mod buffer;
-mod codec;
 pub mod config;
 pub mod connection;
 mod error;
-mod global_pool;
-mod header;
+mod flow;
+mod pin_list;
 pub mod stream;
 mod stream_id;
+mod wire;
+
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 pub use crate::{error::RammuxError, stream_id::StreamId};
 
@@ -61,11 +73,17 @@ static_assertions::const_assert!(std::mem::size_of::<u32>() <= std::mem::size_of
 ///
 /// The cast never truncates, as statically asserted above.
 ///
-/// This trait exists only to avoid commenting in all of the places where this cast is used.
+/// It exists only to avoid commenting in all of the places where this cast is used.
 const fn safe_cast_usize(value: u32) -> usize {
     value as usize
 }
 
-// clap is used in examples.
-#[cfg(test)]
-use clap as _;
+/// Returns the instant `after` from now.
+///
+/// A duration too long to add, such as [`Duration::MAX`], means "never":
+/// the deadline is then 30 years from now, as with [`tokio::time::sleep`].
+fn deadline(after: Duration) -> Instant {
+    const NEVER: Duration = Duration::from_secs(30 * 365 * 24 * 60 * 60);
+    let now = Instant::now();
+    now.checked_add(after.min(NEVER)).unwrap_or(now + NEVER)
+}
