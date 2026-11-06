@@ -230,6 +230,6 @@ mod test {
     #[test]
     fn term_frame() {
         let item = EncoderItem::new(OutFrame::terminate());
-        assert_eq!(collect(&item), &[0x01, 0x00]);
+        assert_eq!(collect(&item), &[0x00, 0x80]);
     }
 }

@@ -53,8 +53,8 @@ There is one frame type. All integers are big-endian.
 | `0x0010` | `DATA` | `stream_id`*, `len: u16`, then `len` payload bytes | stream data, `1 <= len <= frame_limit` |
 | `0x0020` | `PING` | `t_ping: u32` | the sender's clock in microseconds, set when the frame is written |
 | `0x0040` | `PONG` | `t_echo: u32` | answer to a `PING` |
-| `0x0080` | reserved | none | must be zero |
-| `0x0100` | `TERM` | none | end of the rammux session (downgrade) |
+| `0x0080` | `TERM` | none | end of the rammux session (downgrade) |
+| `0xFF00` | reserved | none | must be zero |
 
 \* `stream_id` is present iff at least one of `SYN`, `FIN_READ`, `FIN_WRITE`, `WINDOW`, `DATA` is set,
 and it appears once.
@@ -77,7 +77,7 @@ together (a TCP transport would otherwise put the header in a segment of its own
 
 The following are protocol violations:
 
-- reserved bits (`0xFE80`) set, a frame without flags, `TERM` combined with other flags
+- reserved bits (`0xFF00`) set, a frame without flags, `TERM` combined with other flags
 - `DATA` with `len = 0` or `len > frame_limit`
 - `WINDOW` with `credit = 0`
 - the stream violations described below

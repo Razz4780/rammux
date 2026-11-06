@@ -222,9 +222,9 @@ async fn a_pong_that_waited_longer_than_the_frame_timeout_is_a_sample() {
 async fn the_reserved_bit_is_a_protocol_violation() {
     let mut rig = rig(RammuxRole::Server, config());
     rig.frames();
-    // PING with bit 0x0080 set.
+    // PING with the reserved bit 0x0100 set.
     rig.peer_out
-        .write_all(&[0x00, 0xA0, 0, 0, 0, 1])
+        .write_all(&[0x01, 0x20, 0, 0, 0, 1])
         .await
         .unwrap();
     let error = rig.conn.progress().await.err().unwrap();

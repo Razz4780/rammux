@@ -29,7 +29,7 @@ bitflags! {
         /// The frame carries a `PONG`.
         const PONG      = 0x0040;
         /// End of the rammux session.
-        const TERM      = 0x0100;
+        const TERM      = 0x0080;
     }
 }
 
@@ -337,7 +337,7 @@ mod test {
     }
 
     #[rstest]
-    #[case::term(Header { term: true, ..Default::default() }, &[0x01, 0x00])]
+    #[case::term(Header { term: true, ..Default::default() }, &[0x00, 0x80])]
     #[case::ping(Header { ping: Some(7), ..Default::default() }, &[0x00, 0x20, 0, 0, 0, 7])]
     #[case::pong(
         Header { pong: Some(PONG), ..Default::default() },
@@ -421,13 +421,13 @@ mod test {
     }
 
     #[rstest]
-    #[case::reserved_bit_0x0080(0x0080)]
+    #[case::reserved_bit_0x0100(0x0100)]
     #[case::reserved(0x0200)]
     #[case::reserved_high(0x8001)]
     #[case::no_flags(0x0000)]
-    #[case::term_and_ping(0x0120)]
-    #[case::term_and_data(0x0110)]
-    #[case::term_and_syn(0x0101)]
+    #[case::term_and_ping(0x00A0)]
+    #[case::term_and_data(0x0090)]
+    #[case::term_and_syn(0x0081)]
     #[test]
     fn invalid_flags(#[case] raw: u16) {
         Flags::validate(raw).unwrap_err();
