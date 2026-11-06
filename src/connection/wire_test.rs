@@ -218,6 +218,59 @@ async fn a_pong_that_waited_longer_than_the_frame_timeout_is_a_sample() {
     assert!(rig.conn.stats().srtt.unwrap() >= Duration::from_secs(10));
 }
 
+/// More than half of the range of the `u32` clock, about 35.8 minutes: the wrapping differences
+/// of timestamps that are further apart than this have the wrong sign.
+const MORE_THAN_HALF_THE_CLOCK: Duration = Duration::from_secs(40 * 60);
+
+#[tokio::test(start_paused = true)]
+async fn a_pong_after_a_long_silence_of_the_peer_is_a_sample() {
+    let mut config = config();
+    config.inbound_frame_timeout = 2 * MORE_THAN_HALF_THE_CLOCK;
+    let mut rig = rig(RammuxRole::Server, config);
+    rig.frames();
+    let first = rig.send_ping(Duration::from_secs(5)).await;
+    tokio::time::advance(Duration::from_millis(5)).await;
+    rig.write(pong_of(first)).await;
+    assert_eq!(rig.conn.stats().srtt, Some(Duration::from_millis(5)));
+
+    // The peer answers nothing for a long time, then it answers the latest PING.
+    let latest = rig.send_ping(MORE_THAN_HALF_THE_CLOCK).await;
+    tokio::time::advance(Duration::from_millis(85)).await;
+    rig.write(pong_of(latest)).await;
+    assert_eq!(rig.conn.stats().srtt, Some(Duration::from_millis(15)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_ping_after_a_long_pause_gives_a_sample() {
+    let mut config = config();
+    config.ping_interval = MORE_THAN_HALF_THE_CLOCK;
+    config.inbound_frame_timeout = 2 * MORE_THAN_HALF_THE_CLOCK;
+    let mut rig = rig(RammuxRole::Server, config);
+    rig.frames();
+
+    // No PING goes out for a long time.
+    let t_ping = rig.send_ping(MORE_THAN_HALF_THE_CLOCK).await;
+    tokio::time::advance(Duration::from_millis(5)).await;
+    rig.write(pong_of(t_ping)).await;
+    assert_eq!(rig.conn.stats().srtt, Some(Duration::from_millis(5)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn samples_stay_right_across_the_wrap_of_the_clock() {
+    let mut config = config();
+    config.inbound_frame_timeout = Duration::from_secs(10);
+    config.ping_interval = Duration::from_secs(5);
+    let mut rig = rig(RammuxRole::Server, config);
+    rig.frames();
+    // The clock wraps after 2^32 us, about 71.6 minutes. Every PING is answered after 5 ms.
+    for _ in 0..(75 * 60 / 5) {
+        let t_ping = rig.send_ping(Duration::from_secs(5)).await;
+        tokio::time::advance(Duration::from_millis(5)).await;
+        rig.write(pong_of(t_ping)).await;
+        assert_eq!(rig.conn.stats().srtt, Some(Duration::from_millis(5)));
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_reserved_bit_is_a_protocol_violation() {
     let mut rig = rig(RammuxRole::Server, config());
@@ -258,11 +311,7 @@ async fn pings_follow_the_data_and_the_clock() {
         .collect::<Vec<_>>();
     // One at the start, then one per 1024 bytes.
     assert!((10..=12).contains(&stamps.len()), "{stamps:?}");
-    assert!(
-        stamps
-            .windows(2)
-            .all(|w| crate::wire::clock::diff(w[1], w[0]) > 0)
-    );
+    assert!(stamps.windows(2).all(|w| w[1] > w[0]));
 
     // No data, so the clock decides.
     tokio::time::advance(Duration::from_secs(4)).await;

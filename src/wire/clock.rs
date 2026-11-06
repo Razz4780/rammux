@@ -1,15 +1,20 @@
-//! The private clock that timestamps `PING`s and `PONG`s.
+//! The private clock that stamps `PING`s.
 //!
-//! Each side counts microseconds since its own epoch, truncated to `u32`.
-//! The value wraps every 2^32 microseconds (about 71.6 minutes),
-//! so all arithmetic on timestamps and byte counters must wrap too.
-//! Differences are read as `i32`, see [`diff`].
-
-use std::time::Duration;
+//! Each side counts microseconds since its own epoch. On the wire, `t_ping` and `t_echo` carry only
+//! the low 32 bits, which wrap every 2^32 microseconds (about 71.6 minutes). This side keeps its
+//! timestamps at their full 64 bits, and only the wire values wrap. An echo is extended back to the full
+//! stamp of the `PING` it answers, see [`PingStamps::sent`]. Nothing compares wrapped values, so gaps of
+//! any length (an idle connection, a peer that does not answer for an hour) are harmless.
 
 use tokio::time::Instant;
 
-/// Converts [`Instant`]s into the wire timestamps of this side.
+/// How far back an echo may reach from the newest `PING`, in microseconds: half of the range of the
+/// wire value, about 35.8 minutes.
+///
+/// An echo that reaches further back is indistinguishable from an echo of a `PING` that was never sent.
+const ECHO_REACH: u64 = 1 << 31;
+
+/// Converts [`Instant`]s into the timestamps of this side.
 #[derive(Clone, Copy, Debug)]
 pub struct Clock {
     epoch: Instant,
@@ -23,58 +28,57 @@ impl Clock {
         }
     }
 
-    /// Returns the timestamp of the given instant.
-    pub fn micros(&self, at: Instant) -> u32 {
+    /// Returns the timestamp of the given instant, in microseconds since the epoch.
+    pub fn micros(&self, at: Instant) -> u64 {
         let micros = at.saturating_duration_since(self.epoch).as_micros();
-        // Truncation to 32 bits is the point of the wire clock.
-        u32::try_from(micros & u128::from(u32::MAX)).unwrap_or(0)
+        u64::try_from(micros).unwrap_or(u64::MAX)
     }
 }
 
-/// Returns `a - b` of two wrapping `u32`s, read as `i32`.
-///
-/// `a` is later than `b` iff the result is positive.
-/// This is the only correct way of comparing timestamps and counters.
-pub fn diff(a: u32, b: u32) -> i32 {
-    i32::from_ne_bytes(a.wrapping_sub(b).to_ne_bytes())
+/// Returns the wire value of a timestamp: its low 32 bits.
+pub fn to_wire(micros: u64) -> u32 {
+    // Truncation is the point of the wire value.
+    #[allow(clippy::cast_possible_truncation)]
+    let wire = micros as u32;
+    wire
 }
 
-/// Returns the time between the timestamps `then` and `now` of one clock,
-/// or [`None`] if `now` is earlier.
-pub fn elapsed(now: u32, then: u32) -> Option<Duration> {
-    u64::try_from(diff(now, then))
-        .ok()
-        .map(Duration::from_micros)
-}
-
-/// Hands out the `t_ping` values.
+/// Hands out the stamps of the `PING`s, and recognizes their echoes.
 ///
-/// The values must strictly increase, so that an echoed `t_ping`
-/// identifies one `PING` even if the clock has not moved.
+/// The stamps strictly increase, so that an echo identifies one `PING` even if the clock has not moved.
 #[derive(Default, Debug)]
 pub struct PingStamps {
-    last: Option<u32>,
+    /// The stamp of the newest `PING` that went out.
+    newest: Option<u64>,
 }
 
 impl PingStamps {
-    /// Returns the stamp for a `PING` written at the given timestamp.
+    /// Returns the stamp for a `PING` written at the given time.
     ///
-    /// The stamp only counts once it is [`committed`](Self::commit).
-    pub fn next(&self, now: u32) -> u32 {
-        match self.last {
-            Some(last) if diff(now, last) <= 0 => last.wrapping_add(1),
+    /// The stamp only counts once it is [committed](Self::commit).
+    pub fn next(&self, now: u64) -> u64 {
+        match self.newest {
+            Some(newest) if now <= newest => newest + 1,
             _ => now,
         }
     }
 
-    /// Returns the newest stamp that went out, if any.
-    pub fn newest(&self) -> Option<u32> {
-        self.last
+    /// Records that the `PING` with the given stamp went out.
+    pub fn commit(&mut self, stamp: u64) {
+        self.newest = Some(stamp);
     }
 
-    /// Records that the given stamp went out.
-    pub fn commit(&mut self, stamp: u32) {
-        self.last = Some(stamp);
+    /// Returns the full stamp of the `PING` that an echo answers.
+    ///
+    /// Returns [`None`] if the echo cannot be one of ours: no `PING` went out yet, the echo is later than
+    /// the newest `PING`, or it reaches further back than [`ECHO_REACH`].
+    pub fn sent(&self, t_echo: u32) -> Option<u64> {
+        let newest = self.newest?;
+        let back = u64::from(to_wire(newest).wrapping_sub(t_echo));
+        if back >= ECHO_REACH {
+            return None;
+        }
+        newest.checked_sub(back)
     }
 }
 
@@ -82,36 +86,19 @@ impl PingStamps {
 mod test {
     use std::time::Duration;
 
-    use rstest::rstest;
+    use crate::wire::clock::{Clock, ECHO_REACH, PingStamps, to_wire};
 
-    use crate::wire::clock::{Clock, PingStamps, diff, elapsed};
-
-    #[rstest]
-    #[case(5, 3, 2)]
-    #[case(3, 5, -2)]
-    #[case(1, u32::MAX, 2)]
-    #[case(u32::MAX, 1, -2)]
-    #[case(0x8000_0000, 0, i32::MIN)]
-    #[test]
-    fn diff_wraps(#[case] a: u32, #[case] b: u32, #[case] expected: i32) {
-        assert_eq!(diff(a, b), expected);
-    }
-
-    #[test]
-    fn elapsed_wraps_and_clamps() {
-        assert_eq!(elapsed(10, 4), Some(Duration::from_micros(6)));
-        assert_eq!(elapsed(4, 10), None);
-        assert_eq!(elapsed(3, u32::MAX - 2), Some(Duration::from_micros(6)));
-        assert_eq!(elapsed(7, 7), Some(Duration::ZERO));
-    }
+    /// 2^32 microseconds, where the wire value wraps.
+    const WRAP: u64 = 1 << 32;
 
     #[tokio::test(start_paused = true)]
-    async fn clock_truncates_to_u32() {
+    async fn the_clock_does_not_wrap() {
         let clock = Clock::new();
         assert_eq!(clock.micros(tokio::time::Instant::now()), 0);
-        let wrap = Duration::from_micros(1 << 32);
-        tokio::time::advance(wrap + Duration::from_micros(7)).await;
-        assert_eq!(clock.micros(tokio::time::Instant::now()), 7);
+        tokio::time::advance(Duration::from_micros(WRAP + 7)).await;
+        let micros = clock.micros(tokio::time::Instant::now());
+        assert_eq!(micros, WRAP + 7);
+        assert_eq!(to_wire(micros), 7);
     }
 
     #[test]
@@ -127,9 +114,54 @@ mod test {
         assert_eq!(stamps.next(90), 101);
         stamps.commit(101);
         assert_eq!(stamps.next(150), 150);
-        // Across the wrap.
-        stamps.commit(u32::MAX);
-        assert_eq!(stamps.next(u32::MAX), 0);
-        assert_eq!(stamps.next(2), 2);
+    }
+
+    #[test]
+    fn stamps_follow_the_clock_after_any_pause() {
+        let mut stamps = PingStamps::default();
+        stamps.commit(100);
+        for pause in [
+            ECHO_REACH - 1,
+            ECHO_REACH,
+            ECHO_REACH + 1,
+            WRAP - 1,
+            WRAP,
+            3 * WRAP,
+        ] {
+            assert_eq!(stamps.next(100 + pause), 100 + pause);
+        }
+    }
+
+    #[test]
+    fn an_echo_is_extended_to_the_full_stamp() {
+        let mut stamps = PingStamps::default();
+        assert_eq!(stamps.sent(5), None, "no PING went out");
+
+        let newest = 3 * WRAP + 1000;
+        stamps.commit(newest);
+        assert_eq!(stamps.sent(1000), Some(newest));
+        assert_eq!(stamps.sent(400), Some(newest - 600));
+        // Across the wrap of the wire value.
+        let before_wrap = to_wire(newest - 2000);
+        assert_eq!(stamps.sent(before_wrap), Some(newest - 2000));
+        // As far back as the reach.
+        let oldest = to_wire(newest - (ECHO_REACH - 1));
+        assert_eq!(stamps.sent(oldest), Some(newest - (ECHO_REACH - 1)));
+    }
+
+    #[test]
+    fn an_echo_that_cannot_be_ours_is_recognized() {
+        let mut stamps = PingStamps::default();
+        let newest = 3 * WRAP + 1000;
+        stamps.commit(newest);
+        // Later than the newest PING.
+        assert_eq!(stamps.sent(1001), None);
+        assert_eq!(stamps.sent(to_wire(newest + ECHO_REACH)), None);
+        // Further back than the reach.
+        assert_eq!(stamps.sent(to_wire(newest - ECHO_REACH)), None);
+
+        // Before the epoch.
+        stamps.commit(1000);
+        assert_eq!(stamps.sent(to_wire(WRAP - 5)), None);
     }
 }

@@ -86,11 +86,9 @@ The following are protocol violations:
 
 `PING`s and `PONG`s have no identity and need no state.
 
-Each side counts microseconds since its own epoch in a `u32` private clock (it wraps every 71.6 minutes).
-`t_ping` is the value of that clock when the first byte of the frame is accepted by the transport.
-Successive `t_ping`s of one side strictly increase.
-
-Each side also keeps a `u32` counter, `tx_bytes`, which wraps. It counts the payload bytes of `DATA` frames written.
+Each side counts microseconds since its own epoch on a private clock. The stamp of a `PING` is the value of
+that clock when the first byte of the frame is accepted by the transport, and the stamps of one side strictly
+increase. `t_ping` carries the low 32 bits of the stamp, so it wraps every 2^32 microseconds (about 71.6 minutes).
 
 The responder answers the latest `PING` it has read, as soon as possible, with at most one `PONG` per frame.
 A `PING` that is superseded by a newer one before its answer is written gets no answer. The `PONG` contains
@@ -104,14 +102,17 @@ not answered.
 
 The sender of the `PING` accepts a `PONG` whenever it comes. On receiving it at its clock `now`:
 
-- `rtt = now - t_echo` is a round trip time measured on a single clock. The `PONG` is ignored for the
-  purpose of this sample unless `t_echo` is strictly later than the `t_echo` of the last accepted `PONG`
-  and not later than the newest `t_ping` the sender has sent. The responder answers only the latest `PING`
-  it has read, so the echoes of a sound peer strictly increase; a duplicate, a reordered `PONG` and an echo
-  of a `PING` that was never sent are therefore ignored. The age of `t_echo` is not limited: a `PONG` may
-  wait in a queue for as long as the queue is.
+- the sender extends `t_echo` to the stamp of the `PING` it answers: the stamp whose low 32 bits are `t_echo`,
+  not later than the newest stamp the sender has sent, and less than 2^31 microseconds (about 35.8 minutes)
+  before it. An echo without such a stamp, later than the newest `PING` or further back, is ignored;
+- `rtt = now - stamp` is a round trip time measured on a single clock. The `PONG` is ignored for the
+  purpose of this sample unless its stamp is strictly later than the stamp of the last accepted `PONG`.
+  The responder answers only the latest `PING` it has read, so the echoes of a sound peer strictly increase;
+  a duplicate and a reordered `PONG` are therefore ignored. Apart from the reach of the extension, the age of
+  `t_echo` is not limited: a `PONG` may wait in a queue for as long as the queue is.
 
-All arithmetic on timestamps and counters wraps; differences are read as `i32`.
+Only the wire values wrap. The sender compares full stamps, so an idle connection, or a peer that does not answer
+for a long time, does not confuse it.
 
 A `PING` is sent after every 32 KiB of `DATA` written (`ping_bytes`), and at least every 5 seconds
 (`ping_interval`) to keep the connection alive. Several can be in flight.
