@@ -167,32 +167,6 @@ async fn pong_gives_the_round_trip_time() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn only_a_pong_for_a_ping_sent_after_the_last_answered_is_a_sample() {
-    let mut rig = rig(RammuxRole::Server, config());
-    rig.frames();
-    let first = rig.send_ping(Duration::from_secs(5)).await;
-    tokio::time::advance(Duration::from_millis(5)).await;
-    rig.write(pong_of(first)).await;
-    assert_eq!(rig.conn.stats().srtt, Some(Duration::from_millis(5)));
-
-    let second = rig.send_ping(Duration::from_secs(5)).await;
-    tokio::time::advance(Duration::from_millis(20)).await;
-    // A duplicate of an answered echo is ignored.
-    rig.write(pong_of(first)).await;
-    assert_eq!(rig.conn.stats().srtt, Some(Duration::from_millis(5)));
-    // An echo of a stamp we never sent is ignored.
-    rig.write(pong_of(second + 1000)).await;
-    assert_eq!(rig.conn.stats().srtt, Some(Duration::from_millis(5)));
-    // The genuine answer counts.
-    rig.write(pong_of(second)).await;
-    assert!(rig.conn.stats().srtt.unwrap() > Duration::from_millis(5));
-    let srtt = rig.conn.stats().srtt;
-    // Now it is a duplicate, too.
-    rig.write(pong_of(second)).await;
-    assert_eq!(rig.conn.stats().srtt, srtt);
-}
-
-#[tokio::test(start_paused = true)]
 async fn a_pong_that_waited_longer_than_the_frame_timeout_is_a_sample() {
     // The timeout limits the gaps between frames, not the latency: frames keep arriving while the PONG
     // waits in a queue behind other data.
@@ -274,11 +248,6 @@ async fn pings_follow_the_data_and_the_clock() {
         .collect::<Vec<_>>();
     // One at the start, then one per 1024 bytes.
     assert!((10..=12).contains(&stamps.len()), "{stamps:?}");
-    assert!(
-        stamps
-            .windows(2)
-            .all(|w| crate::wire::clock::diff(w[1], w[0]) > 0)
-    );
 
     // No data, so the clock decides.
     tokio::time::advance(Duration::from_secs(4)).await;

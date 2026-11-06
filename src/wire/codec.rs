@@ -16,7 +16,7 @@ use crate::{
     buffer::Buffer,
     error::{DecodeError, ErrorKind},
     wire::{
-        clock::{Clock, PingStamps},
+        clock::Clock,
         codec::{
             decoder::{DecodedFrame, DecoderState, InboundFrame},
             encoder::{EncoderItem, OutFrame},
@@ -60,7 +60,6 @@ pub struct RammuxCodec<IO> {
     decoder: DecoderState,
     frame_limit: NonZeroU16,
     clock: Clock,
-    ping_stamps: PingStamps,
     inbound_frame_sleep: Pin<Box<Sleep>>,
     inbound_frame_timeout: Duration,
 }
@@ -73,7 +72,6 @@ impl<IO> RammuxCodec<IO> {
             decoder: Default::default(),
             frame_limit,
             clock: Clock::new(),
-            ping_stamps: Default::default(),
             inbound_frame_sleep: Box::pin(tokio::time::sleep(inbound_frame_timeout)),
             inbound_frame_timeout,
         }
@@ -82,11 +80,6 @@ impl<IO> RammuxCodec<IO> {
     /// Returns the private clock of this side, which stamps the `PING`s.
     pub fn clock(&self) -> Clock {
         self.clock
-    }
-
-    /// Returns the `t_ping` of the newest `PING` that went out, if any.
-    pub fn newest_ping_stamp(&self) -> Option<u32> {
-        self.ping_stamps.newest()
     }
 
     pub fn into_inner(self) -> IO {
@@ -234,11 +227,9 @@ where
             }
 
             // Until the transport accepts a byte of the frame, the timestamp is whatever the time is now.
-            let stamp = (item.has_ping() && !item.is_started()).then(|| {
-                let stamp = self.ping_stamps.next(self.clock.micros(Instant::now()));
-                item.stamp(stamp);
-                stamp
-            });
+            if item.has_ping() && !item.is_started() {
+                item.stamp(self.clock.micros(Instant::now()));
+            }
             // The header and the payload go to the transport together. A transport without
             // vectored writes gets them one after another, which is the best it can do.
             let (slices, n_slices) = item.slices();
@@ -247,9 +238,6 @@ where
             )?;
             if written == 0 {
                 return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
-            }
-            if let Some(stamp) = stamp {
-                self.ping_stamps.commit(stamp);
             }
             item.advance(written);
         }
@@ -684,30 +672,6 @@ mod tests {
         let writes = writes.lock().unwrap();
         assert_eq!(writes.len(), 1);
         assert_eq!(t_ping_of(&writes[0]), 3500);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn ping_stamps_strictly_increase() {
-        let (io, writes, _) = MockIo::new(true);
-        let mut codec = codec(io);
-        tokio::time::advance(Duration::from_micros(40)).await;
-        for _ in 0..3 {
-            // The paused clock does not move between the frames.
-            codec
-                .send(OutFrame {
-                    ping: true,
-                    ..stream_frame(7, syn(), 100, b"x")
-                })
-                .await
-                .unwrap();
-        }
-        let stamps = writes
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|w| t_ping_of(w))
-            .collect::<Vec<_>>();
-        assert_eq!(stamps, [40, 41, 42]);
     }
 
     #[tokio::test(start_paused = true)]

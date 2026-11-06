@@ -14,10 +14,13 @@ use crate::{
     connection::{RammuxStats, pings::Pings, streams::Streams},
     error::ErrorKind,
     stream::RammuxDuplex,
-    wire::codec::{
-        RammuxCodec,
-        decoder::{DecodedFrame, InboundFrame},
-        encoder::OutFrame,
+    wire::{
+        clock,
+        codec::{
+            RammuxCodec,
+            decoder::{DecodedFrame, InboundFrame},
+            encoder::OutFrame,
+        },
     },
 };
 
@@ -98,12 +101,12 @@ where
             DecodedFrame::Terminate => return Poll::Ready(Ok(Received::Term)),
         };
 
+        // A `PONG` gives the round trip time on our clock. Its age does not matter:
+        // it can wait in a queue for as long as the queue is.
         if let Some(pong) = header.pong {
             let now = self.codec.clock().micros(header_at);
-            let newest_ping = self.codec.newest_ping_stamp();
-            if let Some(rtt) = self.pings.received_pong(pong, newest_ping, now) {
-                self.streams.flow_mut().srtt.observe(rtt);
-            }
+            let rtt = clock::elapsed(now, pong.t_echo);
+            self.streams.flow_mut().srtt.observe(rtt);
         }
         if let Some(t_ping) = header.ping {
             self.pings.received_ping(t_ping);
