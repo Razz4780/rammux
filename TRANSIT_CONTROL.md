@@ -33,6 +33,8 @@ pool. What it adds is fair sharing of the pool between busy streams, and the pro
 | `T_c` | Credit threshold, `min(32 KiB, B / 2)`. |
 | `R_s`, `A_s` | Rate estimate of the stream (a decaying sum of its credit with the time constant `srtt`), and its allowance `R_s * tau_s`. |
 | `tau_s` | `k * srtt`, with `k = 2`: how long the allowance covers. |
+| `g`, `G` | The advance: unproven bytes one stream may draw per episode, and all streams together (`advance_grant`, `advance_budget`, fractions of `P_tx`). Both 0 by default. |
+| `advance_s`, `V` | Unproven bytes stream `s` drew and has not repaid, and their sum over the streams. |
 | `srtt` | Smoothed round trip time (EWMA, gain 1/8, at least 1 us) of `PING`/`PONG` exchanges. |
 
 ## Accounting
@@ -147,6 +149,51 @@ Why:
 - **No byte-count semaphore.** A stream's allowance keeps decaying while it waits. A semaphore fixes the amount at
   request time, so it could grant a stalled stream more than its allowance, and that stream would hold up the queue.
 - **Credit and `FIN_READ` are never held back** by the queue: they go out with the next frame of the connection.
+
+## The advance
+
+Optional, off by default (`advance_grant = advance_budget = 0`). It is local to the sender: no wire change,
+no negotiation, and the receiver cannot tell.
+
+**The problem.** A stream may borrow only what its reader has proven, `A_s`, about twice the credit of the last loop.
+A new stream, or one silent for about a loop, has `A_s = 0`: its first flight is `B`, and each doubling then costs a loop.
+A 2 MiB burst on a 200 ms path takes 4.6 round trips although the link needs 56 ms, and a latecomer next to a stream
+that holds the pool needs 5 to 10 loops to reach its share.
+
+**The rule.** The stream's `borrow_allow` becomes `proven + unproven`:
+
+1. *Episode start.* A stream with data waiting and `unacked_s < T_c` is idle: `grant_left_s = g`.
+2. *Borrowing.* `proven = max(0, A_s + advance_s - borrowed_s)` and `unproven = min(grant_left_s, G - V)`.
+   The turn and the pool room are still needed.
+3. *Drawing.* A frame that takes `t` bytes from the pool draws `max(0, t - proven)`:
+   `grant_left_s`, `advance_s` and `V` move by that.
+4. *Repayment.* `WINDOW(credit)` repays `min(advance_s, credit)`. The credit feeds `R_s` as before.
+5. `FIN_READ` returns the whole `advance_s` (so does an abort of the stream).
+
+**Guarantees.** `V <= G` and `advance_s <= g` always (`advance_s <= borrowed_s` too, so a stream with
+`unacked_s < T_c` owes nothing and a new grant never stacks on an old one). `U_tx <= P_tx` is unchanged.
+Readers that never read pin at most `G` together on top of their base windows. A slow reader keeps a backlog,
+is never idle, and gets one grant; it repays at its read rate. Once `V = G` every stream follows the rules above.
+`g <= G` is required: with a larger `g` one stream re-draws the budget as it repays it.
+
+**Waking on freed budget.** A stream that lacks only budget (nothing proven, a grant left, `V = G`) waits in its own
+intrusive FIFO, outside of the turn queue: in the turn queue it would hold the front with nothing to use it for.
+A repayment or `FIN_READ` that lowers `V` wakes the front of that FIFO, like freed pool room wakes the turn queue.
+A woken stream that draws leaves and, if budget is left, wakes the next, so a large release serves several waiters.
+Waking is a hint: the woken stream still needs its turn and pool room. Joining, leaving and waking are O(1).
+
+**Costs.**
+- *Pinned budget.* The never-reading streams pin up to `G` of the pool, where today they pin only base windows.
+  A burst next to them is as slow as today once the budget is gone.
+- *Limit 2 is reached sooner.* A stream that reads for a few loops and stalls holds more by then (simulated,
+  512 KiB pool, `g` = 1/16, `G` = 1/4: 233 KiB against 154 KiB). Bounding that needs another rule, such as a cap on one
+  stream's share of the pool; none is designed.
+- *Startup within `B` is gone by design:* the first loop of a new stream is `B + g`.
+
+**Simulated gains** (sim_test, `g` = 1/16, `G` = 1/4 of 16 MiB): a 2 MiB burst at 300 Mbit/s and 200 ms takes 330 ms
+against 925 ms; a latecomer reaches 40% of 100 Mbit/s in 1.4 s against 5.5 s. Nothing here was measured over real TCP: on a
+cold connection the congestion window, not rammux, limits the burst (Linux halves it per idle timeout).
+The first byte of a latecomer still waits a loop: the bytes ahead of it are already in the transport.
 
 ## Dynamics
 

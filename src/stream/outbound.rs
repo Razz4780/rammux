@@ -215,7 +215,11 @@ impl OutboundTraffic {
 
         let freed = self.ledger.window.set(&mut ctx.flow.tx_pool, unacked);
         // The credit pays back the advance first.
-        if self.ledger.loan.repay(&mut ctx.flow.advance, u64::from(credit)) {
+        if self
+            .ledger
+            .loan
+            .repay(&mut ctx.flow.advance, u64::from(credit))
+        {
             ctx.flow.wake_budget_front();
         }
         // The estimate only runs once the loop time is known, or its time constant is not.

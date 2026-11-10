@@ -583,9 +583,7 @@ impl Bed {
     }
 
     fn waits_for_budget(&self, s: usize) -> bool {
-        self.flow()
-            .budget_waiters
-            .contains(&self.streams[s].me)
+        self.flow().budget_waiters.contains(&self.streams[s].me)
     }
 }
 
@@ -626,7 +624,11 @@ async fn credit_repays_the_advance_and_still_feeds_the_rate() {
     // the stream may borrow 16 + 8 - 8 = 16 more. It is not the grant that sends them.
     let sent = bed.drain();
     assert_eq!(sent, [(x, 8), (x, 8)]);
-    assert_eq!((bed.advance(x), bed.v()), (8, 8), "proven bytes are not drawn");
+    assert_eq!(
+        (bed.advance(x), bed.v()),
+        (8, 8),
+        "proven bytes are not drawn"
+    );
 
     bed.credit(x, 8);
     assert_eq!((bed.advance(x), bed.v()), (0, 0));
@@ -736,7 +738,10 @@ async fn a_repayment_wakes_the_stream_that_waits_for_the_budget() {
     bed.credit(x, 8);
     assert_eq!(bed.drain_grouped(), [(x, 8), (x, 8), (z, 8)]);
     assert_eq!((bed.advance(z), bed.v()), (8, 32));
-    assert!(bed.waits_for_budget(z), "it took what was free and waits again");
+    assert!(
+        bed.waits_for_budget(z),
+        "it took what was free and waits again"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -800,7 +805,7 @@ async fn the_advance_stays_within_its_bounds_whatever_the_streams_do() {
                 assert!(ready.is_some() || bed.unacked(s) > 0);
             },
             3..=6 if !closed[s] && sent[s] > 0 => {
-                let credit = 1 + (next() % u64::from(sent[s])) as u32;
+                let credit = 1 + u32::try_from(next() % u64::from(sent[s])).unwrap();
                 bed.credit(s, credit);
                 sent[s] -= credit;
             },
@@ -820,7 +825,10 @@ async fn the_advance_stays_within_its_bounds_whatever_the_streams_do() {
 
         let advances = streams.iter().map(|&s| bed.advance(s)).collect::<Vec<_>>();
         assert!(bed.v() <= 32, "step {step}: V = {}", bed.v());
-        assert!(advances.iter().all(|&a| a <= 16), "step {step}: {advances:?}");
+        assert!(
+            advances.iter().all(|&a| a <= 16),
+            "step {step}: {advances:?}"
+        );
         assert_eq!(advances.iter().sum::<u64>(), bed.v(), "step {step}");
         for &s in &streams {
             let borrowed = bed.unacked(s).saturating_sub(16);

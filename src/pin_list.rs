@@ -88,7 +88,8 @@ pub struct PinList<T: Linked<L>, L = ()> {
     tail: Option<NonNull<T>>,
     len: usize,
     /// The list owns a strong reference to every linked element.
-    _owns: PhantomData<(Arc<T>, fn() -> L)>,
+    _owns: PhantomData<Arc<T>>,
+    _kind: PhantomData<fn() -> L>,
 }
 
 // SAFETY: the list owns `Arc<T>`s, which are `Send` if `T` is `Send + Sync`.
@@ -107,6 +108,7 @@ impl<T: Linked<L>, L> PinList<T, L> {
             tail: None,
             len: 0,
             _owns: PhantomData,
+            _kind: PhantomData,
         }
     }
 
@@ -195,6 +197,7 @@ impl<T: Linked<L>, L> PinList<T, L> {
         Iter {
             next: self.head,
             _list: PhantomData,
+            _kind: PhantomData,
         }
     }
 
@@ -260,7 +263,8 @@ impl<T: Linked<L> + fmt::Debug, L> fmt::Debug for PinList<T, L> {
 /// Iterator over the elements of a [`PinList`], see [`PinList::iter`].
 pub struct Iter<'a, T, L = ()> {
     next: Option<NonNull<T>>,
-    _list: PhantomData<(&'a T, fn() -> L)>,
+    _list: PhantomData<&'a T>,
+    _kind: PhantomData<fn() -> L>,
 }
 
 impl<'a, T: Linked<L>, L> Iterator for Iter<'a, T, L> {
