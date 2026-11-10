@@ -111,7 +111,6 @@ impl Advance {
     }
 
     /// Returns the sum over the streams of the bytes they drew and have not repaid.
-    #[cfg(test)]
     pub fn used(&self) -> u64 {
         self.used
     }
@@ -138,11 +137,6 @@ impl Loan {
         self.advance
     }
 
-    /// Returns whether the stream may still draw in this episode, if the budget had room.
-    pub fn has_grant(&self) -> bool {
-        self.grant_left > 0
-    }
-
     /// Starts a new episode: the stream was idle and has data to send.
     pub fn start_episode(&mut self, advance: &Advance) {
         self.grant_left = advance.grant;
@@ -161,17 +155,20 @@ impl Loan {
         advance.used += bytes;
     }
 
-    /// Repays from `credit`, as much as is owed. Returns whether the budget got more room.
-    pub fn repay(&mut self, advance: &mut Advance, credit: u64) -> bool {
+    /// Repays from `credit`, as much as is owed.
+    ///
+    /// The first credit also ends the grant: the grant is for the first flight, before any proof. A stream
+    /// that did not use it by then (the budget was empty) must not draw it later, when its reader may have stalled.
+    pub fn repay(&mut self, advance: &mut Advance, credit: u64) {
+        self.grant_left = 0;
         let repaid = self.advance.min(credit);
         self.advance -= repaid;
         advance.used -= repaid;
-        repaid > 0
     }
 
-    /// Repays everything. Returns whether the budget got more room.
-    pub fn release(&mut self, advance: &mut Advance) -> bool {
-        self.repay(advance, self.advance)
+    /// Repays everything.
+    pub fn release(&mut self, advance: &mut Advance) {
+        self.repay(advance, self.advance);
     }
 }
 
