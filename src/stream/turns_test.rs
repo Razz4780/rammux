@@ -581,10 +581,6 @@ impl Bed {
             )
             .unwrap();
     }
-
-    fn waits_for_budget(&self, s: usize) -> bool {
-        self.flow().budget_waiters.contains(&self.streams[s].me)
-    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -598,7 +594,7 @@ async fn an_idle_stream_draws_its_grant_and_no_more() {
     assert_eq!(bed.flow().tx_pool.used(), 16);
     // The grant is spent and there is no new episode: the stream has 32 bytes in flight, not idle.
     assert!(bed.drain().is_empty());
-    assert!(!bed.is_queued(x) && !bed.waits_for_budget(x));
+    assert!(!bed.is_queued(x));
 }
 
 #[tokio::test(start_paused = true)]
@@ -689,24 +685,7 @@ async fn fin_read_returns_the_whole_advance() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn abort_returns_the_advance() {
-    let mut bed = Bed::with_advance(0.25, 0.5);
-    let [x, y] = [bed.add(), bed.add()];
-    for s in [x, y] {
-        bed.write(s, 64);
-        bed.drain();
-    }
-    assert_eq!(bed.v(), 32);
-    let x = bed.streams.remove(x);
-    x.handle.abort(bed.selector.strategy_mut());
-    assert_eq!(bed.v(), 16);
-    let y = bed.streams.remove(0);
-    y.handle.abort(bed.selector.strategy_mut());
-    assert_eq!(bed.v(), 0);
-}
-
-#[tokio::test(start_paused = true)]
-async fn the_budget_is_shared_and_a_stream_waits_for_it() {
+async fn a_stream_that_finds_the_budget_empty_waits_for_its_own_credit() {
     let mut bed = Bed::with_advance(0.25, 0.5);
     let [x, y, z] = [bed.add(), bed.add(), bed.add()];
     for s in [x, y] {
@@ -715,62 +694,106 @@ async fn the_budget_is_shared_and_a_stream_waits_for_it() {
     }
     assert_eq!(bed.v(), 32, "the budget is spent");
 
-    // Z has only its base window, and waits for the budget, outside of the turn queue.
+    // Z has only its base window. Nobody wakes it for the budget: it follows the usual rules.
     bed.write(z, 64);
     assert_eq!(bed.drain(), [(z, 8), (z, 8)]);
-    assert!(bed.waits_for_budget(z));
     assert!(!bed.is_queued(z));
     assert_eq!(bed.advance(z), 0);
+    // What the others repay does not wake it either, and does not reach it.
+    bed.fin_read(x);
+    assert!(bed.drain().is_empty());
+    assert_eq!((bed.advance(z), bed.v()), (0, 16));
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_repayment_wakes_the_stream_that_waits_for_the_budget() {
+async fn a_grant_does_not_outlive_its_episode() {
     let mut bed = Bed::with_advance(0.25, 0.5);
     let [x, y, z] = [bed.add(), bed.add(), bed.add()];
-    for s in [x, y, z] {
+    for s in [x, y] {
         bed.write(s, 64);
         bed.drain();
     }
-    assert!(bed.waits_for_budget(z));
+    assert_eq!(bed.v(), 32, "the budget is spent");
 
-    // 8 bytes are repaid by X. Z never gets credit of its own: it is the repayment that wakes it.
-    // X sends 16 of what its credit proved.
-    bed.credit(x, 8);
-    assert_eq!(bed.drain_grouped(), [(x, 8), (x, 8), (z, 8)]);
-    assert_eq!((bed.advance(z), bed.v()), (8, 32));
-    assert!(
-        bed.waits_for_budget(z),
-        "it took what was free and waits again"
-    );
+    // Z starts its episode with the budget empty, and sends what its allowance proves.
+    bed.prime(z, 8);
+    bed.write(z, 64);
+    assert_eq!(bed.drain(), [(z, 8), (z, 8), (z, 8)]);
+    assert_eq!(bed.advance(z), 0);
+
+    // Its reader stalls: a trickle of credit, and the allowance fades away. The budget gets room later.
+    tokio::time::advance(Duration::from_secs(20)).await;
+    bed.credit(z, 1);
+    bed.fin_read(x);
+    bed.drain();
+    // The first credit ended the grant, and Z does not draw it into the stalled reader.
+    assert_eq!((bed.advance(z), bed.v()), (0, 16));
+    tokio::time::advance(Duration::from_secs(20)).await;
+    bed.credit(z, 1);
+    bed.drain();
+    assert_eq!((bed.advance(z), bed.v()), (0, 16));
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_budget_goes_to_the_waiters_in_order_and_the_wake_up_is_passed_on() {
-    // One grant is 8 bytes, the budget 16.
-    let mut bed = Bed::with_advance(0.125, 0.25);
-    let [x, y, z, w, u] = [bed.add(), bed.add(), bed.add(), bed.add(), bed.add()];
-    for s in [x, y, z, w, u] {
-        bed.write(s, 64);
-        bed.drain();
-    }
-    assert_eq!(bed.v(), 16);
-    for s in [z, w, u] {
-        assert!(bed.waits_for_budget(s));
-    }
+async fn closing_with_an_advance_outstanding_keeps_it_until_proof_or_fin_read() {
+    let mut bed = Bed::with_advance(0.25, 0.5);
+    let x = bed.add();
+    bed.write(x, 64);
+    bed.drain();
+    assert_eq!((bed.advance(x), bed.v()), (16, 16));
 
-    // 8 bytes come back: the first waiter takes them, the others keep waiting.
+    // The application closes its side while the data is in flight: the advance is still owed.
+    bed.streams[x].duplex.close().now_or_never();
+    bed.drain();
+    assert_eq!((bed.advance(x), bed.v()), (16, 16));
+    // Credit repays it as before.
+    bed.credit(x, 8);
+    bed.drain();
+    assert_eq!((bed.advance(x), bed.v()), (8, 8));
+    // And FIN_READ returns the rest, with no credit ever coming.
     bed.fin_read(x);
-    assert_eq!(bed.drain(), [(z, 8)]);
-    assert!(!bed.waits_for_budget(z) && bed.waits_for_budget(w) && bed.waits_for_budget(u));
-    assert_eq!(bed.v(), 16);
+    assert_eq!((bed.advance(x), bed.v()), (0, 0));
+    assert!(bed.queue().is_empty());
+}
 
-    // 8 bytes come back, and then 8 more before anybody polled: the woken waiter takes its part,
-    // and passes the wake-up on.
-    bed.fin_read(y);
-    bed.fin_read(z);
+#[tokio::test(start_paused = true)]
+async fn a_reused_stream_id_starts_without_the_advance_of_the_old_stream() {
+    let mut bed = Bed::with_advance(0.25, 0.5);
+    let old = bed.add();
+    bed.write(old, 64);
+    bed.drain();
+    assert_eq!((bed.advance(old), bed.v()), (16, 16));
+
+    // The old stream closes completely, with its advance outstanding.
+    bed.streams[old]
+        .handle
+        .received(
+            None,
+            Data::default(),
+            fins(true, true),
+            bed.selector.strategy_mut(),
+        )
+        .unwrap();
+    bed.drain();
+    assert_eq!((bed.advance(old), bed.v()), (0, 0));
+
+    // The new stream draws its own grant, and the books stay right.
+    let new = bed.add_reusing(old);
+    bed.write(new, 64);
+    bed.drain();
+    assert_eq!((bed.advance(new), bed.v()), (16, 16));
+    bed.fin_read(new);
     assert_eq!(bed.v(), 0);
-    assert_eq!(bed.drain(), [(w, 8), (u, 8)]);
-    assert_eq!(bed.v(), 16);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_zero_grant_draws_nothing_whatever_the_budget() {
+    // g = 0 with G > 0: nothing is drawn.
+    let mut bed = Bed::with_advance(0.0, 0.5);
+    let x = bed.add();
+    bed.write(x, 64);
+    assert_eq!(bed.drain(), [(x, 8), (x, 8)]);
+    assert_eq!(bed.v(), 0);
 }
 
 /// A deterministic sequence of writes, credits and `FIN_READ`s of six streams: `V <= G`, `advance_s <= g`,
@@ -838,4 +861,24 @@ async fn the_advance_stays_within_its_bounds_whatever_the_streams_do() {
         max_v = max_v.max(bed.v());
     }
     assert!(max_v > 16, "the test reached more than one grant: {max_v}");
+
+    // Nothing stays queued forever: once the readers prove everything, every stream sends all it has.
+    for _ in 0..200 {
+        for &s in streams.iter().filter(|&&s| !closed[s]) {
+            let credit = std::mem::take(&mut sent[s]);
+            if credit > 0 {
+                bed.credit(s, credit);
+            }
+        }
+        tokio::time::advance(Duration::from_millis(500)).await;
+        for (s, len) in bed.drain() {
+            sent[s] += u32::try_from(len).unwrap();
+        }
+    }
+    for &s in streams.iter().filter(|&&s| !closed[s]) {
+        assert_eq!(bed.unacked(s), 0, "stream {s} is stuck");
+        assert_eq!(bed.advance(s), 0);
+    }
+    assert!(bed.queue().is_empty(), "{:?}", bed.queue());
+    assert_eq!(bed.v(), 0);
 }

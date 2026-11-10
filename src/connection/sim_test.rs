@@ -585,8 +585,9 @@ async fn a_stalled_reader_stops_borrowing_with_the_advance() {
     // Nothing is borrowed after the stall, whatever the advance did before it.
     assert_eq!(early.pool_tx_used, late.pool_tx_used, "{early:?} {late:?}");
     // Limit 2 of `TRANSIT_CONTROL.md` costs more: the stream ramps faster, so it holds more by the time it
-    // stalls (measured: 233 KiB of the 512 KiB pool against 154 KiB without the advance, which is within
-    // the 128 KiB budget on top). The bound of the test without the advance still holds, with little margin.
+    // stalls (measured: 233 KiB of the 512 KiB pool against 154 KiB without the advance). The extra hold is not
+    // bounded by the budget, only by the pool: the faster ramp compounds. The bound of the test without the advance
+    // still holds, with little margin.
     assert!(late.pool_tx_used < 512 * 1024 / 2, "{late:?}");
     assert!(late.pool_tx_used > 0);
 }

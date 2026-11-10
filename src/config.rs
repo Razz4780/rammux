@@ -113,7 +113,7 @@ pub struct RammuxConfig {
     ///
     /// A stream that has been idle (almost nothing in flight) and starts sending may draw up to
     /// `floor(g * remote_recv_pool)` bytes beyond what its reader's recent credit justifies, and repays them from
-    /// the credit that comes back. It is the largest burst that leaves in a single flight: a new stream, or one
+    /// the credit that comes back. A burst of up to the base window plus `g` leaves in a single flight (while the budget and the pool have room): a new stream, or one
     /// that paused for about a loop, would otherwise start from its base window and wait a loop for each doubling.
     /// With `0.0`, the default, there is no advance, and the sender follows only the proven rate.
     ///
