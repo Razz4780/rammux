@@ -344,7 +344,7 @@ async fn a_bulk_stream_grows_to_the_pool_and_fills_the_link() {
 
 #[tokio::test(start_paused = true)]
 async fn a_stalled_reader_stops_borrowing() {
-    let mut rig = Rig::new(MBIT, RTT, config());
+    let mut rig = Rig::new(MBIT, RTT, without_advance(config()));
     // The reader stops early in the ramp, before the stream reached the pool.
     rig.bulk(Some(Instant::now() + Duration::from_millis(150)))
         .await;
@@ -394,7 +394,7 @@ async fn busy_streams_converge_to_equal_shares() {
 /// like yamux and the adaptive window of HTTP/2, until the pool or the link stops it.
 #[tokio::test(start_paused = true)]
 async fn a_new_stream_at_least_doubles_per_loop() {
-    let mut config = config();
+    let mut config = without_advance(config());
     config.local_recv_pool = 16 * 1024 * 1024;
     config.remote_recv_pool = 16 * 1024 * 1024;
     // A link that is not the limit in the first loops.
@@ -510,6 +510,13 @@ async fn the_shares_of_streams_follow_the_size_of_their_writes() {
     assert!((6.0..10.0).contains(&ratio), "big {big} small {small}");
 }
 
+/// No advance: the sender follows only the proven rate.
+fn without_advance(mut config: RammuxConfig) -> RammuxConfig {
+    config.advance_grant = 0.0;
+    config.advance_budget = 0.0;
+    config
+}
+
 /// The advance of the sim tests: `g` = 1/16 and `G` = 1/4 of the pool.
 fn with_advance(mut config: RammuxConfig) -> RammuxConfig {
     config.advance_grant = 1.0 / 16.0;
@@ -531,7 +538,7 @@ fn big_pool_config() -> RammuxConfig {
 async fn the_advance_speeds_up_the_burst_of_a_fresh_stream() {
     let rtt = Duration::from_millis(200);
     // Today: the burst leaves in the base window, and each doubling costs a loop.
-    let off = Rig::new(300.0, rtt, big_pool_config())
+    let off = Rig::new(300.0, rtt, without_advance(big_pool_config()))
         .burst(2 * 1024 * 1024)
         .await;
     let on = Rig::new(300.0, rtt, with_advance(big_pool_config()))
@@ -566,7 +573,7 @@ async fn latecomer_catches_up(config: RammuxConfig, mbit: f64, share: f64) -> Du
 
 #[tokio::test(start_paused = true)]
 async fn the_advance_speeds_up_a_latecomer() {
-    let off = latecomer_catches_up(big_pool_config(), 100.0, 0.4).await;
+    let off = latecomer_catches_up(without_advance(big_pool_config()), 100.0, 0.4).await;
     let on = latecomer_catches_up(with_advance(big_pool_config()), 100.0, 0.4).await;
     // Measured: 5.5 s against 1.4 s.
     assert!(on < off.mul_f64(0.8), "{on:?} against {off:?}");

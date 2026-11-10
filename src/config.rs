@@ -115,7 +115,8 @@ pub struct RammuxConfig {
     /// `floor(g * remote_recv_pool)` bytes beyond what its reader's recent credit justifies, and repays them from
     /// the credit that comes back. A burst of up to the base window plus `g` leaves in a single flight (while the budget and the pool have room): a new stream, or one
     /// that paused for about a loop, would otherwise start from its base window and wait a loop for each doubling.
-    /// With `0.0`, the default, there is no advance, and the sender follows only the proven rate.
+    /// With `0.0` there is no advance, and the sender follows only the proven rate.
+    /// The default is `0.25`: with the default 4 MiB pool, 1 MiB.
     ///
     /// The cost is shared with [`Self::advance_budget`]. A larger grant means a bigger burst for the idle stream,
     /// and more bytes that a reader which never reads pins until it reads or closes.
@@ -131,7 +132,9 @@ pub struct RammuxConfig {
     ///
     /// The budget bounds what readers that never read can pin, on top of their base windows: at most
     /// `floor(G * remote_recv_pool)` bytes in total, however many streams there are. Once the budget is
-    /// spent, streams follow the proven rate only, as without the advance. With `0.0`, the default, there is no advance.
+    /// spent, streams follow the proven rate only, as without the advance. With `0.0` there is no advance.
+    /// The default is `0.25`: with the default 4 MiB pool, 1 MiB. To turn the advance off, set both this and
+    /// [`Self::advance_grant`] to `0.0`.
     ///
     /// The budget has to be at least the grant. With a larger grant, a single stream would draw the budget again
     /// every time it repaid some of it, and a slow reader would hold far more than its read rate justifies.
@@ -177,7 +180,7 @@ impl RammuxConfig {
     /// 5. [`Self::ping_interval`] - 5s
     /// 6. [`Self::inbound_frame_timeout`] - 10s
     /// 7. [`Self::local_recv_pool`] and [`Self::remote_recv_pool`] - 4 MiB
-    /// 8. [`Self::advance_grant`] and [`Self::advance_budget`] - 0, no advance
+    /// 8. [`Self::advance_grant`] and [`Self::advance_budget`] - 0.25 each (1 MiB of the default pool); 0 turns the advance off
     pub const fn new() -> Self {
         Self {
             frame_limit: NonZeroU16::new(16 * 1024).unwrap(),
@@ -187,8 +190,8 @@ impl RammuxConfig {
             remote_recv_window: NonZeroU32::new(64 * 1024).unwrap(),
             local_recv_pool: 4 * 1024 * 1024,
             remote_recv_pool: 4 * 1024 * 1024,
-            advance_grant: 0.0,
-            advance_budget: 0.0,
+            advance_grant: 0.25,
+            advance_budget: 0.25,
             ping_bytes: NonZeroU32::new(32 * 1024).unwrap(),
             ping_interval: Duration::from_secs(5),
             inbound_frame_timeout: Duration::from_secs(10),

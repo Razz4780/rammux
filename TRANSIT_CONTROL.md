@@ -33,7 +33,7 @@ pool. What it adds is fair sharing of the pool between busy streams, and the pro
 | `T_c` | Credit threshold, `min(32 KiB, B / 2)`. |
 | `R_s`, `A_s` | Rate estimate of the stream (a decaying sum of its credit with the time constant `srtt`), and its allowance `R_s * tau_s`. |
 | `tau_s` | `k * srtt`, with `k = 2`: how long the allowance covers. |
-| `g`, `G` | The advance: unproven bytes one stream may draw per episode, and all streams together (`advance_grant`, `advance_budget`, fractions of `P_tx`). Both 0 by default. |
+| `g`, `G` | The advance: unproven bytes one stream may draw per episode, and all streams together (`advance_grant`, `advance_budget`, fractions of `P_tx`). Both a quarter (0.25) by default. |
 | `advance_s`, `V` | Unproven bytes stream `s` drew and has not repaid, and their sum over the streams. |
 | `srtt` | Smoothed round trip time (EWMA, gain 1/8, at least 1 us) of `PING`/`PONG` exchanges. |
 
@@ -152,7 +152,8 @@ Why:
 
 ## The advance
 
-Optional, off by default (`advance_grant = advance_budget = 0`). It is local to the sender: no wire change,
+On by default (`advance_grant = advance_budget = 0.25`, so `g = G` = a quarter of the pool: 1 MiB each at the
+default 4 MiB pool). To turn it off, set both to 0. It is local to the sender: no wire change,
 no negotiation, and the receiver cannot tell.
 
 **The problem.** A stream may borrow only what its reader has proven, `A_s`, about twice the credit of the last loop.
@@ -200,6 +201,11 @@ later, and then ramps as it does today.
 against 925 ms; a latecomer reaches 40% of 100 Mbit/s in 1.4 s against 5.5 s. Nothing here was measured over real TCP: on a
 cold connection the congestion window, not rammux, limits the burst (Linux halves it per idle timeout).
 The first byte of a latecomer still waits a loop: the bytes ahead of it are already in the transport.
+
+**Measured on netem** (`g = G = 0.25`; benchmarks in `rammux-work/bench-advance.md`): on a busy connection, bursts
+finish near link speed (2 MiB in 159 ms against 930 ms without the advance), and latecomers reach 40% of the link
+2 to 3.7 times faster. Slow or stalled readers cost nothing extra, and readers that never read pin at most `G`.
+On an idle connection TCP's restart window caps the gain above about 256 KiB after idle.
 
 ## Dynamics
 

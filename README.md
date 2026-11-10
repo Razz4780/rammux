@@ -84,6 +84,14 @@ to the rate its reader has proven (derived from the credit it gets back and the 
 busy streams that write at least `frame_limit` bytes at a time converge to equal shares. A turn moves
 one frame, and a frame holds at most one write, so a stream that writes less gets a proportionally smaller share.
 
+A new or idle stream also gets an *advance*: a burst of unproven window (`advance_grant`, repaid from the credit that
+comes back) so that it does not wait a loop per doubling. It is on by default, a quarter of the pool for one stream
+and a quarter for all streams together (1 MiB each at the default 4 MiB pool); set `advance_grant` and
+`advance_budget` to 0 to turn it off. Measured on netem: on a busy connection a 2 MiB burst finishes in 159 ms
+instead of 930 ms and latecomers reach 40% of the link 2 to 3.7 times faster; slow or stalled readers cost nothing
+extra, and readers that never read pin at most the budget. After idle, TCP's restart window caps the gain above
+about 256 KiB.
+
 See [TRANSIT_CONTROL.md](TRANSIT_CONTROL.md) for the rules, the reasons, and the known limits.
 The connection fills the pool when there is enough data, like the autotuning multiplexers do,
 so the pool bounds the queue that the connection builds on the path.
