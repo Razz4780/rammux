@@ -218,6 +218,11 @@ pub struct RammuxStats {
     pub pool_rx_used: u64,
     /// Count of streams waiting for their turn to use the shared pool.
     pub turn_queue_len: u32,
+    /// Bytes of the pool that our outbound streams hold as an advance: sent before the peer's reader proved to read.
+    ///
+    /// Zero unless the advance is on, and at most [`advance_budget`](crate::config::RammuxConfig::advance_budget)
+    /// of the pool. A value that stays high means that some readers of the peer stalled.
+    pub advance_held: u64,
 }
 
 #[cfg(test)]
