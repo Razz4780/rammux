@@ -1,7 +1,8 @@
 //! The part of the flow control that the streams of a connection share.
 
 use crate::{
-    flow::{Pool, Srtt},
+    config::RammuxConfig,
+    flow::{Advance, Pool, Srtt},
     stream::{StreamRef, turns::Turns},
 };
 
@@ -19,6 +20,8 @@ pub struct ConnFlow {
     pub tx_pool: Pool,
     /// Streams that wait for their turn to borrow from [`Self::tx_pool`].
     pub turns: Turns,
+    /// The unproven bytes that our outbound streams drew from [`Self::tx_pool`]. Zero until [`Self::with_advance`].
+    pub advance: Advance,
 }
 
 impl ConnFlow {
@@ -29,7 +32,18 @@ impl ConnFlow {
             rx_pool: Pool::new(rx_pool),
             tx_pool: Pool::new(tx_pool),
             turns: Turns::default(),
+            advance: Advance::default(),
         }
+    }
+
+    /// Lets the streams draw the advance that the config asks for.
+    pub fn with_advance(mut self, config: &RammuxConfig) -> Self {
+        self.advance = Advance::new(
+            config.remote_recv_pool,
+            config.advance_grant,
+            config.advance_budget,
+        );
+        self
     }
 
     /// Takes the stream out of the turn queue, and lets the next one borrow if there is room.

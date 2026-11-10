@@ -224,6 +224,37 @@ impl Rig {
         }
     }
 
+    /// Writes `bytes` on a new stream and returns how long the server took to read them all.
+    async fn burst(&mut self, bytes: u64) -> Duration {
+        let (tx, rx) = oneshot::channel();
+        self.open.send(tx).unwrap();
+        let stream = rx.await.unwrap();
+        let (mut sink, _stream) = stream.into_split();
+        let start = Instant::now();
+        tokio::spawn(async move {
+            let chunk = Bytes::from(vec![5_u8; 16 * 1024]);
+            for _ in 0..bytes / chunk.len() as u64 {
+                sink.send(chunk.clone()).await.unwrap();
+            }
+            std::future::pending::<()>().await;
+            drop(_stream);
+        });
+        let server_stream = self.server_streams.recv().await.unwrap();
+        let counter = Arc::new(AtomicU64::new(0));
+        self.read.push(counter.clone());
+        let read = counter.clone();
+        tokio::spawn(async move {
+            let (_sink, mut stream) = server_stream.into_split();
+            while let Some(data) = stream.next().await {
+                read.fetch_add(data.len() as u64, Ordering::Relaxed);
+            }
+        });
+        while counter.load(Ordering::Relaxed) < bytes {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        start.elapsed()
+    }
+
     /// Starts a bulk upload: the client writes as fast as it can, the server reads
     /// until `stall_at` (never, if [`None`]).
     async fn bulk(&mut self, stall_at: Option<Instant>) {
@@ -313,7 +344,7 @@ async fn a_bulk_stream_grows_to_the_pool_and_fills_the_link() {
 
 #[tokio::test(start_paused = true)]
 async fn a_stalled_reader_stops_borrowing() {
-    let mut rig = Rig::new(MBIT, RTT, config());
+    let mut rig = Rig::new(MBIT, RTT, without_advance(config()));
     // The reader stops early in the ramp, before the stream reached the pool.
     rig.bulk(Some(Instant::now() + Duration::from_millis(150)))
         .await;
@@ -363,7 +394,7 @@ async fn busy_streams_converge_to_equal_shares() {
 /// like yamux and the adaptive window of HTTP/2, until the pool or the link stops it.
 #[tokio::test(start_paused = true)]
 async fn a_new_stream_at_least_doubles_per_loop() {
-    let mut config = config();
+    let mut config = without_advance(config());
     config.local_recv_pool = 16 * 1024 * 1024;
     config.remote_recv_pool = 16 * 1024 * 1024;
     // A link that is not the limit in the first loops.
@@ -477,4 +508,136 @@ async fn the_shares_of_streams_follow_the_size_of_their_writes() {
     // 16 KiB against 2 KiB per write: about 8 to 1.
     let ratio = big as f64 / small as f64;
     assert!((6.0..10.0).contains(&ratio), "big {big} small {small}");
+}
+
+/// No advance: the sender follows only the proven rate.
+fn without_advance(mut config: RammuxConfig) -> RammuxConfig {
+    config.advance_grant = 0.0;
+    config.advance_budget = 0.0;
+    config
+}
+
+/// The advance of the sim tests: `g` = 1/16 and `G` = 1/4 of the pool.
+fn with_advance(mut config: RammuxConfig) -> RammuxConfig {
+    config.advance_grant = 1.0 / 16.0;
+    config.advance_budget = 0.25;
+    config
+}
+
+/// A link of 300 Mbit/s and 200 ms, where the pool is a lot more than the bandwidth-delay product.
+fn big_pool_config() -> RammuxConfig {
+    let mut config = config();
+    config.local_recv_window = NonZeroU32::new(64 * 1024).unwrap();
+    config.remote_recv_window = NonZeroU32::new(64 * 1024).unwrap();
+    config.local_recv_pool = 16 * 1024 * 1024;
+    config.remote_recv_pool = 16 * 1024 * 1024;
+    config
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_advance_speeds_up_the_burst_of_a_fresh_stream() {
+    let rtt = Duration::from_millis(200);
+    // Today: the burst leaves in the base window, and each doubling costs a loop.
+    let off = Rig::new(300.0, rtt, without_advance(big_pool_config()))
+        .burst(2 * 1024 * 1024)
+        .await;
+    let on = Rig::new(300.0, rtt, with_advance(big_pool_config()))
+        .burst(2 * 1024 * 1024)
+        .await;
+    // Measured: 925 ms against 330 ms. The link alone needs 56 ms and the path 100 ms.
+    assert!(off > 3 * rtt, "{off:?}");
+    assert!(on * 2 < off, "{on:?} against {off:?}");
+    assert!(on < 2 * rtt, "{on:?}");
+}
+
+/// Time until `second` carries `share` of the link, after it started next to a stream that holds the pool.
+async fn latecomer_catches_up(config: RammuxConfig, mbit: f64, share: f64) -> Duration {
+    let mut rig = Rig::new(mbit, RTT, config);
+    rig.bulk(None).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let start = Instant::now();
+    rig.bulk(None).await;
+    let step = Duration::from_millis(100);
+    let mut last = rig.bytes(1);
+    loop {
+        tokio::time::sleep(step).await;
+        let now = rig.bytes(1);
+        let rate = (now - last) as f64 * 8.0 / 1e6 / step.as_secs_f64();
+        last = now;
+        if rate >= share * mbit {
+            return start.elapsed();
+        }
+        assert!(start.elapsed() < Duration::from_secs(120), "never");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_advance_speeds_up_a_latecomer() {
+    let off = latecomer_catches_up(without_advance(big_pool_config()), 100.0, 0.4).await;
+    let on = latecomer_catches_up(with_advance(big_pool_config()), 100.0, 0.4).await;
+    // Measured: 5.5 s against 1.4 s.
+    assert!(on < off.mul_f64(0.8), "{on:?} against {off:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_reader_stops_borrowing_with_the_advance() {
+    let mut rig = Rig::new(MBIT, RTT, with_advance(config()));
+    rig.bulk(Some(Instant::now() + Duration::from_millis(150)))
+        .await;
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let early = rig.stats();
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let late = rig.stats();
+    // Nothing is borrowed after the stall, whatever the advance did before it.
+    assert_eq!(early.pool_tx_used, late.pool_tx_used, "{early:?} {late:?}");
+    // Limit 2 of `TRANSIT_CONTROL.md` costs more: the stream ramps faster, so it holds more by the time it
+    // stalls (measured: 233 KiB of the 512 KiB pool against 154 KiB without the advance). The extra hold is not
+    // bounded by the budget, only by the pool: the faster ramp compounds. The bound of the test without the advance
+    // still holds, with little margin.
+    assert!(late.pool_tx_used < 512 * 1024 / 2, "{late:?}");
+    assert!(late.pool_tx_used > 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_reader_does_not_hold_up_the_others_with_the_advance() {
+    let mut rig = Rig::new(MBIT, RTT, with_advance(config()));
+    rig.bulk(Some(Instant::now() + Duration::from_millis(150)))
+        .await;
+    rig.bulk(None).await;
+
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let rate = rig.rate(1, Duration::from_secs(10)).await;
+    // The stalled stream holds more than without the advance (see above), but the healthy stream still
+    // gets the link: measured 19.99 Mbit/s of 20, as without the advance.
+    assert!(rate > 0.85 * MBIT, "{rate} Mbit/s");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_new_stream_starts_within_the_grant_with_the_advance() {
+    let mut config = with_advance(config());
+    config.local_recv_pool = 16 * 1024 * 1024;
+    config.remote_recv_pool = 16 * 1024 * 1024;
+    let grant = 16 * 1024 * 1024 / 16;
+    let mut rig = Rig::new(2000.0, RTT, config);
+    rig.bulk(None).await;
+
+    let mut last = 0;
+    let mut per_loop = Vec::new();
+    for _ in 0..6 {
+        tokio::time::sleep(RTT).await;
+        let now = rig.bytes(0);
+        per_loop.push((now - last) as f64);
+        last = now;
+    }
+    // The first loop is the base window and the grant: the rule changes that on purpose (measured: 1.03 MiB,
+    // 1 MiB of it the grant). The doubling goes on from there, while the link is not the limit.
+    assert!(
+        per_loop[0] <= 32.0 * 1024.0 + grant as f64 + 1.0,
+        "{per_loop:?}"
+    );
+    assert!(per_loop[0] > grant as f64, "{per_loop:?}");
+    for pair in per_loop.windows(2).take(3) {
+        assert!(pair[1] >= 1.8 * pair[0], "{per_loop:?}");
+    }
 }

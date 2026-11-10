@@ -74,6 +74,7 @@ impl<IO> Active<IO> {
             pool_tx_used: flow.tx_pool.used(),
             pool_rx_used: flow.rx_pool.used(),
             turn_queue_len: count(flow.turns.len()),
+            advance_held: flow.advance.used(),
         }
     }
 

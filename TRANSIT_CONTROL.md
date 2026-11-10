@@ -33,6 +33,8 @@ pool. What it adds is fair sharing of the pool between busy streams, and the pro
 | `T_c` | Credit threshold, `min(32 KiB, B / 2)`. |
 | `R_s`, `A_s` | Rate estimate of the stream (a decaying sum of its credit with the time constant `srtt`), and its allowance `R_s * tau_s`. |
 | `tau_s` | `k * srtt`, with `k = 2`: how long the allowance covers. |
+| `g`, `G` | The advance: unproven bytes one stream may draw per episode, and all streams together (`advance_grant`, `advance_budget`, fractions of `P_tx`). Both a quarter (0.25) by default. |
+| `advance_s`, `V` | Unproven bytes stream `s` drew and has not repaid, and their sum over the streams. |
 | `srtt` | Smoothed round trip time (EWMA, gain 1/8, at least 1 us) of `PING`/`PONG` exchanges. |
 
 ## Accounting
@@ -148,6 +150,63 @@ Why:
   request time, so it could grant a stalled stream more than its allowance, and that stream would hold up the queue.
 - **Credit and `FIN_READ` are never held back** by the queue: they go out with the next frame of the connection.
 
+## The advance
+
+On by default (`advance_grant = advance_budget = 0.25`, so `g = G` = a quarter of the pool: 1 MiB each at the
+default 4 MiB pool). To turn it off, set both to 0. It is local to the sender: no wire change,
+no negotiation, and the receiver cannot tell.
+
+**The problem.** A stream may borrow only what its reader has proven, `A_s`, about twice the credit of the last loop.
+A new stream, or one silent for about a loop, has `A_s = 0`: its first flight is `B`, and each doubling then costs a loop.
+A 2 MiB burst on a 200 ms path takes 4.6 round trips although the link needs 56 ms, and a latecomer next to a stream
+that holds the pool needs 5 to 10 loops to reach its share.
+
+**The rule.** The stream's `borrow_allow` becomes `proven + unproven`:
+
+1. *Episode start.* A stream with data waiting and `unacked_s < T_c` is idle: `grant_left_s = g`.
+   The grant is for the first flight only: the first credit of the episode sets `grant_left_s = 0`.
+2. *Borrowing.* `proven = max(0, A_s + advance_s - borrowed_s)` and `unproven = min(grant_left_s, G - V)`.
+   The turn and the pool room are still needed.
+3. *Drawing.* A frame that takes `t` bytes from the pool draws `max(0, t - proven)`:
+   `grant_left_s`, `advance_s` and `V` move by that.
+4. *Repayment.* `WINDOW(credit)` repays `min(advance_s, credit)`. The credit feeds `R_s` as before.
+5. `FIN_READ` returns the whole `advance_s`. (The abort of a stream ends the connection, and the books with it.)
+
+**Guarantees.** `V <= G` and `advance_s <= g` always (`advance_s <= borrowed_s` too, so a stream with
+`unacked_s < T_c` owes nothing and a new grant never stacks on an old one). `U_tx <= P_tx` is unchanged.
+Readers that never read pin at most `G` together on top of their base windows. A slow reader keeps a backlog,
+is never idle, and gets one grant; it repays at its read rate. Once `V = G` every stream follows the rules above.
+`g <= G` is required: with a larger `g` one stream re-draws the budget as it repays it.
+
+**No waking on freed budget.** A stream that finds the budget empty follows the rules above: with nothing proven it
+waits for its own credit, outside of the turn queue, and nothing wakes it when others repay. A list of such waiters was
+tried and dropped. Its front is the stream that has waited longest without credit of its own, which makes it the
+stream most likely to have a stalled reader, so every repayment would hand freed budget to the worst candidate
+and pin it for good. The cost of not waking: a stream that lost the budget by a moment gets its first proof one loop
+later, and then ramps as it does today.
+
+**Costs.**
+- *Pinned budget.* The never-reading streams pin up to `G` of the pool, where today they pin only base windows.
+  A burst next to them is as slow as today once the budget is gone.
+- *Limit 2 is reached sooner.* The ramp is faster, so a stream that reads for a few loops and stalls holds more
+  by then: about `log2((B + g) / B)` loops earlier on its curve, and bounded only by `P_tx`, not by `G`. Simulated
+  (512 KiB pool, `g` = 1/16, `G` = 1/4): 233 KiB against 154 KiB, and a healthy stream next to it still gets 19.99 of
+  20 Mbit/s. ADVANCE.md's prototype measured 489 KiB and 13.6 Mbit/s for the same scenario; the difference is not
+  explained (the prototype is not this code). Do not read the 233 KiB as a bound. The worst case is unchanged,
+  a lone bulk stream can hold the whole pool, as today. Bounding it needs another rule (a cap on one stream's share
+  of the pool); none is designed. A grant never outlives the first credit, so a stalled reader gets nothing new.
+- *Startup within `B` is gone by design:* the first loop of a new stream is `B + g`.
+
+**Simulated gains** (sim_test, `g` = 1/16, `G` = 1/4 of 16 MiB): a 2 MiB burst at 300 Mbit/s and 200 ms takes 330 ms
+against 925 ms; a latecomer reaches 40% of 100 Mbit/s in 1.4 s against 5.5 s. Nothing here was measured over real TCP: on a
+cold connection the congestion window, not rammux, limits the burst (Linux halves it per idle timeout).
+The first byte of a latecomer still waits a loop: the bytes ahead of it are already in the transport.
+
+**Measured on netem** (`g = G = 0.25`; benchmarks in `rammux-work/bench-advance.md`): on a busy connection, bursts
+finish near link speed (2 MiB in 159 ms against 930 ms without the advance), and latecomers reach 40% of the link
+2 to 3.7 times faster. Slow or stalled readers cost nothing extra, and readers that never read pin at most `G`.
+On an idle connection TCP's restart window caps the gain above about 256 KiB after idle.
+
 ## Dynamics
 
 A stream limited by its allowance delivers `r = (B + A) / L`, where `L` is the loop time, and its allowance moves as
@@ -169,16 +228,18 @@ delivery rate, proportional to what it holds. The streams settle where each deli
 within about one loop time. A newcomer is limited only by its own allowance ramp, which about doubles per loop: in the example above (330 ms
 loops), Y reaches an even split in about 5 loops, roughly 1.7 s.
 
-**Slow and stalled readers** never queue, because their allowance blocks them first. A slow reader keeps its read rate,
+**Slow and stalled readers** do not queue for long, because their allowance blocks them first. (With the advance on,
+a stream with a grant left and nothing proven may join the turn queue once, to draw the grant.) A slow reader keeps its read rate,
 and the fast streams share the rest (max-min fair).
 
 ## Known limits
 
 1. **New and resumed streams ramp up from `B`** at about twice per round trip: a 0.5-1 MB response on a 100 ms path
    takes 3-4 round trips. hyper with its default 2 MiB windows takes about 1, rust-yamux (256 KiB, doubling) 2-3.
-   Responses under `B` are not affected. There are no slow-start shortcuts.
+   Responses under `B` are not affected. The optional advance (see "The advance") shortens the ramp, within `g`.
 2. **A stalled reader keeps what it already holds** until it reads. If a lone bulk stream holds the whole pool and
    stalls, the other streams are left with their base windows: about 5 Mbit/s at 100 ms with 64 KiB windows.
+   The advance makes a stalled stream hold somewhat more by the time it stalls (see "Costs").
 3. **More control frames than yamux or hyper.** Credit is returned every 32 KiB (against about half a window), and
    every 32 KiB of data also carries a `PING` and gets a `PONG`. At 150 Mbit/s that is roughly 1700 small frames per second.
    Many ride on data frames, and every frame is one write, so the packet count stays close to the data's.

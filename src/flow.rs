@@ -77,6 +77,101 @@ impl Pool {
     }
 }
 
+/// The advance of a connection: unproven bytes that the streams drew from the pool, see `TRANSIT_CONTROL.md`.
+///
+/// A stream may draw at most `g` of them per episode ([`Loan`]), all streams together at most `G`.
+/// Both are zero by default, and then nothing is ever drawn.
+#[derive(Debug, Default)]
+pub struct Advance {
+    /// `g` in bytes.
+    grant: u64,
+    /// `G` in bytes.
+    budget: u64,
+    /// Sum over the streams of the bytes they drew and have not repaid, `V`.
+    used: u64,
+}
+
+impl Advance {
+    /// Creates an unused advance of `grant` and `budget` fractions of a pool of `pool` bytes, rounded down.
+    ///
+    /// The fractions are what [`RammuxConfig::validate`](crate::config::RammuxConfig::validate) accepts.
+    pub fn new(pool: u32, grant: f32, budget: f32) -> Self {
+        let bytes = |fraction: f32| {
+            // Within 0..=pool for a valid fraction, and the cast saturates for an invalid one.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let bytes = (f64::from(fraction) * f64::from(pool)).floor() as u64;
+            bytes.min(u64::from(pool))
+        };
+        let budget = bytes(budget);
+        Self {
+            grant: bytes(grant).min(budget),
+            budget,
+            used: 0,
+        }
+    }
+
+    /// Returns the sum over the streams of the bytes they drew and have not repaid.
+    pub fn used(&self) -> u64 {
+        self.used
+    }
+
+    /// Returns how many more bytes the streams may draw together.
+    pub fn free(&self) -> u64 {
+        self.budget - self.used
+    }
+}
+
+/// What one stream owes to an [`Advance`].
+#[derive(Debug, Default)]
+pub struct Loan {
+    /// How many more bytes this episode may draw.
+    grant_left: u64,
+    /// Bytes drawn and not repaid, at most `g`.
+    advance: u64,
+}
+
+impl Loan {
+    /// Returns the bytes drawn and not repaid. They count as proven: the stream may keep them borrowed,
+    /// so the proven part of its borrowing is `max(0, A + advance - borrowed)`.
+    pub fn advance(&self) -> u64 {
+        self.advance
+    }
+
+    /// Starts a new episode: the stream was idle and has data to send.
+    pub fn start_episode(&mut self, advance: &Advance) {
+        self.grant_left = advance.grant;
+    }
+
+    /// Returns how many unproven bytes the stream may draw now.
+    pub fn unproven(&self, advance: &Advance) -> u64 {
+        self.grant_left.min(advance.free())
+    }
+
+    /// Draws `bytes`, which must not exceed [`Self::unproven`].
+    pub fn draw(&mut self, advance: &mut Advance, bytes: u64) {
+        debug_assert!(bytes <= self.unproven(advance));
+        self.grant_left -= bytes;
+        self.advance += bytes;
+        advance.used += bytes;
+    }
+
+    /// Repays from `credit`, as much as is owed.
+    ///
+    /// The first credit also ends the grant: the grant is for the first flight, before any proof. A stream
+    /// that did not use it by then (the budget was empty) must not draw it later, when its reader may have stalled.
+    pub fn repay(&mut self, advance: &mut Advance, credit: u64) {
+        self.grant_left = 0;
+        let repaid = self.advance.min(credit);
+        self.advance -= repaid;
+        advance.used -= repaid;
+    }
+
+    /// Repays everything.
+    pub fn release(&mut self, advance: &mut Advance) {
+        self.repay(advance, self.advance);
+    }
+}
+
 /// Bytes of one direction of a stream that are in flight: sent and not credited back.
 ///
 /// The part beyond the base window is borrowed from a [`Pool`].
@@ -84,6 +179,8 @@ impl Pool {
 pub struct Window {
     /// The base window `B`.
     base: u64,
+    /// `T_c`: below this many bytes in flight, the stream is idle.
+    idle_below: u64,
     unacked: u64,
 }
 
@@ -92,6 +189,7 @@ impl Window {
     pub fn new(base: u32) -> Self {
         Self {
             base: u64::from(base),
+            idle_below: credit_threshold(base),
             unacked: 0,
         }
     }
@@ -99,6 +197,11 @@ impl Window {
     /// Returns the bytes in flight.
     pub fn unacked(&self) -> u64 {
         self.unacked
+    }
+
+    /// Returns whether less than `T_c` bytes are in flight: the stream is idle, or its reader has caught up.
+    pub fn is_idle(&self) -> bool {
+        self.unacked < self.idle_below
     }
 
     /// Returns the bytes in flight beyond the base window.

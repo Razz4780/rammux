@@ -42,7 +42,8 @@ pub struct Streams {
 
 impl Streams {
     pub fn new(role: RammuxRole, config: RammuxConfig) -> Self {
-        let flow = ConnFlow::new(config.local_recv_pool, config.remote_recv_pool);
+        let flow =
+            ConnFlow::new(config.local_recv_pool, config.remote_recv_pool).with_advance(&config);
         Self {
             role,
             config,

@@ -23,6 +23,8 @@ const CONFIG: RammuxConfig = RammuxConfig {
     remote_recv_window: NonZeroU32::new(14).unwrap(),
     local_recv_pool: 32,
     remote_recv_pool: 32,
+    advance_grant: 0.0,
+    advance_budget: 0.0,
     ping_bytes: NonZeroU32::new(32).unwrap(),
     ping_interval: Duration::from_secs(1),
     inbound_frame_timeout: Duration::from_secs(1),
