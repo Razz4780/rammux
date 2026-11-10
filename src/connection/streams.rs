@@ -167,12 +167,11 @@ impl Streams {
 
 impl Drop for Streams {
     fn drop(&mut self) {
-        let flow = self.updates.strategy_mut();
         for handle in self.outbound.drain() {
-            handle.abort(flow);
+            handle.abort();
         }
         for (_, handle) in self.inbound.drain() {
-            handle.abort(flow);
+            handle.abort();
         }
     }
 }

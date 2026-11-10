@@ -50,13 +50,12 @@ impl StreamHandle {
     /// Closes the stream, because the connection is gone.
     ///
     /// The application reads the data that arrived, and then the end of the stream. Writing fails.
-    /// The advance the stream still owes goes back to the budget.
     /// Does nothing if another user of the stream panicked while holding its lock.
-    pub fn abort(self, flow: &mut ConnFlow) {
+    pub fn abort(self) {
         let Some(mut state) = self.0.try_lock() else {
             return;
         };
         let _ = state.inbound.received_fin_write(&self.0.updates);
-        state.outbound.abort(&self.0.updates, flow);
+        state.outbound.abort(&self.0.updates);
     }
 }

@@ -183,7 +183,7 @@ impl OutboundTraffic {
 
             OutboundState::Closed { fin_state } => {
                 // A closed stream must not hold up the others.
-                ctx.flow.leave_queues(ctx.me);
+                ctx.flow.pass_turn(ctx.me);
                 if fin_state.sent {
                     return Poll::Pending;
                 }
@@ -215,13 +215,9 @@ impl OutboundTraffic {
 
         let freed = self.ledger.window.set(&mut ctx.flow.tx_pool, unacked);
         // The credit pays back the advance first.
-        if self
-            .ledger
+        self.ledger
             .loan
-            .repay(&mut ctx.flow.advance, u64::from(credit))
-        {
-            ctx.flow.wake_budget_front();
-        }
+            .repay(&mut ctx.flow.advance, u64::from(credit));
         // The estimate only runs once the loop time is known, or its time constant is not.
         if let Some(srtt) = ctx.flow.srtt.secs() {
             self.ledger.rate.add(credit, ctx.now, srtt);
@@ -247,19 +243,13 @@ impl OutboundTraffic {
             ctx.flow.turns.wake_front();
         }
         // The whole advance goes back, wherever the stream was in its episode.
-        if self.ledger.loan.release(&mut ctx.flow.advance) {
-            ctx.flow.wake_budget_front();
-        }
+        self.ledger.loan.release(&mut ctx.flow.advance);
         Ok(())
     }
 
-    /// Closes the direction without the accounting of the pool, when the connection is gone.
-    /// The advance still goes back to the budget, so that it never leaks.
-    pub fn abort(&mut self, updates: &AtomicWaker, flow: &mut ConnFlow) {
+    /// Closes the direction without the accounting, when the connection is gone.
+    pub fn abort(&mut self, updates: &AtomicWaker) {
         let _ = self.close_reading_side(updates);
-        if self.ledger.loan.release(&mut flow.advance) {
-            flow.wake_budget_front();
-        }
     }
 
     fn close_reading_side(&mut self, updates: &AtomicWaker) -> Result<(), StreamError> {
@@ -342,7 +332,7 @@ impl Ledger {
     fn plan(&mut self, ctx: &mut Ctx<'_>, waiting: usize) -> Option<usize> {
         let waiting = waiting as u64;
         if waiting == 0 {
-            ctx.flow.leave_queues(ctx.me);
+            ctx.flow.pass_turn(ctx.me);
             return None;
         }
 
@@ -356,7 +346,6 @@ impl Ledger {
         let full = self.frame_limit.min(waiting);
         if base_room >= full {
             self.window.add(&mut ctx.flow.tx_pool, full);
-            ctx.flow.pass_budget(ctx.me);
             return Some(to_len(full));
         }
 
@@ -377,17 +366,10 @@ impl Ledger {
         };
         let n = full.min(base_room + shared);
         if n == 0 {
-            if may_borrow > 0 {
-                ctx.flow.pass_budget(ctx.me);
-                ctx.flow.turns.join(ctx.me);
-            } else {
+            if may_borrow == 0 {
                 ctx.flow.pass_turn(ctx.me);
-                if self.loan.has_grant() {
-                    // With a grant in hand, the empty budget is all that is missing.
-                    ctx.flow.budget_waiters.join(ctx.me);
-                } else {
-                    ctx.flow.pass_budget(ctx.me);
-                }
+            } else {
+                ctx.flow.turns.join(ctx.me);
             }
             return None;
         }
@@ -396,8 +378,6 @@ impl Ledger {
         self.window.add(&mut ctx.flow.tx_pool, n);
         self.loan
             .draw(&mut ctx.flow.advance, taken.saturating_sub(proven));
-        // A woken waiter for the budget leaves, and the next one may draw if there is room left.
-        ctx.flow.pass_budget(ctx.me);
         if n > base_room {
             ctx.flow.turns.leave(ctx.me);
             if waiting > n {

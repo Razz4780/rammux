@@ -41,7 +41,6 @@ pub(crate) fn new(
     let shared = Arc::new(StreamShared {
         updates: AtomicWaker::new(),
         turn: Node::new(),
-        budget: Node::new(),
         state: Mutex::new(StreamState {
             inbound: InboundTraffic::new(config.local_recv_window.get()),
             outbound: OutboundTraffic::new(config.frame_limit, config.remote_recv_window.get()),
@@ -74,8 +73,6 @@ pub(crate) struct StreamShared {
     updates: AtomicWaker,
     /// Place of the stream in the turn queue, see [`turns::Turns`].
     turn: Node<StreamShared>,
-    /// Place of the stream in the queue for the budget of the advance, see [`turns::BudgetWaiters`].
-    budget: Node<StreamShared>,
     state: Mutex<StreamState>,
 }
 
@@ -83,13 +80,6 @@ pub(crate) struct StreamShared {
 unsafe impl Linked for StreamShared {
     fn node(&self) -> &Node<Self> {
         &self.turn
-    }
-}
-
-// SAFETY: the node is a field of the stream.
-unsafe impl Linked<turns::BudgetLink> for StreamShared {
-    fn node(&self) -> &Node<Self> {
-        &self.budget
     }
 }
 

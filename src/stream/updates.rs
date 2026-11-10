@@ -106,7 +106,7 @@ impl Task<ConnFlow> for StreamUpdates {
         value: Self::Break,
     ) -> Option<Self::Output> {
         // A closed stream waits for nothing, and nobody waits for it.
-        flow.leave_queues(&removed.stream);
+        flow.pass_turn(&removed.stream);
         Some(value)
     }
 }
