@@ -42,7 +42,8 @@ pub struct Streams {
 
 impl Streams {
     pub fn new(role: RammuxRole, config: RammuxConfig) -> Self {
-        let flow = ConnFlow::new(config.local_recv_pool, config.remote_recv_pool);
+        let flow =
+            ConnFlow::new(config.local_recv_pool, config.remote_recv_pool).with_advance(&config);
         Self {
             role,
             config,
@@ -166,11 +167,12 @@ impl Streams {
 
 impl Drop for Streams {
     fn drop(&mut self) {
+        let flow = self.updates.strategy_mut();
         for handle in self.outbound.drain() {
-            handle.abort();
+            handle.abort(flow);
         }
         for (_, handle) in self.inbound.drain() {
-            handle.abort();
+            handle.abort(flow);
         }
     }
 }

@@ -28,8 +28,8 @@ use std::{
 ///
 /// [`Linked::node`] must always return the same [`Node`], and the node must be a part of `self`,
 /// so that it lives exactly as long as the element.
-pub unsafe trait Linked: Sized {
-    /// Returns the node of this element.
+pub unsafe trait Linked<L = ()>: Sized {
+    /// Returns the node of this element for the lists of the kind `L`.
     fn node(&self) -> &Node<Self>;
 }
 
@@ -82,21 +82,21 @@ unsafe impl<T: Send + Sync> Send for Node<T> {}
 unsafe impl<T: Send + Sync> Sync for Node<T> {}
 
 /// An intrusive doubly linked list of [`Arc`]s, see the [module docs](self).
-pub struct PinList<T: Linked> {
+pub struct PinList<T: Linked<L>, L = ()> {
     id: NonZeroU64,
     head: Option<NonNull<T>>,
     tail: Option<NonNull<T>>,
     len: usize,
     /// The list owns a strong reference to every linked element.
-    _owns: PhantomData<Arc<T>>,
+    _owns: PhantomData<(Arc<T>, fn() -> L)>,
 }
 
 // SAFETY: the list owns `Arc<T>`s, which are `Send` if `T` is `Send + Sync`.
-unsafe impl<T: Linked + Send + Sync> Send for PinList<T> {}
+unsafe impl<T: Linked<L> + Send + Sync, L> Send for PinList<T, L> {}
 // SAFETY: a shared reference to the list only reads the links and hands out `&T`.
-unsafe impl<T: Linked + Send + Sync> Sync for PinList<T> {}
+unsafe impl<T: Linked<L> + Send + Sync, L> Sync for PinList<T, L> {}
 
-impl<T: Linked> PinList<T> {
+impl<T: Linked<L>, L> PinList<T, L> {
     /// Creates an empty list.
     pub fn new() -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -191,7 +191,7 @@ impl<T: Linked> PinList<T> {
     }
 
     /// Returns an iterator over the elements, first to last.
-    pub fn iter(&self) -> Iter<'_, T> {
+    pub fn iter(&self) -> Iter<'_, T, L> {
         Iter {
             next: self.head,
             _list: PhantomData,
@@ -239,31 +239,31 @@ impl<T: Linked> PinList<T> {
     }
 }
 
-impl<T: Linked> Default for PinList<T> {
+impl<T: Linked<L>, L> Default for PinList<T, L> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: Linked> Drop for PinList<T> {
+impl<T: Linked<L>, L> Drop for PinList<T, L> {
     fn drop(&mut self) {
         while self.pop_front().is_some() {}
     }
 }
 
-impl<T: Linked + fmt::Debug> fmt::Debug for PinList<T> {
+impl<T: Linked<L> + fmt::Debug, L> fmt::Debug for PinList<T, L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.iter()).finish()
     }
 }
 
 /// Iterator over the elements of a [`PinList`], see [`PinList::iter`].
-pub struct Iter<'a, T> {
+pub struct Iter<'a, T, L = ()> {
     next: Option<NonNull<T>>,
-    _list: PhantomData<&'a T>,
+    _list: PhantomData<(&'a T, fn() -> L)>,
 }
 
-impl<'a, T: Linked> Iterator for Iter<'a, T> {
+impl<'a, T: Linked<L>, L> Iterator for Iter<'a, T, L> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -271,7 +271,7 @@ impl<'a, T: Linked> Iterator for Iter<'a, T> {
         // SAFETY: the element is in the list, which is borrowed for `'a`, so it is alive
         // and its links do not change.
         unsafe {
-            self.next = (*PinList::links(ptr)).next;
+            self.next = (*PinList::<T, L>::links(ptr)).next;
             Some(ptr.as_ref())
         }
     }

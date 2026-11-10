@@ -108,6 +108,38 @@ pub struct RammuxConfig {
     /// This value has to be negotiated beforehand and
     /// must match the peer's [`RammuxConfig::local_recv_pool`].
     pub remote_recv_pool: u32,
+    /// Grant of the advance, `g`: the fraction of [`Self::remote_recv_pool`] that one stream may borrow
+    /// before its reader has proven anything. `0 <= g <= G`, see [`Self::advance_budget`].
+    ///
+    /// A stream that has been idle (almost nothing in flight) and starts sending may draw up to
+    /// `floor(g * remote_recv_pool)` bytes beyond what its reader's recent credit justifies, and repays them from
+    /// the credit that comes back. It is the largest burst that leaves in a single flight: a new stream, or one
+    /// that paused for about a loop, would otherwise start from its base window and wait a loop for each doubling.
+    /// With `0.0`, the default, there is no advance, and the sender follows only the proven rate.
+    ///
+    /// The cost is shared with [`Self::advance_budget`]. A larger grant means a bigger burst for the idle stream,
+    /// and more bytes that a reader which never reads pins until it reads or closes.
+    ///
+    /// See "The advance" in `TRANSIT_CONTROL.md`.
+    ///
+    /// # Negotiation
+    ///
+    /// This value is local to the sender and does not have to be negotiated.
+    pub advance_grant: f32,
+    /// Budget of the advance, `G`: the fraction of [`Self::remote_recv_pool`] that all streams of the
+    /// connection may hold as advance together. `g <= G <= 1`, see [`Self::advance_grant`].
+    ///
+    /// The budget bounds what readers that never read can pin, on top of their base windows: at most
+    /// `floor(G * remote_recv_pool)` bytes in total, however many streams there are. Once the budget is
+    /// spent, streams follow the proven rate only, as without the advance. With `0.0`, the default, there is no advance.
+    ///
+    /// The budget has to be at least the grant. With a larger grant, a single stream would draw the budget again
+    /// every time it repaid some of it, and a slow reader would hold far more than its read rate justifies.
+    ///
+    /// # Negotiation
+    ///
+    /// This value is local to the sender and does not have to be negotiated.
+    pub advance_budget: f32,
     /// A `PING` is sent when this much `DATA` was written since the last one.
     ///
     /// The latest `PING` read is answered with a `PONG`, which gives the peer a round trip time sample.
@@ -145,6 +177,7 @@ impl RammuxConfig {
     /// 5. [`Self::ping_interval`] - 5s
     /// 6. [`Self::inbound_frame_timeout`] - 10s
     /// 7. [`Self::local_recv_pool`] and [`Self::remote_recv_pool`] - 4 MiB
+    /// 8. [`Self::advance_grant`] and [`Self::advance_budget`] - 0, no advance
     pub const fn new() -> Self {
         Self {
             frame_limit: NonZeroU16::new(16 * 1024).unwrap(),
@@ -154,6 +187,8 @@ impl RammuxConfig {
             remote_recv_window: NonZeroU32::new(64 * 1024).unwrap(),
             local_recv_pool: 4 * 1024 * 1024,
             remote_recv_pool: 4 * 1024 * 1024,
+            advance_grant: 0.0,
+            advance_budget: 0.0,
             ping_bytes: NonZeroU32::new(32 * 1024).unwrap(),
             ping_interval: Duration::from_secs(5),
             inbound_frame_timeout: Duration::from_secs(10),
@@ -177,6 +212,17 @@ impl RammuxConfig {
                 field: "max_outbound_streams",
                 value: self.max_outbound_streams,
             });
+        }
+        for (field, value) in [
+            ("advance_grant", self.advance_grant),
+            ("advance_budget", self.advance_budget),
+        ] {
+            if !(0.0..=1.0).contains(&value) {
+                return Err(ConfigError::AdvanceNotAFraction { field });
+            }
+        }
+        if self.advance_grant > self.advance_budget {
+            return Err(ConfigError::AdvanceGrantAboveBudget);
         }
         if self.ping_interval.is_zero() {
             return Err(ConfigError::ZeroPingInterval);
@@ -208,6 +254,15 @@ pub enum ConfigError {
         /// Configured value.
         value: u32,
     },
+    /// An advance setting is not a number from 0 to 1 (NaN and infinities included).
+    #[error("{field} must be a finite fraction from 0 to 1")]
+    AdvanceNotAFraction {
+        /// Name of the offending field.
+        field: &'static str,
+    },
+    /// `advance_grant` exceeds `advance_budget`.
+    #[error("advance_grant must not exceed advance_budget")]
+    AdvanceGrantAboveBudget,
     /// `ping_interval` is zero: a `PING` would be due all the time.
     #[error("ping_interval must not be zero")]
     ZeroPingInterval,
@@ -277,6 +332,41 @@ mod test {
         ));
         config.ping_interval = config.inbound_frame_timeout - Duration::from_millis(1);
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn advance_is_a_pair_of_fractions_with_grant_up_to_budget() {
+        let mut config = RammuxConfig::new();
+        config.advance_grant = 1.0 / 16.0;
+        config.advance_budget = 0.25;
+        config.validate().unwrap();
+        config.advance_grant = 0.25;
+        config.validate().unwrap();
+        config.advance_budget = 1.0;
+        config.validate().unwrap();
+
+        config.advance_grant = 0.5;
+        config.advance_budget = 0.25;
+        assert_eq!(config.validate(), Err(ConfigError::AdvanceGrantAboveBudget));
+
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.1, 1.1] {
+            let mut config = RammuxConfig::new();
+            config.advance_grant = bad;
+            assert_eq!(
+                config.validate(),
+                Err(ConfigError::AdvanceNotAFraction {
+                    field: "advance_grant"
+                })
+            );
+            let mut config = RammuxConfig::new();
+            config.advance_budget = bad;
+            assert_eq!(
+                config.validate(),
+                Err(ConfigError::AdvanceNotAFraction {
+                    field: "advance_budget"
+                })
+            );
+        }
     }
 
     #[test]

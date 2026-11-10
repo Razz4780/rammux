@@ -23,7 +23,7 @@ use crate::{
     StreamId,
     buffer::Data,
     config::RammuxConfig,
-    flow::Srtt,
+    flow::{Advance, Srtt},
     stream::{ConnFlow, RammuxDuplex, StreamRef, handle::StreamHandle, updates::StreamUpdates},
     wire::header::ControlFlags,
 };
@@ -36,6 +36,8 @@ const CONFIG: RammuxConfig = RammuxConfig {
     remote_recv_window: NonZeroU32::new(16).unwrap(),
     local_recv_pool: 1 << 20,
     remote_recv_pool: 8,
+    advance_grant: 0.0,
+    advance_budget: 0.0,
     ping_bytes: NonZeroU32::new(32).unwrap(),
     ping_interval: Duration::from_secs(1),
     inbound_frame_timeout: Duration::from_secs(2),
@@ -540,4 +542,292 @@ fn fins(fin_write: bool, fin_read: bool) -> ControlFlags {
         fin_read,
         fin_write,
     }
+}
+
+// The advance. The pool is 64 bytes, a stream draws 16 at most per episode (g = 1/4)
+// and all streams together 32 at most (G = 1/2). `T_c` is 8 bytes.
+
+const POOL: u32 = 64;
+
+impl Bed {
+    /// Creates a bed with the advance of `grant` and `budget` fractions of the pool.
+    fn with_advance(grant: f32, budget: f32) -> Self {
+        let mut bed = Self::new(POOL);
+        bed.selector.strategy_mut().advance = Advance::new(POOL, grant, budget);
+        bed
+    }
+
+    /// The sum of the advances, `V`.
+    fn v(&self) -> u64 {
+        self.flow().advance.used()
+    }
+
+    fn advance(&self, s: usize) -> u64 {
+        self.streams[s].me.lock().outbound.advance()
+    }
+
+    fn unacked(&self, s: usize) -> u64 {
+        self.streams[s].me.lock().outbound.unacked()
+    }
+
+    fn fin_read(&mut self, s: usize) {
+        self.streams[s]
+            .handle
+            .received(
+                None,
+                Data::default(),
+                fins(false, true),
+                self.selector.strategy_mut(),
+            )
+            .unwrap();
+    }
+
+    fn waits_for_budget(&self, s: usize) -> bool {
+        self.flow()
+            .budget_waiters
+            .contains(&self.streams[s].me)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_idle_stream_draws_its_grant_and_no_more() {
+    let mut bed = Bed::with_advance(0.25, 0.5);
+    let x = bed.add();
+    bed.write(x, 64);
+    // The base window (16), then the grant (16): nothing is proven.
+    assert_eq!(bed.drain(), [(x, 8), (x, 8), (x, 8), (x, 8)]);
+    assert_eq!((bed.advance(x), bed.v()), (16, 16));
+    assert_eq!(bed.flow().tx_pool.used(), 16);
+    // The grant is spent and there is no new episode: the stream has 32 bytes in flight, not idle.
+    assert!(bed.drain().is_empty());
+    assert!(!bed.is_queued(x) && !bed.waits_for_budget(x));
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_the_advance_nothing_is_drawn() {
+    let mut bed = Bed::new(POOL);
+    let x = bed.add();
+    bed.write(x, 64);
+    assert_eq!(bed.drain(), [(x, 8), (x, 8)]);
+    assert_eq!((bed.advance(x), bed.v()), (0, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn credit_repays_the_advance_and_still_feeds_the_rate() {
+    let mut bed = Bed::with_advance(0.25, 0.5);
+    let x = bed.add();
+    bed.write(x, 64);
+    bed.drain();
+    assert_eq!((bed.advance(x), bed.v()), (16, 16));
+
+    bed.credit(x, 8);
+    assert_eq!((bed.advance(x), bed.v()), (8, 8));
+    // The credit proved 16 bytes (8 B/s * 2 s) and the 8 left of the advance count as proven too:
+    // the stream may borrow 16 + 8 - 8 = 16 more. It is not the grant that sends them.
+    let sent = bed.drain();
+    assert_eq!(sent, [(x, 8), (x, 8)]);
+    assert_eq!((bed.advance(x), bed.v()), (8, 8), "proven bytes are not drawn");
+
+    bed.credit(x, 8);
+    assert_eq!((bed.advance(x), bed.v()), (0, 0));
+    // More credit than is owed leaves nothing negative.
+    bed.credit(x, 8);
+    assert_eq!((bed.advance(x), bed.v()), (0, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_reader_gets_one_grant() {
+    let mut bed = Bed::with_advance(0.25, 0.5);
+    let x = bed.add();
+    bed.write(x, 64);
+    bed.drain();
+    // One byte of credit per second, the standing backlog stays above `T_c`.
+    let mut v_max = bed.v();
+    for _ in 0..8 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        bed.credit(x, 1);
+        bed.drain();
+        assert!(bed.unacked(x) >= 8, "never idle");
+        v_max = v_max.max(bed.v());
+        assert!(bed.advance(x) <= 16);
+    }
+    assert_eq!(v_max, 16, "no second grant");
+    // The backlog is repaid at the read rate: 8 bytes of credit repaid 8 of the 16.
+    assert_eq!(bed.advance(x), 8);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stream_that_caught_up_starts_a_new_episode() {
+    let mut bed = Bed::with_advance(0.25, 0.5);
+    let x = bed.add();
+    bed.write(x, 32);
+    bed.drain();
+    bed.credit(x, 32);
+    assert_eq!((bed.unacked(x), bed.advance(x), bed.v()), (0, 0, 0));
+    // The allowance fades away, so it is the grant that sends the next burst.
+    tokio::time::advance(Duration::from_secs(20)).await;
+    bed.write(x, 64);
+    assert_eq!(bed.drain().len(), 4);
+    assert_eq!((bed.advance(x), bed.v()), (16, 16));
+}
+
+#[tokio::test(start_paused = true)]
+async fn fin_read_returns_the_whole_advance() {
+    let mut bed = Bed::with_advance(0.25, 0.5);
+    let [x, y] = [bed.add(), bed.add()];
+    for s in [x, y] {
+        bed.write(s, 64);
+        bed.drain();
+    }
+    assert_eq!(bed.v(), 32);
+    bed.fin_read(x);
+    assert_eq!((bed.advance(x), bed.v()), (0, 16));
+    bed.fin_read(y);
+    assert_eq!((bed.advance(y), bed.v()), (0, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn abort_returns_the_advance() {
+    let mut bed = Bed::with_advance(0.25, 0.5);
+    let [x, y] = [bed.add(), bed.add()];
+    for s in [x, y] {
+        bed.write(s, 64);
+        bed.drain();
+    }
+    assert_eq!(bed.v(), 32);
+    let x = bed.streams.remove(x);
+    x.handle.abort(bed.selector.strategy_mut());
+    assert_eq!(bed.v(), 16);
+    let y = bed.streams.remove(0);
+    y.handle.abort(bed.selector.strategy_mut());
+    assert_eq!(bed.v(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_budget_is_shared_and_a_stream_waits_for_it() {
+    let mut bed = Bed::with_advance(0.25, 0.5);
+    let [x, y, z] = [bed.add(), bed.add(), bed.add()];
+    for s in [x, y] {
+        bed.write(s, 64);
+        bed.drain();
+    }
+    assert_eq!(bed.v(), 32, "the budget is spent");
+
+    // Z has only its base window, and waits for the budget, outside of the turn queue.
+    bed.write(z, 64);
+    assert_eq!(bed.drain(), [(z, 8), (z, 8)]);
+    assert!(bed.waits_for_budget(z));
+    assert!(!bed.is_queued(z));
+    assert_eq!(bed.advance(z), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_repayment_wakes_the_stream_that_waits_for_the_budget() {
+    let mut bed = Bed::with_advance(0.25, 0.5);
+    let [x, y, z] = [bed.add(), bed.add(), bed.add()];
+    for s in [x, y, z] {
+        bed.write(s, 64);
+        bed.drain();
+    }
+    assert!(bed.waits_for_budget(z));
+
+    // 8 bytes are repaid by X. Z never gets credit of its own: it is the repayment that wakes it.
+    // X sends 16 of what its credit proved.
+    bed.credit(x, 8);
+    assert_eq!(bed.drain_grouped(), [(x, 8), (x, 8), (z, 8)]);
+    assert_eq!((bed.advance(z), bed.v()), (8, 32));
+    assert!(bed.waits_for_budget(z), "it took what was free and waits again");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_budget_goes_to_the_waiters_in_order_and_the_wake_up_is_passed_on() {
+    // One grant is 8 bytes, the budget 16.
+    let mut bed = Bed::with_advance(0.125, 0.25);
+    let [x, y, z, w, u] = [bed.add(), bed.add(), bed.add(), bed.add(), bed.add()];
+    for s in [x, y, z, w, u] {
+        bed.write(s, 64);
+        bed.drain();
+    }
+    assert_eq!(bed.v(), 16);
+    for s in [z, w, u] {
+        assert!(bed.waits_for_budget(s));
+    }
+
+    // 8 bytes come back: the first waiter takes them, the others keep waiting.
+    bed.fin_read(x);
+    assert_eq!(bed.drain(), [(z, 8)]);
+    assert!(!bed.waits_for_budget(z) && bed.waits_for_budget(w) && bed.waits_for_budget(u));
+    assert_eq!(bed.v(), 16);
+
+    // 8 bytes come back, and then 8 more before anybody polled: the woken waiter takes its part,
+    // and passes the wake-up on.
+    bed.fin_read(y);
+    bed.fin_read(z);
+    assert_eq!(bed.v(), 0);
+    assert_eq!(bed.drain(), [(w, 8), (u, 8)]);
+    assert_eq!(bed.v(), 16);
+}
+
+/// A deterministic sequence of writes, credits and `FIN_READ`s of six streams: `V <= G`, `advance_s <= g`,
+/// and the books agree, after every step.
+#[tokio::test(start_paused = true)]
+async fn the_advance_stays_within_its_bounds_whatever_the_streams_do() {
+    let mut bed = Bed::with_advance(0.25, 0.5);
+    let streams = (0..6).map(|_| bed.add()).collect::<Vec<_>>();
+    // Some readers have proven something, some have not.
+    for &s in &streams[..2] {
+        bed.prime(s, 24);
+    }
+    let mut sent = vec![0_u32; streams.len()];
+    let mut closed = vec![false; streams.len()];
+    let mut rng = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let mut max_v = 0;
+    for step in 0..2000 {
+        let s = streams[(next() % 6) as usize];
+        match next() % 8 {
+            0..=2 if !closed[s] => {
+                // A write is only possible when the previous one went out.
+                let ready = bed.streams[s]
+                    .duplex
+                    .feed(Bytes::from(vec![1; 1 + (next() % 40) as usize]))
+                    .now_or_never();
+                assert!(ready.is_some() || bed.unacked(s) > 0);
+            },
+            3..=6 if !closed[s] && sent[s] > 0 => {
+                let credit = 1 + (next() % u64::from(sent[s])) as u32;
+                bed.credit(s, credit);
+                sent[s] -= credit;
+            },
+            7 if step % 5 == 0 && !closed[s] => {
+                bed.fin_read(s);
+                closed[s] = true;
+                sent[s] = 0;
+            },
+            _ => {},
+        }
+        if next() % 3 == 0 {
+            tokio::time::advance(Duration::from_millis(next() % 1500)).await;
+        }
+        for (s, len) in bed.drain() {
+            sent[s] += u32::try_from(len).unwrap();
+        }
+
+        let advances = streams.iter().map(|&s| bed.advance(s)).collect::<Vec<_>>();
+        assert!(bed.v() <= 32, "step {step}: V = {}", bed.v());
+        assert!(advances.iter().all(|&a| a <= 16), "step {step}: {advances:?}");
+        assert_eq!(advances.iter().sum::<u64>(), bed.v(), "step {step}");
+        for &s in &streams {
+            let borrowed = bed.unacked(s).saturating_sub(16);
+            assert!(bed.advance(s) <= borrowed, "step {step}");
+            assert!(bed.flow().tx_pool.used() <= 64);
+        }
+        max_v = max_v.max(bed.v());
+    }
+    assert!(max_v > 16, "the test reached more than one grant: {max_v}");
 }

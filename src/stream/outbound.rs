@@ -12,7 +12,7 @@ use tokio::time::Instant;
 
 use crate::{
     error::StreamError,
-    flow::{RateEstimate, Window},
+    flow::{Loan, RateEstimate, Window},
     stream::{ConnFlow, FinState, StreamRef, waker::WakerSlot},
 };
 
@@ -71,6 +71,7 @@ impl OutboundTraffic {
             ledger: Ledger {
                 window: Window::new(base_window),
                 frame_limit: u64::from(frame_limit.get()),
+                loan: Loan::default(),
                 rate: RateEstimate::new(Instant::now()),
             },
         }
@@ -182,7 +183,7 @@ impl OutboundTraffic {
 
             OutboundState::Closed { fin_state } => {
                 // A closed stream must not hold up the others.
-                ctx.flow.pass_turn(ctx.me);
+                ctx.flow.leave_queues(ctx.me);
                 if fin_state.sent {
                     return Poll::Pending;
                 }
@@ -213,6 +214,10 @@ impl OutboundTraffic {
             .ok_or(StreamError("returned more credit than was in flight"))?;
 
         let freed = self.ledger.window.set(&mut ctx.flow.tx_pool, unacked);
+        // The credit pays back the advance first.
+        if self.ledger.loan.repay(&mut ctx.flow.advance, u64::from(credit)) {
+            ctx.flow.wake_budget_front();
+        }
         // The estimate only runs once the loop time is known, or its time constant is not.
         if let Some(srtt) = ctx.flow.srtt.secs() {
             self.ledger.rate.add(credit, ctx.now, srtt);
@@ -237,12 +242,20 @@ impl OutboundTraffic {
         if self.ledger.window.set(&mut ctx.flow.tx_pool, 0) {
             ctx.flow.turns.wake_front();
         }
+        // The whole advance goes back, wherever the stream was in its episode.
+        if self.ledger.loan.release(&mut ctx.flow.advance) {
+            ctx.flow.wake_budget_front();
+        }
         Ok(())
     }
 
-    /// Closes the direction without the accounting, when the connection is gone.
-    pub fn abort(&mut self, updates: &AtomicWaker) {
+    /// Closes the direction without the accounting of the pool, when the connection is gone.
+    /// The advance still goes back to the budget, so that it never leaks.
+    pub fn abort(&mut self, updates: &AtomicWaker, flow: &mut ConnFlow) {
         let _ = self.close_reading_side(updates);
+        if self.ledger.loan.release(&mut flow.advance) {
+            flow.wake_budget_front();
+        }
     }
 
     fn close_reading_side(&mut self, updates: &AtomicWaker) -> Result<(), StreamError> {
@@ -273,6 +286,12 @@ impl OutboundTraffic {
         self.ledger.window.unacked()
     }
 
+    /// Returns the advance the stream drew and has not repaid.
+    #[cfg(test)]
+    pub fn advance(&self) -> u64 {
+        self.ledger.loan.advance()
+    }
+
     /// Gives the stream an allowance of the given size, to decay from now.
     #[cfg(test)]
     pub fn prime(&mut self, allowance: u32, srtt: f64, now: Instant) {
@@ -288,6 +307,8 @@ struct Ledger {
     window: Window,
     /// Largest `DATA` payload.
     frame_limit: u64,
+    /// What the stream owes to the advance of the connection.
+    loan: Loan,
     /// The rate at which the reader of the peer proved to read, `R_s`.
     rate: RateEstimate,
 }
@@ -300,26 +321,38 @@ impl Ledger {
     /// 1. Nothing waits: nothing to send.
     /// 2. `full` fits in the base window: send it, no turn needed.
     /// 3. Otherwise the stream may use `shared` bytes of the pool besides its base window:
-    ///    what its allowance still permits and the pool has room for, but only if it is its turn.
+    ///    what its borrowing rule still permits and the pool has room for, but only if it is its turn.
     ///    It sends `n = min(full, base_room + shared)` bytes if that is any.
     ///    If it used the pool, it gives the turn away, and takes a new one if it has more to send.
-    ///    - Nothing can be sent because the allowance is used up: only the stream's own credit can help,
-    ///      so it waits for that, outside of the queue.
-    ///    - Nothing can be sent otherwise (not its turn, or the pool is empty): it waits in the queue.
+    ///    - Nothing can be sent because the borrowing rule permits nothing: only credit can help.
+    ///      The stream's own credit, or the credit of the others if the lack is the budget of the advance.
+    ///      It waits outside of the turn queue, in the queue for the budget in the second case.
+    ///    - Nothing can be sent otherwise (not its turn, or the pool is empty): it waits in the turn queue.
+    ///
+    /// The borrowing rule is `proven + unproven`: the allowance grown by the advance the stream holds,
+    /// and the part of the grant that the budget still covers (see `TRANSIT_CONTROL.md`).
+    /// What the stream takes from the pool beyond `proven` is drawn from the advance.
     ///
     /// A frame is whatever fits. Waiting for a whole frame would let residue of credit, a small
     /// pool or a small window block a stream that has room.
     fn plan(&mut self, ctx: &mut Ctx<'_>, waiting: usize) -> Option<usize> {
         let waiting = waiting as u64;
         if waiting == 0 {
-            ctx.flow.pass_turn(ctx.me);
+            ctx.flow.leave_queues(ctx.me);
             return None;
+        }
+
+        // An idle stream with something to send starts an episode. `unacked < T_c` leaves no advance behind:
+        // the advance is part of the bytes in flight beyond `B`, and credit pays it back first.
+        if self.window.is_idle() {
+            self.loan.start_episode(&ctx.flow.advance);
         }
 
         let base_room = self.window.base_room();
         let full = self.frame_limit.min(waiting);
         if base_room >= full {
             self.window.add(&mut ctx.flow.tx_pool, full);
+            ctx.flow.pass_budget(ctx.me);
             return Some(to_len(full));
         }
 
@@ -328,9 +361,11 @@ impl Ledger {
             .srtt
             .secs()
             .map_or(0.0, |srtt| self.rate.allowance(ctx.now, srtt));
-        // Whole bytes of the allowance that are not borrowed yet.
+        // Whole bytes of the allowance, and of the advance in hand, that are not borrowed yet.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let may_borrow = (allowance - self.window.borrowed() as f64).max(0.0) as u64;
+        let proven = (allowance + self.loan.advance() as f64 - self.window.borrowed() as f64)
+            .max(0.0) as u64;
+        let may_borrow = proven + self.loan.unproven(&ctx.flow.advance);
         let shared = if ctx.flow.turns.has_turn(ctx.me) {
             may_borrow.min(ctx.flow.tx_pool.room())
         } else {
@@ -338,15 +373,27 @@ impl Ledger {
         };
         let n = full.min(base_room + shared);
         if n == 0 {
-            if may_borrow == 0 {
-                ctx.flow.pass_turn(ctx.me);
-            } else {
+            if may_borrow > 0 {
+                ctx.flow.pass_budget(ctx.me);
                 ctx.flow.turns.join(ctx.me);
+            } else {
+                ctx.flow.pass_turn(ctx.me);
+                if self.loan.has_grant() {
+                    // With a grant in hand, the empty budget is all that is missing.
+                    ctx.flow.budget_waiters.join(ctx.me);
+                } else {
+                    ctx.flow.pass_budget(ctx.me);
+                }
             }
             return None;
         }
 
+        let taken = n.saturating_sub(base_room);
         self.window.add(&mut ctx.flow.tx_pool, n);
+        self.loan
+            .draw(&mut ctx.flow.advance, taken.saturating_sub(proven));
+        // A woken waiter for the budget leaves, and the next one may draw if there is room left.
+        ctx.flow.pass_budget(ctx.me);
         if n > base_room {
             ctx.flow.turns.leave(ctx.me);
             if waiting > n {
