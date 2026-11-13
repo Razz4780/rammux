@@ -1,5 +1,5 @@
 use std::{
-    io,
+    fmt, io,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -106,6 +106,16 @@ where
                 break Poll::Ready(Ok(()));
             }
         }
+    }
+}
+
+impl<IO> fmt::Debug for Downgraded<IO> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Downgraded")
+            .field("term_received", &self.term_received)
+            .field("term_sent", &self.term_sent)
+            .field("with_shutdown", &self.with_shutdown)
+            .finish_non_exhaustive()
     }
 }
 

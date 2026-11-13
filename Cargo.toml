@@ -11,17 +11,26 @@ publish = true
 keywords = ["multiplexer", "network", "protocol"]
 categories = ["network-programming"]
 rust-version = "1.89.0"
+include = [
+    "/src",
+    "/examples",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/PROTOCOL.md",
+    "/TRANSIT_CONTROL.md",
+    "/LICENSE",
+]
 
 [dependencies]
 async-selector = "0.4"
 bitflags = "2"
-bytes = "1"
+bytes = "1.1"
 futures = "0.3"
-slab = "0.4"
+slab = "0.4.6"
 static_assertions = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["net", "sync", "time"] }
+tokio = { version = "1.7", features = ["time"] }
 
 [dev-dependencies]
 rstest = "0.26"
-tokio = { version = "1", features = ["full", "test-util"] }
+tokio = { version = "1.7", features = ["full", "test-util"] }

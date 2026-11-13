@@ -1,6 +1,7 @@
 //! Types for running rammux protocol on an IO transport.
 
 use std::{
+    fmt,
     task::{Context, Poll},
     time::Duration,
 };
@@ -21,6 +22,8 @@ pub use crate::connection::downgrade::Downgraded;
 
 mod active;
 mod downgrade;
+#[cfg(test)]
+mod peer_model_test;
 mod pings;
 #[cfg(test)]
 mod sim_test;
@@ -178,6 +181,21 @@ where
     }
 }
 
+impl<IO> fmt::Debug for RammuxConnection<IO> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = match &self.state {
+            ConnState::Active(..) => "active",
+            ConnState::Poisoned => "poisoned",
+            ConnState::Downgraded => "downgraded",
+        };
+        f.debug_struct("RammuxConnection")
+            .field("role", &self.role)
+            .field("state", &state)
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Progress made by a [`RammuxConnection`].
 pub enum RammuxProgress<IO> {
     /// Downgrade procedure was initiated by the other side.
@@ -190,6 +208,16 @@ pub enum RammuxProgress<IO> {
     ///
     /// This variant exists only to make [`RammuxConnection::poll_progress`] reliably return control to the caller.
     Empty,
+}
+
+impl<IO> fmt::Debug for RammuxProgress<IO> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Downgraded(downgraded) => f.debug_tuple("Downgraded").field(downgraded).finish(),
+            Self::Inbound(stream) => f.debug_tuple("Inbound").field(stream).finish(),
+            Self::Empty => f.write_str("Empty"),
+        }
+    }
 }
 
 /// Statistics of a [`RammuxConnection`].

@@ -27,10 +27,10 @@ use crate::{
 };
 
 /// A rammux connection and a peer that reads its frames and writes raw bytes to it.
-struct Rig {
-    conn: RammuxConnection<DuplexStream>,
-    peer_in: RammuxCodec<ReadHalf<DuplexStream>>,
-    peer_out: WriteHalf<DuplexStream>,
+pub(super) struct Rig {
+    pub(super) conn: RammuxConnection<DuplexStream>,
+    pub(super) peer_in: RammuxCodec<ReadHalf<DuplexStream>>,
+    pub(super) peer_out: WriteHalf<DuplexStream>,
 }
 
 fn config() -> RammuxConfig {
@@ -41,7 +41,7 @@ fn config() -> RammuxConfig {
     config
 }
 
-fn rig(role: RammuxRole, config: RammuxConfig) -> Rig {
+pub(super) fn rig(role: RammuxRole, config: RammuxConfig) -> Rig {
     let (io_1, io_2) = tokio::io::duplex(1 << 20);
     let (read, write) = tokio::io::split(io_2);
     Rig {
@@ -51,7 +51,7 @@ fn rig(role: RammuxRole, config: RammuxConfig) -> Rig {
     }
 }
 
-fn raw(header: Header, payload: &[u8]) -> Vec<u8> {
+pub(super) fn raw(header: Header, payload: &[u8]) -> Vec<u8> {
     let mut buf = [0; MAX_HEADER_LEN];
     let len = header.encode(&mut buf);
     let mut out = buf[..len].to_vec();

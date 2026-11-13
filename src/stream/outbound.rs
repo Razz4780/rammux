@@ -318,9 +318,9 @@ impl Ledger {
     ///    what its borrowing rule still permits and the pool has room for, but only if it is its turn.
     ///    It sends `n = min(full, base_room + shared)` bytes if that is any.
     ///    If it used the pool, it gives the turn away, and takes a new one if it has more to send.
-    ///    - Nothing can be sent because the borrowing rule permits nothing: only credit can help.
-    ///      The stream's own credit, or the credit of the others if the lack is the budget of the advance.
-    ///      It waits outside of the turn queue, in the queue for the budget in the second case.
+    ///    - Nothing can be sent because the borrowing rule permits nothing: only the stream's own credit
+    ///      can help, so it waits for that outside of the turn queue. Nothing wakes it when other streams
+    ///      repay the budget of the advance (see "No waking on freed budget" in `TRANSIT_CONTROL.md`).
     ///    - Nothing can be sent otherwise (not its turn, or the pool is empty): it waits in the turn queue.
     ///
     /// The borrowing rule is `proven + unproven`: the allowance grown by the advance the stream holds,

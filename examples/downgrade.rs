@@ -10,7 +10,7 @@ const DATA: Bytes = Bytes::from_static(&[21; 64 * 1024]);
 
 /// This example presents the correct downgrade flow.
 ///
-/// See [PROTOCOL.md](https://github.com/Razz4780/rammux/blob/main/PROTOCOL.md) and [`Downgraded`](rammux::Downgraded)
+/// See [PROTOCOL.md](https://github.com/Razz4780/rammux/blob/main/PROTOCOL.md) and [`Downgraded`](rammux::connection::Downgraded)
 /// doc for more info.
 #[tokio::main]
 async fn main() {
@@ -22,7 +22,7 @@ async fn main() {
     tokio::join!(run_client(client), run_server(server));
 }
 
-/// Opens an rammux stream and sends [`DATA`] through it, then downgrades the connection.
+/// Opens a rammux stream and sends [`DATA`] through it, then downgrades the connection.
 async fn run_client(mut rammux: RammuxConnection<DuplexStream>) {
     let role = rammux.role();
 
@@ -55,7 +55,7 @@ async fn run_client(mut rammux: RammuxConnection<DuplexStream>) {
         match progress.expect("connection should not fail") {
             RammuxProgress::Inbound(..) => panic!("we don't expect more streams"),
             RammuxProgress::Downgraded(..) => {
-                panic!("we don't expect downgrade fromt the other side")
+                panic!("we don't expect downgrade from the other side")
             },
             RammuxProgress::Empty => {},
         }
@@ -73,7 +73,7 @@ async fn run_client(mut rammux: RammuxConnection<DuplexStream>) {
     println!("[{role}] Downgrade finished.");
 }
 
-/// Receive a new stream with [`DATA`], then receives downgrade of the connection.
+/// Receives a new stream with [`DATA`], then receives downgrade of the connection.
 async fn run_server(mut rammux: RammuxConnection<DuplexStream>) {
     let role = rammux.role();
 
@@ -85,7 +85,7 @@ async fn run_server(mut rammux: RammuxConnection<DuplexStream>) {
                 break stream.into_split().1;
             },
             RammuxProgress::Downgraded(..) => {
-                panic!("we don't expect downgrade before receving all data")
+                panic!("we don't expect downgrade before receiving all data")
             },
             RammuxProgress::Empty => {},
         }

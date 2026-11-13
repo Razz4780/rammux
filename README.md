@@ -34,6 +34,74 @@ These multiplexers tune the windows at the receiver. rammux fixes the issue by i
 
 The crate is transport-agnostic. If the type implements async reads and writes, it can carry rammux.
 
+## Quick start
+
+```toml
+[dependencies]
+rammux = "1"
+bytes = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["full"] }
+```
+
+Two peers over an in-memory transport: the server echoes every stream, the client sends `hello` and reads it back.
+
+```rust
+use bytes::Bytes;
+use futures::{SinkExt, StreamExt};
+use rammux::{
+    config::{RammuxConfig, RammuxRole},
+    connection::{RammuxConnection, RammuxProgress},
+};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Any reliable byte stream can be the transport, for example a `TcpStream`.
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    // The peers take opposite roles, and their configs must be compatible. The defaults are.
+    let mut client = RammuxConnection::new(RammuxRole::Client, client_io, RammuxConfig::new())?;
+    let mut server = RammuxConnection::new(RammuxRole::Server, server_io, RammuxConfig::new())?;
+
+    // The server echoes every stream, until the client ends the session.
+    let server = tokio::spawn(async move {
+        loop {
+            match server.progress().await? {
+                RammuxProgress::Inbound(stream) => {
+                    let (sink, stream) = stream.into_split();
+                    tokio::spawn(stream.map(Ok).forward(sink));
+                },
+                // Completes the downgrade, and returns the transport.
+                RammuxProgress::Downgraded(downgraded) => break downgraded.await,
+                RammuxProgress::Empty => {},
+            }
+        }
+    });
+
+    // A stream is a `Sink` and a `Stream` of `Bytes`. It can move to another task.
+    let mut stream = client
+        .try_start_outbound()?
+        .expect("the stream limit is not reached");
+    let mut echo = tokio::spawn(async move {
+        stream.send(Bytes::from_static(b"hello")).await?;
+        Ok::<_, std::io::Error>(stream.next().await)
+    });
+
+    // Nothing runs in the background: streams make progress only while the connection is polled.
+    let reply = loop {
+        tokio::select! {
+            reply = &mut echo => break reply??,
+            progress = client.progress() => { progress?; },
+        }
+    };
+    assert_eq!(reply.as_deref(), Some(&b"hello"[..]));
+
+    // End the session, and take the transports back.
+    let _client_io = client.downgrade()?.await?;
+    let _server_io = server.await??;
+    Ok(())
+}
+```
+
 ## Mental model
 
 This crate does not spawn background tasks. Your application keeps the connection
@@ -113,4 +181,5 @@ Usage examples live in the [examples directory](https://github.com/Razz4780/ramm
 
 See [PROTOCOL.md](PROTOCOL.md) for the current on-wire format.
 
-This crate does not promise backwards compatibility across major versions.
+This crate does not promise backwards compatibility across major versions:
+peers must run the same major version. See [CHANGELOG.md](CHANGELOG.md) for what changed.

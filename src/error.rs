@@ -1,4 +1,4 @@
-//! rammux errors types.
+//! rammux error types.
 
 use std::io;
 
