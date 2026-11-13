@@ -15,7 +15,6 @@ include = [
     "/src",
     "/examples",
     "/README.md",
-    "/CHANGELOG.md",
     "/PROTOCOL.md",
     "/TRANSIT_CONTROL.md",
     "/LICENSE",

@@ -20,7 +20,9 @@ pub struct InboundTraffic {
     state: InboundState,
     /// Bytes received and not credited back.
     ///
-    /// Never larger than the same counter of the sender, see `TRANSIT_CONTROL.md`.
+    /// Never larger than the same counter of the sender: bytes in transit count at the sender only,
+    /// credit is subtracted here before it reaches the sender, and `FIN_READ` zeroes this counter first.
+    /// So a sender that stays within the pool by its own count never overdraws it by ours.
     window: Window,
     /// Bytes read by the application and not credited back yet. Never more than the bytes in [`Self::window`].
     credit: u64,

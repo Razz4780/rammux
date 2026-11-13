@@ -35,39 +35,27 @@ mod wire_test;
 /// How many inbound frames are processed in a row before outbound frames get a turn.
 const INBOUND_BATCH: usize = 16;
 
-/// State machine of a single rammux connection.
+/// One side of a rammux connection. It owns the transport, and runs the protocol on it.
 ///
 /// # Polling
 ///
-/// This state machine does not run anything in the background on its own.
-/// Your code must keep polling [`RammuxConnection::progress`] or [`RammuxConnection::poll_progress`].
-/// While the connection is being polled, it will:
+/// The connection does nothing on its own. Your code has to keep calling [`progress`](Self::progress)
+/// or [`poll_progress`](Self::poll_progress). While it does, the connection moves the data of all streams,
+/// and reports what happens as [`RammuxProgress`]: a stream that the peer started, or the end of the session.
 ///
-/// 1. read and decode inbound frames,
-/// 2. encode and flush outbound frames from active streams,
-/// 3. surface newly accepted inbound streams as
-///    [`RammuxProgress::Inbound`], and
-/// 4. surface remotely initiated downgrade handshake as
-///    [`RammuxProgress::Downgraded`].
+/// If the connection is not polled, its streams stall, and streams that are closed keep their place
+/// in the stream limits.
 ///
-/// If the connection stops being polled, stream IO stalls, flow-control updates
-/// stop, and closed stream IDs are not reclaimed.
+/// # Ending the session
 ///
-/// # Downgrade
-///
-/// To stop using rammux and recover the wrapped transport, call
-/// [`RammuxConnection::downgrade`] and await the returned [`Downgraded`].
-/// That future sends the final `TERM` frame, waits for the peer's `TERM`,
-/// and yields a clean transport with no unread rammux bytes left in it.
-///
-/// Note that the other side might start the downgrade first.
-/// In this case, [`RammuxConnection::progress`]/[`RammuxConnection::poll_progress`]
-/// will yield [`RammuxProgress::Downgraded`], and [`RammuxConnection`] will no longer be usable.
+/// [`downgrade`](Self::downgrade) ends the session and gives the transport back, through the [`Downgraded`]
+/// future. The peer may do it first: [`progress`](Self::progress) then returns
+/// [`RammuxProgress::Downgraded`], and the connection cannot be used any more.
 ///
 /// # Drop
 ///
-/// Dropping this struct while the rammux connection is open will abruptly close the connection and all rammux streams.
-/// Proper rammux shutdown requires that [`Downgraded`] is polled to completion.
+/// Dropping the connection ends all of its streams at once, and the peer is not told.
+/// Use [`downgrade`](Self::downgrade) for an orderly end.
 pub struct RammuxConnection<IO> {
     state: ConnState<IO>,
     role: RammuxRole,
@@ -134,9 +122,9 @@ where
         progress.map(Ok)
     }
 
-    /// Makes progress in this connection.
+    /// Drives the connection, and returns when there is something to report: see [`RammuxProgress`].
     ///
-    /// See [`RammuxProgress`] doc for more info.
+    /// An error is final. The connection cannot be used after it, and all of its streams end.
     pub fn poll_progress(
         &mut self,
         cx: &mut Context<'_>,
@@ -224,32 +212,33 @@ impl<IO> fmt::Debug for RammuxProgress<IO> {
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct RammuxStats {
-    /// Count of currently active inbound streams.
+    /// How many streams started by the peer are open.
     pub inbound_streams: u32,
-    /// Count of currently active outbound streams.
+    /// How many streams started by this side are open.
     pub outbound_streams: u32,
-    /// Smoothed round trip time, measured with `PING`/`PONG` exchanges.
+    /// Smoothed round trip time of the connection, measured with `PING`s.
     ///
-    /// It includes the queues on the path in both directions, and the delay in the peer's muxer.
-    /// Empty if no `PONG` has been received yet.
+    /// It includes the time that data waits in queues on the way, in both directions.
+    /// [`None`] until the first measurement.
     pub srtt: Option<Duration>,
-    /// Bytes of the peer's receive pool used by our outbound data.
+    /// Bytes of the peer's receive pool that our streams use.
     ///
-    /// The sum over the streams of the bytes sent and not credited back, beyond the base window of each stream.
-    /// It never exceeds the configured [`remote_recv_pool`](crate::config::RammuxConfig::remote_recv_pool).
+    /// At most [`remote_recv_pool`](crate::config::RammuxConfig::remote_recv_pool).
     pub pool_tx_used: u64,
-    /// Bytes of our receive pool used by the inbound data of the peer.
+    /// Bytes of our receive pool that the peer's streams use.
     ///
-    /// The sum over the streams of the bytes received and not credited back, beyond the base window of each stream.
-    /// It never exceeds the configured [`local_recv_pool`](crate::config::RammuxConfig::local_recv_pool):
-    /// a peer that would make it do so violates the protocol, and the connection fails.
+    /// At most [`local_recv_pool`](crate::config::RammuxConfig::local_recv_pool).
     pub pool_rx_used: u64,
-    /// Count of streams waiting for their turn to use the shared pool.
-    pub turn_queue_len: u32,
-    /// Bytes of the pool that our outbound streams hold as an advance: sent before the peer's reader proved to read.
+    /// How many of our streams wait for their turn to use the peer's pool.
     ///
-    /// Zero unless the advance is on, and at most [`advance_budget`](crate::config::RammuxConfig::advance_budget)
-    /// of the pool. A value that stays high means that some readers of the peer stalled.
+    /// Streams wait when they have more to send than the pool has room for.
+    pub turn_queue_len: u32,
+    /// Bytes of the peer's pool that our streams hold as an advance, see
+    /// [`advance_grant`](crate::config::RammuxConfig::advance_grant).
+    ///
+    /// An advance is paid back as the peer's application reads. A value that stays high means that
+    /// some streams are not being read. At most
+    /// [`advance_budget`](crate::config::RammuxConfig::advance_budget) of the pool.
     pub advance_held: u64,
 }
 
