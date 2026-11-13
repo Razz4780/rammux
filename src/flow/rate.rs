@@ -12,6 +12,12 @@ use crate::flow::ALLOWANCE_RTTS;
 /// and the sum of credit over the last `tau` seconds is `r * tau`: the sum is an exponentially
 /// weighted window. Credit that is late, or bunched, is not lost: it only moves the estimate
 /// for a while. Every credit counts, and the decay never stops.
+///
+/// Two things that look like improvements, and are not:
+/// - A max filter over the rate (as in BBR) turns every bunch of credit into an overestimate.
+///   A sum of bytes has the right mean for any pattern of arrival.
+/// - Freezing the estimate while the application pauses would send an old allowance into a path
+///   that may have changed. A stream that pauses starts over, as TCP does after idle.
 #[derive(Debug, Clone, Copy)]
 pub struct RateEstimate {
     rate: f64,

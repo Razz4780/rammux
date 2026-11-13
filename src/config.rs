@@ -10,9 +10,8 @@ use thiserror::Error;
 
 /// Role in a rammux connection.
 ///
-/// The only difference between the roles in a rammux connection
-/// is the pool of [`StreamId`](crate::StreamId)s
-/// that can be used when starting a new stream.
+/// The two peers of a connection take opposite roles. The role only decides which
+/// [`StreamId`](crate::StreamId)s a peer gives to the streams it starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RammuxRole {
     /// Can initiate streams with even IDs.
@@ -32,155 +31,115 @@ impl fmt::Display for RammuxRole {
 
 /// Configuration for a [`RammuxConnection`](crate::connection::RammuxConnection).
 ///
-/// rammux does not define an in-band handshake for transport parameters.
-/// Before running a rammux connection, the application must ensure that both sides use a compatible config.
-/// Settings that have to be negotiated beforehand:
-/// - [`RammuxConfig::frame_limit`]
-/// - [`RammuxConfig::max_outbound_streams`]
-/// - [`RammuxConfig::max_inbound_streams`]
-/// - [`RammuxConfig::remote_recv_window`]
-/// - [`RammuxConfig::local_recv_window`]
-/// - [`RammuxConfig::remote_recv_pool`]
-/// - [`RammuxConfig::local_recv_pool`]
+/// [`RammuxConfig::new`] returns the defaults. The fields are public: change the ones you need.
+///
+/// # Settings that the peers have to agree on
+///
+/// rammux has no handshake, so each peer must know the settings of the other before the connection starts.
+/// A connection whose peers do not agree fails, or loses throughput.
+///
+/// | This side | The peer |
+/// | --- | --- |
+/// | [`frame_limit`](Self::frame_limit) | the same `frame_limit` |
+/// | [`max_outbound_streams`](Self::max_outbound_streams) | at most its `max_inbound_streams` |
+/// | [`max_inbound_streams`](Self::max_inbound_streams) | at least its `max_outbound_streams` |
+/// | [`local_recv_window`](Self::local_recv_window) | its `remote_recv_window` |
+/// | [`remote_recv_window`](Self::remote_recv_window) | its `local_recv_window` |
+/// | [`local_recv_pool`](Self::local_recv_pool) | its `remote_recv_pool` |
+/// | [`remote_recv_pool`](Self::remote_recv_pool) | its `local_recv_pool` |
+///
+/// Two default configs match each other. All other settings are local: each side chooses them freely.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct RammuxConfig {
-    /// Limit for the length of data that can be sent in a single `DATA` frame.
+    /// The most data that is sent in one frame, in bytes. Larger writes are split.
     ///
-    /// # Negotiation
-    ///
-    /// This limit applies to both sides of the connection, has to be negotiated beforehand,
-    /// and must match on both sides.
+    /// Default: 16 KiB. Must be the same on both sides.
     pub frame_limit: NonZeroU16,
-    /// How many concurrent inbound (initiated by the remote side of the connection) streams we allow.
+    /// How many streams started by the peer can be open at a time.
     ///
-    /// # Negotiation
+    /// The connection fails if the peer starts more.
     ///
-    /// This limit has to be negotiated beforehand and
-    /// must not be smaller than the peer's [`RammuxConfig::max_outbound_streams`].
+    /// Default: 128. At most [`MAX_STREAMS_PER_SIDE`], and not less than the peer's
+    /// [`max_outbound_streams`](Self::max_outbound_streams).
     pub max_inbound_streams: u32,
-    /// How many concurrent outbound (initiated by the local side of the connection) streams we allow.
+    /// How many streams started by this side can be open at a time.
     ///
-    /// # Negotiation
+    /// At the limit, [`try_start_outbound`](crate::connection::RammuxConnection::try_start_outbound)
+    /// returns [`None`] until a stream is closed by both sides.
     ///
-    /// This limit has to be negotiated beforehand and
-    /// not exceed the peer's [`RammuxConfig::max_inbound_streams`].
+    /// Default: 128. At most [`MAX_STREAMS_PER_SIDE`], and not more than the peer's
+    /// [`max_inbound_streams`](Self::max_inbound_streams).
     pub max_outbound_streams: u32,
-    /// Base receive window of every stream, `B` in `TRANSIT_CONTROL.md`.
+    /// Receive window of every stream, in bytes.
     ///
-    /// Every stream can have this many bytes of its inbound data unread by the application,
-    /// no matter what the other streams do. It is fixed for the life of the connection,
-    /// the receiver does not tune it. On top of it, streams share [`Self::local_recv_pool`].
+    /// This much data of a stream can wait for the application to read it, whatever the other streams do.
+    /// Streams that need more share [`local_recv_pool`](Self::local_recv_pool). The memory that the connection
+    /// uses for received data is at most `streams * local_recv_window + local_recv_pool`.
     ///
-    /// # Negotiation
-    ///
-    /// This value has to be negotiated beforehand and
-    /// must match the peer's [`RammuxConfig::remote_recv_window`].
+    /// Default: 64 KiB. Must be the peer's [`remote_recv_window`](Self::remote_recv_window).
     pub local_recv_window: NonZeroU32,
-    /// Base receive window the peer grants to every stream.
+    /// The peer's [`local_recv_window`](Self::local_recv_window).
     ///
-    /// # Negotiation
-    ///
-    /// This value has to be negotiated beforehand and
-    /// must match the peer's [`RammuxConfig::local_recv_window`].
+    /// Default: 64 KiB.
     pub remote_recv_window: NonZeroU32,
-    /// Size of the pool of receive window shared by all inbound streams.
+    /// Receive memory that all streams share on top of their windows, in bytes.
     ///
-    /// The unread inbound data of all streams can exceed their base windows
-    /// by this many bytes at most. The memory used for inbound data is therefore at most
-    /// `streams * local_recv_window + local_recv_pool`.
+    /// The pool is what lets busy streams go fast, and it is what limits the queue that the connection builds.
+    /// A connection carries at most about `(streams * window + pool) / round trip time`, and delays an interactive
+    /// stream by up to `(streams * window + pool) / bandwidth`. A pool of about the bandwidth times the round
+    /// trip time is enough for full speed. Any size works, 0 included.
     ///
-    /// The pool is the responsibility of the user, rammux uses the configured value as it is.
-    /// Any size works, 0 included (streams run on their base windows). A pool or a window smaller than
-    /// [`Self::frame_limit`] is used with smaller frames.
-    /// The pool bounds the queue that the connection can build on the path, at about
-    /// `(streams * window + pool) / bandwidth`.
-    ///
-    /// # Negotiation
-    ///
-    /// This value has to be negotiated beforehand and
-    /// must match the peer's [`RammuxConfig::remote_recv_pool`].
+    /// Default: 4 MiB. Must be the peer's [`remote_recv_pool`](Self::remote_recv_pool).
     pub local_recv_pool: u32,
-    /// Size of the pool of receive window shared by the inbound streams of the peer.
+    /// The peer's [`local_recv_pool`](Self::local_recv_pool).
     ///
-    /// # Negotiation
-    ///
-    /// This value has to be negotiated beforehand and
-    /// must match the peer's [`RammuxConfig::local_recv_pool`].
+    /// Default: 4 MiB.
     pub remote_recv_pool: u32,
-    /// Grant of the advance, `g`: the fraction of [`Self::remote_recv_pool`] that one stream may borrow
-    /// before its reader has proven anything. `0 <= g <= G`, see [`Self::advance_budget`].
+    /// How much of the peer's pool a new or idle stream may use at once, as a fraction of
+    /// [`remote_recv_pool`](Self::remote_recv_pool).
     ///
-    /// A stream that has been idle (almost nothing in flight) and starts sending may draw up to
-    /// `floor(g * remote_recv_pool)` bytes beyond what its reader's recent credit justifies, and repays them from
-    /// the credit that comes back. A burst of up to the base window plus `g` leaves in a single flight (while the budget and the pool have room): a new stream, or one
-    /// that paused for about a loop, would otherwise start from its base window and wait a loop for each doubling.
-    /// With `0.0` there is no advance, and the sender follows only the proven rate.
-    /// The default is `0.25`: with the default 4 MiB pool, 1 MiB.
+    /// A stream normally earns its part of the pool: it starts with the peer's window, and may send more as
+    /// the peer's application proves to read, about twice as much every round trip. The advance lets a stream
+    /// that starts, or resumes after a pause, send a burst of the window plus this grant right away.
     ///
-    /// The cost is shared with [`Self::advance_budget`]. A larger grant means a bigger burst for the idle stream,
-    /// and more bytes that a reader which never reads pins until it reads or closes.
+    /// A larger grant means faster bursts, and more that a stream whose reader never reads can hold on to.
+    /// See [`advance_budget`](Self::advance_budget) for the limit on that.
     ///
-    /// See "The advance" in `TRANSIT_CONTROL.md`.
-    ///
-    /// # Negotiation
-    ///
-    /// This value is local to the sender and does not have to be negotiated.
+    /// Default: 0.25. From 0 to `advance_budget`. With 0, there is no advance. This setting is local.
     pub advance_grant: f32,
-    /// Budget of the advance, `G`: the fraction of [`Self::remote_recv_pool`] that all streams of the
-    /// connection may hold as advance together. `g <= G <= 1`, see [`Self::advance_grant`].
+    /// How much of the peer's pool all streams together may hold as an advance, as a fraction of
+    /// [`remote_recv_pool`](Self::remote_recv_pool).
     ///
-    /// The budget bounds what readers that never read can pin, on top of their base windows: at most
-    /// `floor(G * remote_recv_pool)` bytes in total, however many streams there are. Once the budget is
-    /// spent, streams follow the proven rate only, as without the advance. With `0.0` there is no advance.
-    /// The default is `0.25`: with the default 4 MiB pool, 1 MiB. To turn the advance off, set both this and
-    /// [`Self::advance_grant`] to `0.0`.
+    /// This is the most that streams whose readers never read can take away from the others, on top of their
+    /// windows. Once it is used up, new streams start without an advance.
     ///
-    /// The budget has to be at least the grant. With a larger grant, a single stream would draw the budget again
-    /// every time it repaid some of it, and a slow reader would hold far more than its read rate justifies.
-    ///
-    /// # Negotiation
-    ///
-    /// This value is local to the sender and does not have to be negotiated.
+    /// Default: 0.25. From [`advance_grant`](Self::advance_grant) to 1. This setting is local.
     pub advance_budget: f32,
-    /// A `PING` is sent when this much `DATA` was written since the last one.
+    /// A `PING` is sent after this many bytes of data.
     ///
-    /// The latest `PING` read is answered with a `PONG`, which gives the peer a round trip time sample.
-    /// Several `PING`s can be in flight.
+    /// The answers measure the round trip time, which the flow control needs while data flows.
     ///
-    /// This value is a local knob and does not have to be negotiated.
+    /// Default: 32 KiB. This setting is local.
     pub ping_bytes: NonZeroU32,
-    /// A `PING` is sent when this much time passed since the last one, no matter how much data was written.
+    /// A `PING` is sent at least this often, which keeps an idle connection alive.
     ///
-    /// This keeps an idle connection alive (see [`RammuxConfig::inbound_frame_timeout`]),
-    /// so it must be shorter than the timeout.
-    ///
-    /// This value is a local knob and does not have to be negotiated.
+    /// Default: 5 s. Not zero, and shorter than [`inbound_frame_timeout`](Self::inbound_frame_timeout).
+    /// This setting is local.
     pub ping_interval: Duration,
-    /// Max delay between receiving inbound frames, can be used to detect dead peers.
+    /// The connection fails when nothing arrives from the peer for this long.
     ///
-    /// This is safe to use even with periods of no traffic,
-    /// as rammux expects responses to `PING` frames sent on interval.
+    /// The peer answers `PING`s, so a connection that is idle and healthy does not time out.
     ///
-    /// This value is a local knob and does not have to be negotiated.
+    /// Default: 10 s. This setting is local.
     pub inbound_frame_timeout: Duration,
 }
 
 impl RammuxConfig {
-    /// Creates a new config for the given [`RammuxRole`].
+    /// Creates a config with the default settings, which the docs of the fields list.
     ///
-    /// Note that the obtained config will use default values for all settings.
-    /// You will need to adjust settings that have to be negotiated with the peer.
-    ///
-    /// Default values:
-    /// 1. [`Self::frame_limit`] - 16 KiB
-    /// 2. [`Self::max_inbound_streams`] and [`Self::max_outbound_streams`] - 128
-    /// 3. [`Self::local_recv_window`] and [`Self::remote_recv_window`] - 64 KiB
-    /// 4. [`Self::ping_bytes`] - 32 KiB
-    /// 5. [`Self::ping_interval`] - 5s
-    /// 6. [`Self::inbound_frame_timeout`] - 10s
-    /// 7. [`Self::local_recv_pool`] and [`Self::remote_recv_pool`] - 4 MiB
-    /// 8. [`Self::advance_grant`] and [`Self::advance_budget`] - 0.25 each (1 MiB of the default pool); 0 turns the advance off
+    /// Two default configs match each other. If you change a setting that the peers have to agree on,
+    /// change it on both sides.
     pub const fn new() -> Self {
         Self {
             frame_limit: NonZeroU16::new(16 * 1024).unwrap(),

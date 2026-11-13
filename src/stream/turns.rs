@@ -13,6 +13,10 @@ use crate::{
 /// so free room never lets a stream skip the queue. A stream leaves the queue when it borrowed
 /// (and joins again at the back if it has more to send), when it stops needing the pool, and when it closes.
 ///
+/// A turn carries no byte count. The allowance of a stream keeps decaying while it waits, so the stream
+/// works out the amount when its turn comes. A semaphore that fixed the amount at the time of the request
+/// could grant a stalled stream more than its allowance, and that stream would hold up the queue.
+///
 /// The queue is intrusive: a stream is linked through the node in its [`StreamShared`],
 /// so joining and leaving are O(1) and never allocate.
 #[derive(Default)]

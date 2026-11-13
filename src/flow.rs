@@ -17,6 +17,11 @@ pub use rate::RateEstimate;
 mod rate;
 
 /// `k`: an allowance covers this many loops (smoothed round trip times) of the rate estimate.
+///
+/// The estimate averages over one loop and the allowance covers two, so the window of a stream whose
+/// reader keeps up about doubles per loop, and its steady allowance is about twice what it has in flight.
+/// Averaging over the two loops themselves would read simpler, but a new stream would then grow only
+/// about 1.65 times per loop.
 pub const ALLOWANCE_RTTS: f64 = 2.0;
 
 /// Bytes of credit at which the receiver returns credit to the sender, unless the base window is small.
@@ -253,7 +258,8 @@ impl Srtt {
     /// Folds a sample into the smoothed value.
     ///
     /// The samples include our own queue and the peer's queue, and the delay of the peer's muxer.
-    /// That is intended, see `TRANSIT_CONTROL.md`.
+    /// That is intended: the allowance has to cover the loop that credit actually takes. It also means
+    /// that the allowance does not limit the queue. The pool does.
     pub fn observe(&mut self, rtt: Duration) {
         let srtt = match self.0 {
             None => rtt,

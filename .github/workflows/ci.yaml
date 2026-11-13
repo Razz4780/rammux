@@ -19,6 +19,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep in sync with `rust-version` in Cargo.toml.
+  MSRV: "1.89.0"
+
 jobs:
   basic_checks:
     runs-on: ubuntu-24.04
@@ -53,3 +61,78 @@ jobs:
           cargo run ${{ matrix.profile }} --example downgrade
           cargo run ${{ matrix.profile }} --example flow_control
           cargo run ${{ matrix.profile }} --example negotiation
+
+  docs:
+    runs-on: ubuntu-24.04
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the docs
+        run: cargo doc --no-deps
+
+  # The crate builds and passes its tests with the oldest compiler it claims to support.
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test
+
+  # The crate builds and passes its tests with the oldest dependencies that Cargo.toml allows.
+  minimal_versions:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Select the minimal versions of direct dependencies
+        run: cargo +nightly update -Z direct-minimal-versions
+
+      - name: Run tests
+        run: cargo +stable test --locked
+
+  # Miri checks the modules that use unsafe code.
+  miri:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run the tests of the unsafe modules
+        run: "cargo miri test --lib -- buffer:: pin_list::"
+
+  # The crate that would be published builds on its own.
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Package and verify
+        run: cargo package

@@ -4,7 +4,7 @@ use crate::config::RammuxRole;
 
 /// 16-bit ID of a rammux stream.
 ///
-/// Each active rammux stream has an ID uniquely identifies that stream
+/// Each active rammux stream has an ID that uniquely identifies that stream
 /// relative to all other active streams. Freed IDs are reused.
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StreamId(u16);

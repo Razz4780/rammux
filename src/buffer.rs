@@ -71,7 +71,10 @@ impl Data {
     #[cfg(test)]
     pub fn copy_from_slice(slice: &[u8]) -> Self {
         let mut buffer = Buffer::with_capacity(slice.len());
-        buffer.as_mut_slice().write_copy_of_slice(slice);
+        // `MaybeUninit::write_copy_of_slice` is newer than our MSRV.
+        for (slot, byte) in buffer.as_mut_slice().iter_mut().zip(slice) {
+            slot.write(*byte);
+        }
         // SAFETY: the data was just initialized.
         unsafe { buffer.assume_init() }
     }
@@ -231,12 +234,11 @@ mod test {
         let mut list = DataList::default();
 
         for chunk in chunks {
-            let mut buffer = Buffer::with_capacity(chunk.len());
-            let storage = buffer.as_mut_slice();
-            assert_eq!(storage.len(), chunk.len());
-            storage.write_copy_of_slice(chunk);
-            // SAFETY: the data was just initialized.
-            let data = unsafe { buffer.assume_init() };
+            assert_eq!(
+                Buffer::with_capacity(chunk.len()).as_slice().len(),
+                chunk.len()
+            );
+            let data = Data::copy_from_slice(chunk);
             assert_eq!(data.as_ref(), chunk);
             list.push_back(data);
         }

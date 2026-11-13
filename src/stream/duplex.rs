@@ -1,5 +1,5 @@
 use std::{
-    io,
+    fmt, io,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -47,6 +47,14 @@ impl RammuxDuplex {
     /// Splits this stream into independent [`Sink`] and [`Stream`] handles.
     pub fn into_split(self) -> (RammuxSink, RammuxStream) {
         (self.sink, self.stream)
+    }
+}
+
+impl fmt::Debug for RammuxDuplex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RammuxDuplex")
+            .field("id", &self.id())
+            .finish_non_exhaustive()
     }
 }
 
@@ -99,6 +107,15 @@ impl RammuxSink {
     /// Returns the ID of this stream.
     pub fn id(&self) -> StreamId {
         self.id
+    }
+}
+
+impl fmt::Debug for RammuxSink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RammuxSink")
+            .field("id", &self.id)
+            .field("closed", &self.shared.is_none())
+            .finish_non_exhaustive()
     }
 }
 
@@ -175,6 +192,15 @@ impl RammuxStream {
     /// Returns the ID of this stream.
     pub fn id(&self) -> StreamId {
         self.id
+    }
+}
+
+impl fmt::Debug for RammuxStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RammuxStream")
+            .field("id", &self.id)
+            .field("closed", &self.shared.is_none())
+            .finish_non_exhaustive()
     }
 }
 
