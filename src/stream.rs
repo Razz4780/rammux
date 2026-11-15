@@ -20,6 +20,7 @@ pub use duplex::{RammuxDuplex, RammuxSink, RammuxStream};
 #[cfg(test)]
 mod accounting_test;
 mod conn_flow;
+pub(crate) mod credit;
 mod duplex;
 pub(crate) mod handle;
 mod inbound;

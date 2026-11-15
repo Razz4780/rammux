@@ -6,8 +6,13 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::{SinkExt, StreamExt};
-use tokio::io::{AsyncRead, AsyncWrite};
+use std::pin::Pin;
+
+use futures::{FutureExt, SinkExt, StreamExt};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    time::{Instant, Sleep},
+};
 
 use crate::{
     config::{RammuxConfig, RammuxRole},
@@ -36,6 +41,8 @@ pub struct Active<IO> {
     codec: RammuxCodec<IO>,
     streams: Streams,
     pings: Pings,
+    /// EXPERIMENT: fires when pending credit has to go out.
+    credit_sleep: Pin<Box<Sleep>>,
 }
 
 /// What an inbound frame did.
@@ -52,6 +59,7 @@ impl<IO> Active<IO> {
             codec: RammuxCodec::new(io, config.frame_limit, config.inbound_frame_timeout),
             pings: Pings::new(config.ping_interval, config.ping_bytes.get()),
             streams: Streams::new(role, config.clone()),
+            credit_sleep: Box::pin(tokio::time::sleep(std::time::Duration::ZERO)),
         }
     }
 
@@ -134,11 +142,21 @@ where
             // 4. stream data.
             // What goes first cannot wait behind what goes later,
             // but it rides along if the later frame is going out anyway.
-            let (pong, ping) = self.pings.take_frame_part(cx);
-            let stream = match self.streams.poll_update(cx) {
-                Poll::Ready(update) => Some(update.into()),
-                Poll::Pending => None,
-            };
+            let now = Instant::now();
+            let owes_pong = self.pings.owes_pong();
+            let flow = self.streams.flow_mut();
+            let srtt = flow.srtt.get();
+            flow.credit.on_poll(now, srtt);
+            if owes_pong && flow.credit.pong_riders() {
+                flow.credit.open_flush();
+            }
+            let stream: Option<crate::wire::codec::encoder::OutStream> =
+                match self.streams.poll_update(cx) {
+                    Poll::Ready(update) => Some(update.into()),
+                    Poll::Pending => None,
+                };
+            let credit_frame = stream.as_ref().is_some_and(|stream| stream.credit > 0);
+            let (pong, ping) = self.pings.take_frame_part(cx, now, srtt, credit_frame);
             let frame = OutFrame {
                 ping,
                 pong,
@@ -146,6 +164,14 @@ where
                 term: false,
             };
             if frame.is_empty() {
+                let credit = &mut self.streams.flow_mut().credit;
+                credit.close_flush();
+                if let Some(deadline) = credit.deadline {
+                    self.credit_sleep.as_mut().reset(deadline);
+                    if self.credit_sleep.poll_unpin(cx).is_ready() {
+                        continue;
+                    }
+                }
                 let _ = self.codec.poll_flush_unpin(cx)?;
                 return Poll::Pending;
             }

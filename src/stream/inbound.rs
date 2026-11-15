@@ -4,11 +4,17 @@ use std::task::{Poll, Waker};
 
 use futures::task::AtomicWaker;
 
+use tokio::time::Instant;
+
 use crate::{
     buffer::{Data, DataList},
     error::StreamError,
-    flow::{self, Pool, Window},
-    stream::{FinState, waker::WakerSlot},
+    flow::{self, Pool, RateEstimate, Window},
+    stream::{
+        ConnFlow, FinState, StreamRef,
+        credit::{CreditPolicy, EXPERIMENT},
+        waker::WakerSlot,
+    },
 };
 
 /// The receiving direction of a stream.
@@ -28,6 +34,14 @@ pub struct InboundTraffic {
     credit: u64,
     /// Credit is sent when this much accumulates.
     credit_threshold: u64,
+    /// EXPERIMENT: the connection is woken at this much credit.
+    wake_at: u64,
+    /// EXPERIMENT: the part of [`Self::credit`] that the connection side has seen.
+    seen: u64,
+    /// EXPERIMENT: what the application consumed, as a rate.
+    consumed: RateEstimate,
+    /// EXPERIMENT: the stream is in the list of waiters.
+    waiting: bool,
 }
 
 enum InboundState {
@@ -59,6 +73,13 @@ impl InboundTraffic {
             window: Window::new(base_window),
             credit: 0,
             credit_threshold: flow::credit_threshold(base_window),
+            wake_at: floor(
+                EXPERIMENT.get().policy != CreditPolicy::Fixed,
+                flow::credit_threshold(base_window),
+            ),
+            seen: 0,
+            consumed: RateEstimate::new(Instant::now()),
+            waiting: false,
         }
     }
 
@@ -104,7 +125,7 @@ impl InboundTraffic {
         };
 
         self.credit += data.as_ref().len() as u64;
-        if self.credit >= self.credit_threshold {
+        if self.credit >= self.wake_at {
             updates.wake();
         }
         Poll::Ready(Some(data))
@@ -131,14 +152,54 @@ impl InboundTraffic {
     /// Polls for what this direction sends next: credit, and whether it is `FIN_READ`.
     ///
     /// Returns [`Poll::Pending`] when there is nothing to send. Registering the waker is up to the caller.
-    pub fn poll_update(&mut self, pool: &mut Pool) -> Poll<(u32, bool)> {
+    pub fn poll_update(
+        &mut self,
+        flow: &mut ConnFlow,
+        me: &StreamRef,
+        now: Instant,
+    ) -> Poll<(u32, bool)> {
+        let pool = &mut flow.rx_pool;
         match &mut self.state {
             InboundState::Open { .. } | InboundState::HalfClosed { .. } => {
-                if self.credit < self.credit_threshold {
+                let srtt = flow.srtt.get();
+                let fresh = self.credit - self.seen;
+                self.seen = self.credit;
+                if fresh > 0
+                    && let Some(srtt) = srtt
+                {
+                    self.consumed
+                        .add_amount(fresh as f64, now, srtt.as_secs_f64());
+                }
+                let gate = &mut flow.credit;
+                if self.credit < floor(gate.riders(), self.credit_threshold) {
                     return Poll::Pending;
                 }
+                let due_at = match gate.policy {
+                    CreditPolicy::Proportional { div, .. } => {
+                        let volume = srtt.map_or(0.0, |srtt| {
+                            let srtt = srtt.as_secs_f64();
+                            self.consumed.value(now, srtt) * srtt
+                        });
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        self.credit_threshold.max((volume / div) as u64)
+                    },
+                    _ => self.credit_threshold,
+                };
+                let send = gate.flushing || (self.credit >= due_at && gate.request(now, srtt));
+                if !send {
+                    if !self.waiting {
+                        self.waiting = true;
+                        gate.wait(me);
+                    }
+                    if self.credit >= self.credit_threshold {
+                        gate.tail(now, srtt);
+                    }
+                    return Poll::Pending;
+                }
+                self.waiting = false;
                 let credit = u32::try_from(self.credit).unwrap_or(u32::MAX);
                 self.credit -= u64::from(credit);
+                self.seen = self.credit;
                 self.window
                     .set(pool, self.window.unacked() - u64::from(credit));
                 Poll::Ready((credit, false))
@@ -151,6 +212,7 @@ impl InboundTraffic {
                 fin_state.sent = true;
                 // The sender forgets the bytes in flight when it reads `FIN_READ`, and the rest of the data is discarded.
                 self.credit = 0;
+                self.seen = 0;
                 self.window.set(pool, 0);
                 Poll::Ready((0, true))
             },
@@ -231,6 +293,15 @@ impl InboundTraffic {
     #[cfg(test)]
     pub fn unacked(&self) -> u64 {
         self.window.unacked()
+    }
+}
+
+/// EXPERIMENT: the least credit that rides along with a flush.
+fn floor(riders: bool, threshold: u64) -> u64 {
+    if riders {
+        (threshold / 8).max(1)
+    } else {
+        threshold
     }
 }
 

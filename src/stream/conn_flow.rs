@@ -3,7 +3,7 @@
 use crate::{
     config::RammuxConfig,
     flow::{Advance, Pool, Srtt},
-    stream::{StreamRef, turns::Turns},
+    stream::{StreamRef, credit::CreditGate, turns::Turns},
 };
 
 /// The state that the streams of a connection share.
@@ -22,6 +22,8 @@ pub struct ConnFlow {
     pub turns: Turns,
     /// The unproven bytes that our outbound streams drew from [`Self::tx_pool`]. Zero until [`Self::with_advance`].
     pub advance: Advance,
+    /// EXPERIMENT: when credit is returned.
+    pub credit: CreditGate,
 }
 
 impl ConnFlow {
@@ -33,6 +35,7 @@ impl ConnFlow {
             tx_pool: Pool::new(tx_pool),
             turns: Turns::default(),
             advance: Advance::default(),
+            credit: CreditGate::new(),
         }
     }
 

@@ -41,7 +41,7 @@ impl RateEstimate {
         self.add_amount(f64::from(bytes), now, tau);
     }
 
-    fn add_amount(&mut self, bytes: f64, now: Instant, tau: f64) {
+    pub fn add_amount(&mut self, bytes: f64, now: Instant, tau: f64) {
         self.rate = self.value(now, tau) + bytes / tau;
         self.at = now;
     }

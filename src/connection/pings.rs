@@ -7,7 +7,7 @@ use std::{
 };
 
 use futures::FutureExt;
-use tokio::time::Sleep;
+use tokio::time::{Instant, Sleep};
 
 use crate::wire::header::Pong;
 
@@ -46,11 +46,21 @@ impl Pings {
     /// and whether it carries a `PING`.
     ///
     /// Taking a `PING` records that it is sent.
-    pub fn take_frame_part(&mut self, cx: &mut Context<'_>) -> (Option<Pong>, bool) {
+    pub fn take_frame_part(
+        &mut self,
+        cx: &mut Context<'_>,
+        now: Instant,
+        srtt: Option<Duration>,
+        credit_frame: bool,
+    ) -> (Option<Pong>, bool) {
         let pong = self.owed_pong.take();
-        let ping = self.schedule.poll_due(cx).is_ready();
+        let ping = self
+            .schedule
+            .poll_due_gapped(cx, now, srtt, credit_frame)
+            .is_ready();
         if ping {
             self.schedule.sent();
+            self.schedule.last = Some(now);
         }
         (pong, ping)
     }
@@ -58,6 +68,11 @@ impl Pings {
     /// Records that `DATA` is being sent.
     pub fn data_sent(&mut self, len: usize) {
         self.schedule.data_sent(len);
+    }
+
+    /// Returns whether we owe a `PONG`.
+    pub fn owes_pong(&self) -> bool {
+        self.owed_pong.is_some()
     }
 
     /// Returns the `PONG` we owe.
@@ -80,6 +95,9 @@ pub struct PingSchedule {
     ping_bytes: u32,
     /// Bytes of `DATA` written since the last `PING`.
     unpinged_bytes: u32,
+    /// EXPERIMENT: at most one `PING` per `srtt / 8`.
+    gapped: bool,
+    last: Option<Instant>,
 }
 
 impl PingSchedule {
@@ -90,6 +108,35 @@ impl PingSchedule {
             interval,
             ping_bytes,
             unpinged_bytes: 0,
+            gapped: crate::stream::credit::EXPERIMENT.get().new_pings,
+            last: None,
+        }
+    }
+
+    /// EXPERIMENT: like [`Self::poll_due`], with at most one `PING` per `srtt / 8`
+    /// and a `PING` on the frames that carry credit.
+    pub fn poll_due_gapped(
+        &mut self,
+        cx: &mut Context<'_>,
+        now: Instant,
+        srtt: Option<Duration>,
+        credit_frame: bool,
+    ) -> Poll<()> {
+        if !self.gapped {
+            return self.poll_due(cx);
+        }
+        if self.sleep.poll_unpin(cx).is_ready() {
+            return Poll::Ready(());
+        }
+        let wants = self.unpinged_bytes >= self.ping_bytes || credit_frame;
+        let gap = match (srtt, self.last) {
+            (Some(srtt), Some(last)) => now.saturating_duration_since(last) >= srtt / 8,
+            _ => true,
+        };
+        if wants && gap {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
         }
     }
 

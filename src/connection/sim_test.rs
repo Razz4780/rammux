@@ -47,6 +47,10 @@ struct DirState {
     /// Bytes waiting to be serialized: (finish, len).
     queue: VecDeque<(Instant, usize)>,
     reader: Option<Waker>,
+    /// EXPERIMENT: writes, and instants with at least one write.
+    writes: u64,
+    instants: u64,
+    last_write: Option<Instant>,
 }
 
 impl Dir {
@@ -103,6 +107,11 @@ impl AsyncWrite for End {
         let dir = &self.tx;
         let mut inner = dir.inner.lock().unwrap();
         let now = Instant::now();
+        inner.writes += 1;
+        if inner.last_write != Some(now) {
+            inner.instants += 1;
+            inner.last_write = Some(now);
+        }
         let start = inner.free_at.map_or(now, |free_at| free_at.max(now));
         let finish = start + Duration::from_secs_f64(buf.len() as f64 / dir.rate);
         inner.free_at = Some(finish);
@@ -191,6 +200,7 @@ struct Rig {
     open: mpsc::UnboundedSender<Open>,
     client_stats: Arc<Mutex<RammuxStats>>,
     forward: Arc<Dir>,
+    backward: Arc<Dir>,
     /// Bytes read by the server, per stream, in the order of opening.
     read: Vec<Arc<AtomicU64>>,
     server_streams: mpsc::UnboundedReceiver<RammuxDuplex>,
@@ -198,7 +208,7 @@ struct Rig {
 
 impl Rig {
     fn new(mbit: f64, rtt: Duration, config: RammuxConfig) -> Self {
-        let (client_io, server_io, forward, _backward) = link(mbit, rtt / 2);
+        let (client_io, server_io, forward, backward) = link(mbit, rtt / 2);
         let client = RammuxConnection::new(RammuxRole::Client, client_io, config.clone()).unwrap();
         let server = RammuxConnection::new(RammuxRole::Server, server_io, config).unwrap();
         let (open, open_rx) = mpsc::unbounded_channel();
@@ -219,6 +229,7 @@ impl Rig {
             open,
             client_stats,
             forward,
+            backward,
             read: Vec::new(),
             server_streams,
         }
@@ -639,5 +650,186 @@ async fn a_new_stream_starts_within_the_grant_with_the_advance() {
     assert!(per_loop[0] > grant as f64, "{per_loop:?}");
     for pair in per_loop.windows(2).take(3) {
         assert!(pair[1] >= 1.8 * pair[0], "{per_loop:?}");
+    }
+}
+
+// EXPERIMENT: how the credit policies compare. Run with
+// `cargo test --release --lib credit_experiment -- --ignored --nocapture`.
+mod credit_experiment {
+    use super::*;
+    use crate::stream::credit::{CreditPolicy, EXPERIMENT, Experiment};
+
+    impl Rig {
+        /// Writes and distinct write instants of the reverse direction.
+        fn reverse(&self) -> (u64, u64) {
+            let inner = self.backward.inner.lock().unwrap();
+            (inner.writes, inner.instants)
+        }
+
+        fn total(&self) -> u64 {
+            (0..self.read.len()).map(|i| self.bytes(i)).sum()
+        }
+    }
+
+    fn wan(pool: u32) -> RammuxConfig {
+        let mut config = big_pool_config();
+        config.local_recv_pool = pool;
+        config.remote_recv_pool = pool;
+        config
+    }
+
+    /// Rate in Mbit/s, reverse frames per second, reverse packets per second.
+    async fn steady(rig: &Rig, warm: Duration, window: Duration) -> (f64, f64, f64) {
+        tokio::time::sleep(warm).await;
+        let (bytes, (writes, instants)) = (rig.total(), rig.reverse());
+        tokio::time::sleep(window).await;
+        let secs = window.as_secs_f64();
+        let (w, i) = rig.reverse();
+        (
+            (rig.total() - bytes) as f64 * 8.0 / 1e6 / secs,
+            (w - writes) as f64 / secs,
+            (i - instants) as f64 / secs,
+        )
+    }
+
+    async fn bulk_wan(streams: usize, pool: u32) -> String {
+        let mut rig = Rig::new(300.0, Duration::from_millis(250), wan(pool));
+        let start = Instant::now();
+        for _ in 0..streams {
+            rig.bulk(None).await;
+        }
+        let mut ramp = Duration::ZERO;
+        if streams == 1 {
+            while rig.total() < 64 * 1024 * 1024 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            ramp = start.elapsed();
+        }
+        let (rate, frames, packets) =
+            steady(&rig, Duration::from_secs(15), Duration::from_secs(20)).await;
+        let srtt = rig.stats().srtt.unwrap();
+        format!(
+            "{rate:6.1} Mbit/s  {frames:7.1} frames/s  {packets:7.1} pkts/s  ({:5.1} pkts/srtt)  64MiB in {:5.0} ms",
+            packets * srtt.as_secs_f64(),
+            ramp.as_secs_f64() * 1e3
+        )
+    }
+
+    async fn burst(advance: bool, bytes: u64) -> String {
+        let config = if advance {
+            big_pool_config()
+        } else {
+            without_advance(big_pool_config())
+        };
+        let mut rig = Rig::new(300.0, Duration::from_millis(200), config);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let before = rig.reverse();
+        let took = rig.burst(bytes).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let after = rig.reverse();
+        format!(
+            "{:6.0} ms  {:4} frames {:4} pkts",
+            took.as_secs_f64() * 1e3,
+            after.0 - before.0,
+            after.1 - before.1
+        )
+    }
+
+    /// Streams limited by their base windows: no pool.
+    async fn windowed(streams: usize, mbit: f64, rtt: Duration) -> String {
+        let mut rig = Rig::new(mbit, rtt, wan(0));
+        for _ in 0..streams {
+            rig.bulk(None).await;
+        }
+        let (rate, frames, packets) =
+            steady(&rig, Duration::from_secs(2), Duration::from_secs(4)).await;
+        let srtt = rig.stats().srtt.unwrap();
+        format!(
+            "{rate:6.1} Mbit/s  {frames:7.1} frames/s  {packets:7.1} pkts/s  (srtt {:.2} ms)",
+            srtt.as_secs_f64() * 1e3
+        )
+    }
+
+    fn run<F: std::future::Future<Output = String>>(experiment: Experiment, f: F) -> String {
+        EXPERIMENT.set(experiment);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        runtime.block_on(f)
+    }
+
+    #[test]
+    #[ignore = "an experiment, prints a table"]
+    fn credit_experiment() {
+        let prop = |div| CreditPolicy::Proportional { div };
+        let policies = [
+            (
+                "today (32K steps, ping/32K)",
+                CreditPolicy::Fixed,
+                false,
+                false,
+            ),
+            ("32K steps, new pings", CreditPolicy::Fixed, true, false),
+            ("delay srtt/8", CreditPolicy::Delay, true, false),
+            ("gate b1", CreditPolicy::Gate { burst: 1 }, true, false),
+            ("gate b4", CreditPolicy::Gate { burst: 4 }, true, false),
+            (
+                "gate b4 + pong riders",
+                CreditPolicy::Gate { burst: 4 },
+                true,
+                true,
+            ),
+            ("prop V/8", prop(8.0), true, false),
+            ("prop V/8 + pong riders", prop(8.0), true, true),
+            ("prop V/16 + pong riders", prop(16.0), true, true),
+            ("prop V/4 + pong riders", prop(4.0), true, true),
+        ];
+        let only = std::env::var("SCENARIO").ok();
+        let wanted = |name: &str| only.as_deref().is_none_or(|only| name.contains(only));
+        type Scenario = (&'static str, fn(Experiment) -> String);
+        let scenarios: [Scenario; 8] = [
+            ("1 bulk, 300 Mbit/s, 250 ms, pool 16 MiB", |e| {
+                run(e, bulk_wan(1, 16 << 20))
+            }),
+            ("8 bulk, 300 Mbit/s, 250 ms, pool 16 MiB", |e| {
+                run(e, bulk_wan(8, 16 << 20))
+            }),
+            (
+                "1 bulk, 300 Mbit/s, 250 ms, pool 4 MiB (pool-limited)",
+                |e| run(e, bulk_wan(1, 4 << 20)),
+            ),
+            ("burst 8 MiB on an idle connection, 200 ms, advance", |e| {
+                run(e, burst(true, 8 << 20))
+            }),
+            (
+                "burst 8 MiB on an idle connection, 200 ms, no advance",
+                |e| run(e, burst(false, 8 << 20)),
+            ),
+            ("1 window-limited stream (no pool), 4 ms", |e| {
+                run(e, windowed(1, 10_000.0, Duration::from_millis(4)))
+            }),
+            ("1 window-limited stream (no pool), 50 ms", |e| {
+                run(e, windowed(1, 1000.0, Duration::from_millis(50)))
+            }),
+            ("32 window-limited streams (no pool), 50 ms", |e| {
+                run(e, windowed(32, 1000.0, Duration::from_millis(50)))
+            }),
+        ];
+        for (name, scenario) in scenarios {
+            if !wanted(name) {
+                continue;
+            }
+            println!("\n== {name}");
+            for (label, policy, new_pings, pong_riders) in policies {
+                let result = scenario(Experiment {
+                    policy,
+                    new_pings,
+                    pong_riders,
+                });
+                println!("{label:28} {result}");
+            }
+        }
     }
 }

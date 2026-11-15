@@ -50,11 +50,12 @@ impl Task<ConnFlow> for StreamUpdates {
         let mut state = this.stream.lock();
 
         // Credit and `FIN_READ` never wait for data, or for a turn.
-        let inbound = state.inbound.poll_update(&mut flow.rx_pool);
+        let now = Instant::now();
+        let inbound = state.inbound.poll_update(flow, &this.stream, now);
         let mut ctx = Ctx {
             flow,
             me: &this.stream,
-            now: Instant::now(),
+            now,
         };
         let outbound = state.outbound.poll_update(&mut ctx);
         if inbound.is_pending() && outbound.is_pending() {
