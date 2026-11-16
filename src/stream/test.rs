@@ -106,7 +106,8 @@ async fn rammux_duplex_drop_closes_both() {
         ControlFlags {
             fin_read: true,
             fin_write: false,
-            syn: true
+            syn: true,
+            abort: false,
         }
     );
     assert_eq!(fin_state, FinState::default());
@@ -116,7 +117,8 @@ async fn rammux_duplex_drop_closes_both() {
         ControlFlags {
             fin_read: false,
             fin_write: true,
-            syn: false
+            syn: false,
+            abort: false,
         }
     );
     assert_eq!(
@@ -142,7 +144,8 @@ async fn rammux_sink_drop_closes_writing() {
         ControlFlags {
             fin_read: false,
             fin_write: true,
-            syn: true
+            syn: true,
+            abort: false,
         }
     );
     assert_eq!(
@@ -165,7 +168,8 @@ async fn rammux_stream_drop_closes_reading() {
         ControlFlags {
             fin_read: true,
             fin_write: false,
-            syn: true
+            syn: true,
+            abort: false,
         }
     );
     assert_eq!(
@@ -181,6 +185,7 @@ const NO_FINS: ControlFlags = ControlFlags {
     syn: false,
     fin_read: false,
     fin_write: false,
+    abort: false,
 };
 const FIN_WRITE: ControlFlags = ControlFlags {
     fin_write: true,

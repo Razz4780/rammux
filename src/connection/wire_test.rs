@@ -866,6 +866,7 @@ async fn a_stream_announces_itself_once() {
         syn: true,
         fin_read: true,
         fin_write: false,
+        abort: false,
     };
     let fin_read = ControlFlags {
         fin_read: true,

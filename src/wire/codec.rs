@@ -548,6 +548,7 @@ mod tests {
                             syn: true,
                             fin_read: true,
                             fin_write: true,
+                            abort: true,
                         },
                         5,
                         b"eleven byte",
@@ -616,8 +617,9 @@ mod tests {
     }
 
     #[rstest]
-    #[case::reserved_bits(&[0x02, 0x10, 0, 1, 0, 1, b'a'])]
-    #[case::reserved_bit_0x0100(&[0x01, 0x10, 0, 1, 0, 1, b'a'])]
+    #[case::reserved_bits(&[0x04, 0x10, 0, 1, 0, 1, b'a'])]
+    #[case::reserved_bit_0x0200(&[0x02, 0x10, 0, 1, 0, 1, b'a'])]
+    #[case::abort_without_fin_write(&[0x01, 0x10, 0, 1, 0, 1, b'a'])]
     #[case::high_reserved_bits(&[0x80, 0x10, 0, 1, 0, 1, b'a'])]
     #[case::no_flags(&[0x00, 0x00])]
     #[case::term_and_ping(&[0x00, 0xA0, 0, 0, 0, 1])]

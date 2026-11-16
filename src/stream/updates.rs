@@ -63,6 +63,7 @@ impl Task<RxFlow> for CreditUpdates {
                 syn: std::mem::take(&mut state.syn_pending),
                 fin_read,
                 fin_write: false,
+                abort: false,
             },
         };
         let fin_state = state.fin_state();
@@ -138,6 +139,7 @@ impl Task<ConnFlow> for DataUpdates {
                 syn: std::mem::take(&mut state.syn_pending),
                 fin_read: false,
                 fin_write,
+                abort: false,
             },
         };
         let fin_state = state.fin_state();

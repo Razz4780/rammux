@@ -248,6 +248,7 @@ impl Peer {
                     syn: true,
                     fin_write: stream.peer_fin_write,
                     fin_read: false,
+                    abort: false,
                 };
                 self.streams.insert(id, stream);
                 Some(stream_frame(id, flags, 0, len))
@@ -332,6 +333,7 @@ fn wild_frame(rng: &mut Rng) -> Vec<u8> {
         syn: rng.below(4) == 0,
         fin_write: rng.below(6) == 0,
         fin_read: rng.below(6) == 0,
+        abort: false,
     };
     let credit = if rng.below(3) == 0 { rng.up_to(600) } else { 0 };
     // Sometimes above the frame limit.
