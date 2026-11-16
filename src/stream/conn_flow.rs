@@ -6,16 +6,14 @@ use crate::{
     stream::{StreamRef, turns::Turns},
 };
 
-/// The state that the streams of a connection share.
+/// The state that our outbound streams share: what the sending direction of every stream draws on.
 ///
-/// It is the strategy of the selector that polls the [`StreamUpdates`](super::updates::StreamUpdates),
+/// It is the strategy of the selector that polls the [`DataUpdates`](super::updates::DataUpdates),
 /// so a stream gets it when it is polled, and the connection gets it when it hands an inbound frame
 /// to a stream.
 pub struct ConnFlow {
     /// Smoothed round trip time of the connection.
     pub srtt: Srtt,
-    /// Our receive pool, which the inbound streams use.
-    pub rx_pool: Pool,
     /// The peer's receive pool, which our outbound streams use.
     pub tx_pool: Pool,
     /// Streams that wait for their turn to borrow from [`Self::tx_pool`].
@@ -25,11 +23,10 @@ pub struct ConnFlow {
 }
 
 impl ConnFlow {
-    /// Creates the state of a new connection, with the sizes of the receive pools.
-    pub fn new(rx_pool: u32, tx_pool: u32) -> Self {
+    /// Creates the state of a new connection, with the size of the peer's receive pool.
+    pub fn new(tx_pool: u32) -> Self {
         Self {
             srtt: Srtt::default(),
-            rx_pool: Pool::new(rx_pool),
             tx_pool: Pool::new(tx_pool),
             turns: Turns::default(),
             advance: Advance::default(),
@@ -50,6 +47,26 @@ impl ConnFlow {
     pub fn pass_turn(&mut self, stream: &StreamRef) {
         if self.turns.leave(stream) && self.tx_pool.has_room() {
             self.turns.wake_front();
+        }
+    }
+}
+
+/// The state that the streams share as receivers: what the receiving direction of every stream draws on.
+///
+/// It is the strategy of the selector that polls the [`CreditUpdates`](super::updates::CreditUpdates).
+pub struct RxFlow {
+    /// Smoothed round trip time of the connection.
+    pub srtt: Srtt,
+    /// Our receive pool, which the inbound streams use.
+    pub pool: Pool,
+}
+
+impl RxFlow {
+    /// Creates the state of a new connection, with the size of our receive pool.
+    pub fn new(pool: u32) -> Self {
+        Self {
+            srtt: Srtt::default(),
+            pool: Pool::new(pool),
         }
     }
 }

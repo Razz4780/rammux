@@ -9,12 +9,14 @@ use crate::{
     config::RammuxConfig,
     pin_list::{Linked, Node},
     stream::{
-        handle::StreamHandle, inbound::InboundTraffic, outbound::OutboundTraffic,
-        updates::StreamUpdates,
+        handle::StreamHandle,
+        inbound::InboundTraffic,
+        outbound::OutboundTraffic,
+        updates::{CreditUpdates, DataUpdates},
     },
 };
 
-pub(crate) use conn_flow::ConnFlow;
+pub(crate) use conn_flow::{ConnFlow, RxFlow};
 pub use duplex::{RammuxDuplex, RammuxSink, RammuxStream};
 
 #[cfg(test)]
@@ -33,23 +35,28 @@ pub(crate) mod updates;
 mod waker;
 
 /// Creates the state of a new stream, and the handles to it.
+///
+/// The first frame of an outbound stream carries `SYN`.
 pub(crate) fn new(
     id: StreamId,
     is_outbound: bool,
     config: &RammuxConfig,
-) -> (StreamHandle, StreamUpdates, RammuxDuplex) {
+) -> (StreamHandle, CreditUpdates, DataUpdates, RammuxDuplex) {
     let shared = Arc::new(StreamShared {
-        updates: AtomicWaker::new(),
+        credit_task: AtomicWaker::new(),
+        data_task: AtomicWaker::new(),
         turn: Node::new(),
         state: Mutex::new(StreamState {
             inbound: InboundTraffic::new(config.local_recv_window.get()),
             outbound: OutboundTraffic::new(config.frame_limit, config.remote_recv_window.get()),
+            syn_pending: is_outbound,
         }),
     });
 
     (
         StreamHandle(shared.clone()),
-        StreamUpdates::new(id, is_outbound, shared.clone()),
+        CreditUpdates::new(id, shared.clone()),
+        DataUpdates::new(id, shared.clone()),
         RammuxDuplex::new(id, shared),
     )
 }
@@ -62,15 +69,18 @@ pub(crate) type StreamRef = Arc<StreamShared>;
 /// State of a virtual stream, shared through an [`Arc`] by:
 /// - the application, which holds the [`RammuxSink`] and [`RammuxStream`] halves of a [`RammuxDuplex`],
 /// - the connection, which hands the parts of inbound frames to the [`StreamHandle`],
-/// - the [`StreamUpdates`] task, which the connection polls for what the stream has to send.
+/// - the [`CreditUpdates`] and [`DataUpdates`] tasks, which the connection polls for what the stream has to send.
 ///
 /// The two directions of a stream are independent state machines, [`InboundTraffic`] and
-/// [`OutboundTraffic`]. What all streams of a connection share is the [`ConnFlow`].
+/// [`OutboundTraffic`], and each has its own task. What the streams of a connection share
+/// is the [`RxFlow`] of the receiving directions and the [`ConnFlow`] of the sending ones.
 pub(crate) struct StreamShared {
-    /// Woken when the stream has something to send, see [`StreamUpdates`].
+    /// Woken when the receiving direction has something to send, see [`CreditUpdates`].
+    credit_task: AtomicWaker,
+    /// Woken when the sending direction has something to send, see [`DataUpdates`].
     ///
     /// It lives outside of [`Self::state`], so the turn queue can wake a stream without taking its lock.
-    updates: AtomicWaker,
+    data_task: AtomicWaker,
     /// Place of the stream in the turn queue, see [`turns::Turns`].
     turn: Node<StreamShared>,
     state: Mutex<StreamState>,
@@ -103,6 +113,10 @@ impl StreamShared {
 struct StreamState {
     inbound: InboundTraffic,
     outbound: OutboundTraffic,
+    /// Whether the stream still has to announce itself with `SYN`.
+    ///
+    /// The task that builds the first frame of the stream takes it, whichever direction that is.
+    syn_pending: bool,
 }
 
 impl StreamState {

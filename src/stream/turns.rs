@@ -49,10 +49,10 @@ impl Turns {
         self.queue.remove(stream)
     }
 
-    /// Wakes the stream that is first in line, if any.
+    /// Wakes the [`DataUpdates`](super::updates::DataUpdates) of the stream that is first in line, if any.
     pub fn wake_front(&self) {
         if let Some(front) = self.queue.front() {
-            front.updates.wake();
+            front.data_task.wake();
         }
     }
 

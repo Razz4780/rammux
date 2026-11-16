@@ -73,7 +73,9 @@ impl InboundTraffic {
     // The application side.
 
     /// Returns the next chunk of data for the application, or [`None`] at the end of the stream.
-    pub fn poll_read(&mut self, waker: &Waker, updates: &AtomicWaker) -> Poll<Option<Data>> {
+    ///
+    /// Wakes the `credit_task` of the stream when the read makes credit or `FIN_READ` due.
+    pub fn poll_read(&mut self, waker: &Waker, credit_task: &AtomicWaker) -> Poll<Option<Data>> {
         let data = match &mut self.state {
             InboundState::Open { ready_data, reader } => {
                 let Some(data) = ready_data.pop_front() else {
@@ -95,7 +97,7 @@ impl InboundTraffic {
                             received: true,
                         },
                     };
-                    updates.wake();
+                    credit_task.wake();
                 }
                 data
             },
@@ -105,13 +107,15 @@ impl InboundTraffic {
 
         self.credit += data.as_ref().len() as u64;
         if self.credit >= self.credit_threshold {
-            updates.wake();
+            credit_task.wake();
         }
         Poll::Ready(Some(data))
     }
 
     /// The application stops reading. `FIN_READ` follows, and the data that arrives is discarded.
-    pub fn close_reading(&mut self, updates: &AtomicWaker) {
+    ///
+    /// Wakes the `credit_task` of the stream, which sends `FIN_READ`.
+    pub fn close_reading(&mut self, credit_task: &AtomicWaker) {
         let received = match &self.state {
             InboundState::Open { .. } => false,
             InboundState::HalfClosed { .. } => true,
@@ -123,7 +127,7 @@ impl InboundTraffic {
                 received,
             },
         };
-        updates.wake();
+        credit_task.wake();
     }
 
     // The connection side.
@@ -195,7 +199,9 @@ impl InboundTraffic {
     }
 
     /// The peer stopped writing.
-    pub fn received_fin_write(&mut self, updates: &AtomicWaker) -> Result<(), StreamError> {
+    ///
+    /// Wakes the `credit_task` of the stream if `FIN_READ` is due now: nothing is left to read.
+    pub fn received_fin_write(&mut self, credit_task: &AtomicWaker) -> Result<(), StreamError> {
         match &mut self.state {
             InboundState::Open { ready_data, .. } if !ready_data.is_empty() => {
                 self.state = InboundState::HalfClosed {
@@ -205,7 +211,7 @@ impl InboundTraffic {
             },
 
             InboundState::Open { reader, .. } => {
-                updates.wake();
+                credit_task.wake();
                 reader.wake();
                 self.state = InboundState::Closed {
                     fin_state: FinState {

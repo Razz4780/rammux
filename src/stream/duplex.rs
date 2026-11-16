@@ -135,7 +135,7 @@ impl Sink<Bytes> for RammuxSink {
     fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
         let this = self.get_mut();
         let shared = this.shared.as_ref().ok_or(io::ErrorKind::BrokenPipe)?;
-        let result = shared.lock().outbound.write(item, &shared.updates);
+        let result = shared.lock().outbound.write(item, &shared.data_task);
         // Only a closed direction is forgotten. A write that came before the sink was ready is rejected,
         // and the stream stays: dropping the sink must still close it.
         if result
@@ -161,7 +161,7 @@ impl Sink<Bytes> for RammuxSink {
         };
         {
             let mut state = shared.lock();
-            state.outbound.close_writing(&shared.updates);
+            state.outbound.close_writing(&shared.data_task);
             std::task::ready!(state.outbound.poll_flushed(cx.waker()));
         }
         this.shared = None;
@@ -174,7 +174,7 @@ impl Drop for RammuxSink {
         if let Some(shared) = self.shared.take()
             && let Some(mut state) = shared.try_lock()
         {
-            state.outbound.close_writing(&shared.updates);
+            state.outbound.close_writing(&shared.data_task);
         }
     }
 }
@@ -212,7 +212,12 @@ impl Stream for RammuxStream {
         let Some(shared) = &this.shared else {
             return Poll::Ready(None);
         };
-        let data = std::task::ready!(shared.lock().inbound.poll_read(cx.waker(), &shared.updates));
+        let data = std::task::ready!(
+            shared
+                .lock()
+                .inbound
+                .poll_read(cx.waker(), &shared.credit_task)
+        );
         if data.is_none() {
             this.shared = None;
         }
@@ -225,7 +230,7 @@ impl Drop for RammuxStream {
         if let Some(shared) = self.shared.take()
             && let Some(mut state) = shared.try_lock()
         {
-            state.inbound.close_reading(&shared.updates);
+            state.inbound.close_reading(&shared.credit_task);
         }
     }
 }

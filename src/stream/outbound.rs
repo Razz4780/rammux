@@ -27,9 +27,9 @@ pub struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
-    /// Wakes the [`StreamUpdates`](super::updates::StreamUpdates) of this stream.
-    fn wake_updates(&self) {
-        self.me.updates.wake();
+    /// Wakes the [`DataUpdates`](super::updates::DataUpdates) of this stream.
+    fn wake_data_task(&self) {
+        self.me.data_task.wake();
     }
 }
 
@@ -101,7 +101,9 @@ impl OutboundTraffic {
     }
 
     /// Takes data from the application. The direction must be [ready](Self::poll_write_ready).
-    pub fn write(&mut self, data: Bytes, updates: &AtomicWaker) -> io::Result<()> {
+    ///
+    /// Wakes the `data_task` of the stream, which sends the data.
+    pub fn write(&mut self, data: Bytes, data_task: &AtomicWaker) -> io::Result<()> {
         let OutboundState::Open { ready_data, .. } = &mut self.state else {
             return Err(io::ErrorKind::BrokenPipe.into());
         };
@@ -110,7 +112,7 @@ impl OutboundTraffic {
         }
         if !data.is_empty() {
             *ready_data = data;
-            updates.wake();
+            data_task.wake();
         }
         Ok(())
     }
@@ -128,12 +130,14 @@ impl OutboundTraffic {
     }
 
     /// The application closes writing. `FIN_WRITE` follows the data that is not sent yet.
-    pub fn close_writing(&mut self, updates: &AtomicWaker) {
+    ///
+    /// Wakes the `data_task` of the stream if `FIN_WRITE` is due now: no data is left to send.
+    pub fn close_writing(&mut self, data_task: &AtomicWaker) {
         let OutboundState::Open { ready_data, writer } = &mut self.state else {
             return;
         };
         self.state = if ready_data.is_empty() {
-            updates.wake();
+            data_task.wake();
             OutboundState::Closed {
                 fin_state: FinState::default(),
             }
@@ -230,7 +234,7 @@ impl OutboundTraffic {
             &self.state
             && !ready_data.is_empty()
         {
-            ctx.wake_updates();
+            ctx.wake_data_task();
         }
         Ok(())
     }
@@ -238,7 +242,7 @@ impl OutboundTraffic {
     /// The peer stopped reading. The bytes in flight are forgotten,
     /// which returns the share of the pool that the stream used.
     pub fn received_fin_read(&mut self, ctx: &mut Ctx<'_>) -> Result<(), StreamError> {
-        self.close_reading_side(&ctx.me.updates)?;
+        self.close_reading_side(&ctx.me.data_task)?;
         if self.ledger.window.set(&mut ctx.flow.tx_pool, 0) {
             ctx.flow.turns.wake_front();
         }
@@ -248,15 +252,18 @@ impl OutboundTraffic {
     }
 
     /// Closes the direction without the accounting, when the connection is gone.
-    pub fn abort(&mut self, updates: &AtomicWaker) {
-        let _ = self.close_reading_side(updates);
+    pub fn abort(&mut self, data_task: &AtomicWaker) {
+        let _ = self.close_reading_side(data_task);
     }
 
-    fn close_reading_side(&mut self, updates: &AtomicWaker) -> Result<(), StreamError> {
+    /// The peer stopped reading: nothing more is sent but `FIN_WRITE`, and the data that was not sent is dropped.
+    ///
+    /// Wakes the `data_task` of the stream if `FIN_WRITE` is due now.
+    fn close_reading_side(&mut self, data_task: &AtomicWaker) -> Result<(), StreamError> {
         match &mut self.state {
             OutboundState::Open { writer, .. } | OutboundState::HalfClosed { writer, .. } => {
                 writer.wake();
-                updates.wake();
+                data_task.wake();
                 self.state = OutboundState::Closed {
                     fin_state: FinState {
                         sent: false,

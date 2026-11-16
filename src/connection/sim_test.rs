@@ -189,11 +189,13 @@ async fn drive(
 
 struct Rig {
     open: mpsc::UnboundedSender<Open>,
+    server_open: mpsc::UnboundedSender<Open>,
     client_stats: Arc<Mutex<RammuxStats>>,
     forward: Arc<Dir>,
-    /// Bytes read by the server, per stream, in the order of opening.
+    /// Bytes read by the receiver, per stream, in the order of opening.
     read: Vec<Arc<AtomicU64>>,
     server_streams: mpsc::UnboundedReceiver<RammuxDuplex>,
+    client_streams: mpsc::UnboundedReceiver<RammuxDuplex>,
 }
 
 impl Rig {
@@ -202,8 +204,8 @@ impl Rig {
         let client = RammuxConnection::new(RammuxRole::Client, client_io, config.clone()).unwrap();
         let server = RammuxConnection::new(RammuxRole::Server, server_io, config).unwrap();
         let (open, open_rx) = mpsc::unbounded_channel();
-        let (_server_open, server_open_rx) = mpsc::unbounded_channel();
-        let (client_in, _client_in_rx) = mpsc::unbounded_channel();
+        let (server_open, server_open_rx) = mpsc::unbounded_channel();
+        let (client_in, client_streams) = mpsc::unbounded_channel();
         let (server_in, server_streams) = mpsc::unbounded_channel();
         let client_stats = Arc::new(Mutex::new(RammuxStats::default()));
         tokio::spawn(drive(client, open_rx, client_in, client_stats.clone()));
@@ -213,14 +215,14 @@ impl Rig {
             server_in,
             Arc::new(Mutex::new(RammuxStats::default())),
         ));
-        std::mem::forget(_server_open);
-        std::mem::forget(_client_in_rx);
         Self {
             open,
+            server_open,
             client_stats,
             forward,
             read: Vec::new(),
             server_streams,
+            client_streams,
         }
     }
 
@@ -283,6 +285,29 @@ impl Rig {
                 if stall_at.is_some_and(|at| Instant::now() >= at) {
                     std::future::pending::<()>().await;
                 }
+            }
+        });
+    }
+
+    /// Starts a bulk download: the server writes as fast as it can, the client reads.
+    async fn bulk_download(&mut self) {
+        let (tx, rx) = oneshot::channel();
+        self.server_open.send(tx).unwrap();
+        let stream = rx.await.unwrap();
+        let (mut sink, _stream) = stream.into_split();
+        tokio::spawn(async move {
+            let chunk = Bytes::from(vec![5_u8; 64 * 1024]);
+            while sink.send(chunk.clone()).await.is_ok() {}
+            drop(_stream);
+        });
+
+        let client_stream = self.client_streams.recv().await.unwrap();
+        let counter = Arc::new(AtomicU64::new(0));
+        self.read.push(counter.clone());
+        tokio::spawn(async move {
+            let (_sink, mut stream) = client_stream.into_split();
+            while let Some(data) = stream.next().await {
+                counter.fetch_add(data.len() as u64, Ordering::Relaxed);
             }
         });
     }
@@ -640,4 +665,29 @@ async fn a_new_stream_starts_within_the_grant_with_the_advance() {
     for pair in per_loop.windows(2).take(3) {
         assert!(pair[1] >= 1.8 * pair[0], "{per_loop:?}");
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_download_keeps_its_share_next_to_many_uploads() {
+    // The client sends the data of the uploads and the window updates of the download on the same link.
+    // This link buffers without limit, so the queue builds up in the link and not in the muxer, and the
+    // order in which the muxer writes its frames hardly matters here: measured 11.0 Mbit/s for the download
+    // both when window updates and data shared one round robin, and since window updates go first.
+    // The download is limited by its loop, which includes the queue of the uploads.
+    let mut rig = Rig::new(MBIT, RTT, config());
+    let uploads = 16;
+    for _ in 0..uploads {
+        rig.bulk(None).await;
+    }
+    rig.bulk_download().await;
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let before = (0..=uploads).map(|s| rig.bytes(s)).collect::<Vec<_>>();
+    let window = Duration::from_secs(10);
+    tokio::time::sleep(window).await;
+    let mbit = |s: usize| (rig.bytes(s) - before[s]) as f64 * 8.0 / 1e6 / window.as_secs_f64();
+    let up = (0..uploads).map(mbit).sum::<f64>();
+    let down = mbit(uploads);
+    assert!(up > 0.95 * MBIT, "{up} Mbit/s");
+    assert!(down > 10.0, "{down} Mbit/s");
 }

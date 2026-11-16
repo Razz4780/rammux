@@ -7,7 +7,7 @@ use tokio::time::Instant;
 use crate::{
     buffer::Data,
     error::StreamError,
-    stream::{ConnFlow, FinState, StreamRef, outbound::Ctx},
+    stream::{ConnFlow, FinState, RxFlow, StreamRef, outbound::Ctx},
     wire::header::ControlFlags,
 };
 
@@ -26,20 +26,21 @@ impl StreamHandle {
         credit: Option<NonZeroU32>,
         data: Data,
         flags: ControlFlags,
-        flow: &mut ConnFlow,
+        tx: &mut ConnFlow,
+        rx: &mut RxFlow,
     ) -> Result<FinState, StreamError> {
         let mut state = self.0.lock();
         let mut ctx = Ctx {
-            flow,
+            flow: tx,
             me: &self.0,
             now: Instant::now(),
         };
         if let Some(credit) = credit {
             state.outbound.received_window_update(credit, &mut ctx)?;
         }
-        state.inbound.received_data(data, &mut ctx.flow.rx_pool)?;
+        state.inbound.received_data(data, &mut rx.pool)?;
         if flags.fin_write {
-            state.inbound.received_fin_write(&self.0.updates)?;
+            state.inbound.received_fin_write(&self.0.credit_task)?;
         }
         if flags.fin_read {
             state.outbound.received_fin_read(&mut ctx)?;
@@ -55,7 +56,7 @@ impl StreamHandle {
         let Some(mut state) = self.0.try_lock() else {
             return;
         };
-        let _ = state.inbound.received_fin_write(&self.0.updates);
-        state.outbound.abort(&self.0.updates);
+        let _ = state.inbound.received_fin_write(&self.0.credit_task);
+        state.outbound.abort(&self.0.data_task);
     }
 }

@@ -20,7 +20,7 @@ use tokio::{
 use crate::{
     StreamId,
     config::{RammuxConfig, RammuxRole},
-    connection::{RammuxConnection, RammuxProgress},
+    connection::{RammuxConnection, RammuxProgress, active::CREDIT_BURST},
     wire::{
         codec::{
             RammuxCodec,
@@ -719,4 +719,183 @@ async fn a_stream_id_can_be_reused_after_both_sides_closed_it() {
         rig.frames();
         assert_eq!(rig.conn.stats().inbound_streams, 0);
     }
+}
+
+/// The stream frames among the frames, as (id, credit, data length, flags).
+fn stream_frames(frames: &[InboundFrame]) -> Vec<(u16, u32, usize, ControlFlags)> {
+    frames
+        .iter()
+        .filter_map(|frame| {
+            let stream = frame.header.stream.as_ref()?;
+            Some((
+                u16::from_be_bytes(stream.id.to_be_bytes()),
+                stream.credit.map_or(0, NonZeroU32::get),
+                frame.data.as_ref().len(),
+                stream.flags,
+            ))
+        })
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_window_update_does_not_wait_behind_the_data_of_other_streams() {
+    // The pipe back takes 64 bytes while the peer does not read.
+    let (read, mut peer_out) = tokio::io::duplex(1 << 20);
+    let (write, mut peer_in) = tokio::io::duplex(64);
+    let mut small_window = config();
+    small_window.local_recv_window = NonZeroU32::new(512).unwrap();
+    let mut conn =
+        RammuxConnection::new(RammuxRole::Client, Pipes { read, write }, small_window).unwrap();
+    let mut accepted = Vec::new();
+    let mut settle = |conn: &mut RammuxConnection<Pipes>| {
+        while let Some(result) = tokio::task::unconstrained(conn.progress()).now_or_never() {
+            if let RammuxProgress::Inbound(stream) = result.unwrap() {
+                accepted.push(stream);
+            }
+        }
+    };
+
+    // Four streams have four frames of data each, and the transport fills up.
+    let mut uploads = Vec::new();
+    for _ in 0..4 {
+        let mut stream = conn.try_start_outbound().unwrap().unwrap();
+        stream
+            .feed(Bytes::from(vec![1_u8; 1024]))
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        uploads.push(stream);
+    }
+    settle(&mut conn);
+
+    // The peer starts a stream, and the application reads enough of it to owe credit.
+    peer_out
+        .write_all(&data(1, syn(), &[2; 256]))
+        .await
+        .unwrap();
+    settle(&mut conn);
+    drop(settle);
+    let mut download = accepted.pop().expect("the stream of the peer");
+    assert_eq!(download.next().now_or_never().unwrap().unwrap().len(), 256);
+
+    // The transport drains.
+    let mut codec = RammuxCodec::new(
+        &mut peer_in,
+        config().frame_limit,
+        Duration::from_secs(3600),
+    );
+    let mut frames = Vec::new();
+    for _ in 0..1000 {
+        while let Some(result) = tokio::task::unconstrained(conn.progress()).now_or_never() {
+            result.unwrap();
+        }
+        while let Some(Some(frame)) = tokio::task::unconstrained(codec.next()).now_or_never() {
+            if let DecodedFrame::Frame(frame) = frame.unwrap() {
+                frames.push(frame);
+            }
+        }
+    }
+    let frames = stream_frames(&frames);
+    let window = frames
+        .iter()
+        .position(|&(id, credit, ..)| id == 1 && credit == 256)
+        .expect("the window update");
+    let data_before = frames[..window].iter().filter(|frame| frame.2 > 0).count();
+    // One frame may have been in the codec already.
+    assert!(
+        data_before <= 1,
+        "{data_before} DATA frames before it: {frames:?}"
+    );
+    assert_eq!(frames.iter().filter(|frame| frame.2 > 0).count(), 16);
+}
+
+#[tokio::test(start_paused = true)]
+async fn credit_does_not_starve_data() {
+    let mut config = config();
+    config.local_recv_window = NonZeroU32::new(512).unwrap();
+    let mut rig = rig(RammuxRole::Client, config);
+    let mut upload = rig.conn.try_start_outbound().unwrap().unwrap();
+    rig.frames();
+
+    // The peer starts 64 streams, with enough data each that reading it owes credit.
+    let mut bytes = Vec::new();
+    for s in 0..64 {
+        bytes.extend(data(2 * s + 1, syn(), &[3; 256]));
+    }
+    rig.peer_out.write_all(&bytes).await.unwrap();
+    // Unconstrained: tokio's budget would make a long run of ready reads look like Pending.
+    let mut accepted = Vec::new();
+    while let Some(result) = tokio::task::unconstrained(rig.conn.progress()).now_or_never() {
+        if let RammuxProgress::Inbound(stream) = result.unwrap() {
+            accepted.push(stream);
+        }
+    }
+    assert_eq!(accepted.len(), 64);
+
+    // All of them owe credit at the same moment, and then the upload has data.
+    for stream in &mut accepted {
+        assert_eq!(stream.next().now_or_never().unwrap().unwrap().len(), 256);
+    }
+    upload
+        .feed(Bytes::from(vec![1_u8; 256]))
+        .now_or_never()
+        .unwrap()
+        .unwrap();
+
+    while let Some(result) = tokio::task::unconstrained(rig.conn.progress()).now_or_never() {
+        result.unwrap();
+    }
+    let mut frames = Vec::new();
+    while let Some(Some(frame)) = tokio::task::unconstrained(rig.peer_in.next()).now_or_never() {
+        if let DecodedFrame::Frame(frame) = frame.unwrap() {
+            frames.push(frame);
+        }
+    }
+    let frames = stream_frames(&frames);
+    assert_eq!(frames.len(), 65, "{frames:?}");
+    let first_data = frames
+        .iter()
+        .position(|frame| frame.2 > 0)
+        .expect("the DATA frame");
+    assert!(first_data <= CREDIT_BURST, "{first_data}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stream_announces_itself_once() {
+    let syn_fin_read = ControlFlags {
+        syn: true,
+        fin_read: true,
+        fin_write: false,
+    };
+    let fin_read = ControlFlags {
+        fin_read: true,
+        ..Default::default()
+    };
+
+    // The reader goes first: SYN rides on FIN_READ.
+    let mut one = rig(RammuxRole::Client, config());
+    one.frames();
+    let (mut sink, reader) = one.conn.try_start_outbound().unwrap().unwrap().into_split();
+    drop(reader);
+    assert_eq!(stream_frames(&one.frames()), [(0, 0, 0, syn_fin_read)]);
+    sink.feed(Bytes::from_static(b"abc"))
+        .now_or_never()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stream_frames(&one.frames()),
+        [(0, 0, 3, ControlFlags::default())]
+    );
+
+    // The writer goes first: SYN rides on DATA.
+    let mut two = rig(RammuxRole::Client, config());
+    two.frames();
+    let (mut sink, reader) = two.conn.try_start_outbound().unwrap().unwrap().into_split();
+    sink.feed(Bytes::from_static(b"abc"))
+        .now_or_never()
+        .unwrap()
+        .unwrap();
+    assert_eq!(stream_frames(&two.frames()), [(0, 0, 3, syn())]);
+    drop(reader);
+    assert_eq!(stream_frames(&two.frames()), [(0, 0, 0, fin_read)]);
 }

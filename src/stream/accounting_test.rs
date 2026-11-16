@@ -21,7 +21,11 @@ use crate::{
     buffer::Data,
     config::RammuxConfig,
     flow::Srtt,
-    stream::{ConnFlow, RammuxDuplex, handle::StreamHandle, updates::StreamUpdates},
+    stream::{
+        ConnFlow, RammuxDuplex, RxFlow,
+        handle::StreamHandle,
+        updates::{CreditUpdates, DataUpdates},
+    },
     wire::header::ControlFlags,
 };
 
@@ -63,7 +67,8 @@ struct InFlight {
 
 /// One end of the link: streams with both directions.
 struct End {
-    selector: Selector<StreamUpdates, ConnFlow>,
+    credit: Selector<CreditUpdates, RxFlow>,
+    data: Selector<DataUpdates, ConnFlow>,
     handles: Vec<StreamHandle>,
     duplexes: Vec<RammuxDuplex>,
     ids: Vec<StreamId>,
@@ -72,10 +77,14 @@ struct End {
 
 impl End {
     fn new(initiator: bool) -> Self {
-        let mut flow = ConnFlow::new(POOL, POOL);
-        flow.srtt = Srtt::of(Duration::from_millis(100));
+        let srtt = Srtt::of(Duration::from_millis(100));
+        let mut tx = ConnFlow::new(POOL);
+        tx.srtt = srtt;
+        let mut rx = RxFlow::new(POOL);
+        rx.srtt = srtt;
         let mut end = Self {
-            selector: Selector::new(flow),
+            credit: Selector::new(rx),
+            data: Selector::new(tx),
             handles: Vec::new(),
             duplexes: Vec::new(),
             ids: Vec::new(),
@@ -83,8 +92,9 @@ impl End {
         };
         for n in 0..STREAMS {
             let id = StreamId::from_be_bytes((u16::try_from(n).unwrap() * 2).to_be_bytes());
-            let (handle, updates, duplex) = crate::stream::new(id, initiator, &CONFIG);
-            end.selector.push(updates);
+            let (handle, credit, data, duplex) = crate::stream::new(id, initiator, &CONFIG);
+            end.credit.push(credit);
+            end.data.push(data);
             end.handles.push(handle);
             end.duplexes.push(duplex);
             end.ids.push(id);
@@ -92,14 +102,18 @@ impl End {
         end
     }
 
-    /// Collects the frames the streams want to send.
+    /// Collects the frames the streams want to send, credit first, like the connection does.
     fn flush(&mut self, delay: Duration) {
         let flag = Arc::new(Woken(AtomicBool::new(false)));
         let waker = futures::task::waker(flag.clone());
         let mut cx = Context::from_waker(&waker);
         loop {
             flag.0.store(false, Ordering::SeqCst);
-            match self.selector.poll_next_unpin(&mut cx) {
+            let polled = match self.credit.poll_next_unpin(&mut cx) {
+                Poll::Ready(Some(yielded)) => Poll::Ready(Some(yielded)),
+                _ => self.data.poll_next_unpin(&mut cx),
+            };
+            match polled {
                 Poll::Ready(Some((update, _))) => {
                     let stream = self.ids.iter().position(|id| *id == update.id).unwrap();
                     self.outgoing.push_back(InFlight {
@@ -127,7 +141,8 @@ impl End {
                     NonZeroU32::new(f.credit),
                     Data::copy_from_slice(&f.data),
                     fins(f.fin_write, f.fin_read),
-                    self.selector.strategy_mut(),
+                    self.data.strategy_mut(),
+                    self.credit.strategy_mut(),
                 )
                 .expect("the peer follows the rules");
         }
@@ -212,10 +227,10 @@ async fn run(seed: u64, steps: usize) -> u64 {
             sum_tx += tx.saturating_sub(u64::from(BASE));
             sum_rx += rx.saturating_sub(u64::from(BASE));
         }
-        let (g_tx, g_rx) = (left.selector.strategy(), right.selector.strategy());
+        let (g_tx, g_rx) = (left.data.strategy(), right.credit.strategy());
         assert_eq!(g_tx.tx_pool.used(), sum_tx);
-        assert_eq!(g_rx.rx_pool.used(), sum_rx);
-        assert!(g_tx.tx_pool.used() >= g_rx.rx_pool.used());
+        assert_eq!(g_rx.pool.used(), sum_rx);
+        assert!(g_tx.tx_pool.used() >= g_rx.pool.used());
         assert!(g_tx.tx_pool.used() <= u64::from(POOL));
         max_used = max_used.max(g_tx.tx_pool.used());
     }
@@ -235,9 +250,9 @@ async fn run(seed: u64, steps: usize) -> u64 {
         );
         assert_eq!(left.unacked_tx(s), right.unacked_rx(s));
     }
-    assert_eq!(left.selector.strategy().tx_pool.used(), 0);
-    assert_eq!(right.selector.strategy().rx_pool.used(), 0);
-    assert_eq!(left.selector.strategy().turns.len(), 0);
+    assert_eq!(left.data.strategy().tx_pool.used(), 0);
+    assert_eq!(right.credit.strategy().pool.used(), 0);
+    assert_eq!(left.data.strategy().turns.len(), 0);
     max_used
 }
 
