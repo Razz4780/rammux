@@ -169,6 +169,8 @@ struct MarkChannel {
 }
 
 thread_local! {
+    /// EXPERIMENT: credit goes out before data.
+    pub static CONTROL_FIRST: Cell<bool> = const { Cell::new(false) };
     static MARKS: RefCell<HashMap<MarkKey, MarkChannel>> = RefCell::default();
     /// The one-way delay of the path, which a mark without data (a request) takes.
     pub static ONE_WAY: Cell<Duration> = const { Cell::new(Duration::ZERO) };

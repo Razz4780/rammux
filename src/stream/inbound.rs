@@ -46,6 +46,9 @@ pub struct InboundTraffic {
     marks: Option<MarkKey>,
     consumed_total: u64,
     marked: bool,
+    /// EXPERIMENT: counts the streams with credit due, and whether this one is counted.
+    control_pending: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    counted: bool,
 }
 
 enum InboundState {
@@ -87,6 +90,27 @@ impl InboundTraffic {
             marks: None,
             consumed_total: 0,
             marked: false,
+            control_pending: None,
+            counted: false,
+        }
+    }
+
+    pub fn set_control_pending(&mut self, counter: std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        self.control_pending = Some(counter);
+    }
+
+    fn count_due(&mut self, due: bool) {
+        use std::sync::atomic::Ordering;
+        if due == self.counted {
+            return;
+        }
+        if let Some(counter) = &self.control_pending {
+            if due {
+                counter.fetch_add(1, Ordering::Relaxed);
+            } else {
+                counter.fetch_sub(1, Ordering::Relaxed);
+            }
+            self.counted = due;
         }
     }
 
@@ -138,6 +162,9 @@ impl InboundTraffic {
         self.credit += data.as_ref().len() as u64;
         if self.credit >= self.wake_at {
             updates.wake();
+        }
+        if self.credit >= self.credit_threshold {
+            self.count_due(true);
         }
         Poll::Ready(Some(data))
     }
@@ -221,6 +248,7 @@ impl InboundTraffic {
                 }
                 self.waiting = false;
                 self.marked = false;
+                self.count_due(false);
                 let credit = u32::try_from(self.credit).unwrap_or(u32::MAX);
                 self.credit -= u64::from(credit);
                 self.seen = self.credit;
@@ -230,6 +258,12 @@ impl InboundTraffic {
             },
 
             InboundState::Closed { fin_state } => {
+                if self.counted {
+                    if let Some(counter) = &self.control_pending {
+                        counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    self.counted = false;
+                }
                 if fin_state.sent {
                     return Poll::Pending;
                 }

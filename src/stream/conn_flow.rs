@@ -1,5 +1,7 @@
 //! The part of the flow control that the streams of a connection share.
 
+use std::sync::{Arc, atomic::AtomicUsize};
+
 use crate::{
     config::RammuxConfig,
     flow::{Advance, Pool, Srtt},
@@ -24,6 +26,10 @@ pub struct ConnFlow {
     pub advance: Advance,
     /// EXPERIMENT: when credit is returned.
     pub credit: CreditGate,
+    /// EXPERIMENT: data waits while any stream has credit due.
+    pub control_first: bool,
+    /// EXPERIMENT: how many streams have credit due.
+    pub control_pending: Arc<AtomicUsize>,
 }
 
 impl ConnFlow {
@@ -36,6 +42,8 @@ impl ConnFlow {
             turns: Turns::default(),
             advance: Advance::default(),
             credit: CreditGate::new(),
+            control_first: crate::stream::credit::CONTROL_FIRST.get(),
+            control_pending: Arc::default(),
         }
     }
 

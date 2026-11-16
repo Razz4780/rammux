@@ -37,7 +37,7 @@ impl StreamUpdates {
 }
 
 impl Task<ConnFlow> for StreamUpdates {
-    type Cont = (StreamUpdate, FinState);
+    type Cont = Option<(StreamUpdate, FinState)>;
     type Break = (StreamUpdate, FinState);
     type Output = (StreamUpdate, FinState);
 
@@ -52,6 +52,17 @@ impl Task<ConnFlow> for StreamUpdates {
         // Credit and `FIN_READ` never wait for data, or for a turn.
         let now = Instant::now();
         let inbound = state.inbound.poll_update(flow, &this.stream, now);
+        // EXPERIMENT: data waits while another stream has credit due. The stream keeps its place in line.
+        if flow.control_first
+            && inbound.is_pending()
+            && state.outbound.has_waiting()
+            && flow
+                .control_pending
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+        {
+            return Poll::Ready(ControlFlow::Continue(None));
+        }
         let mut ctx = Ctx {
             flow,
             me: &this.stream,
@@ -89,7 +100,7 @@ impl Task<ConnFlow> for StreamUpdates {
             // Both `FIN_*`s are sent, nothing more will come.
             ControlFlow::Break((update, fin_state))
         } else {
-            ControlFlow::Continue((update, fin_state))
+            ControlFlow::Continue(Some((update, fin_state)))
         })
     }
 
@@ -98,7 +109,7 @@ impl Task<ConnFlow> for StreamUpdates {
         _: &mut ConnFlow,
         value: Self::Cont,
     ) -> Option<Self::Output> {
-        Some(value)
+        value
     }
 
     fn transform_break(

@@ -157,6 +157,15 @@ impl OutboundTraffic {
         };
     }
 
+    /// EXPERIMENT: whether data waits to be sent.
+    pub fn has_waiting(&self) -> bool {
+        match &self.state {
+            OutboundState::Open { ready_data, .. }
+            | OutboundState::HalfClosed { ready_data, .. } => !ready_data.is_empty(),
+            OutboundState::Closed { .. } => false,
+        }
+    }
+
     // The connection side.
 
     /// Polls for what this direction sends next: a chunk of data, and whether `FIN_WRITE` follows it.

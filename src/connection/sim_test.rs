@@ -36,6 +36,12 @@ struct Dir {
     /// Bytes per second.
     rate: f64,
     delay: Duration,
+    /// EXPERIMENT: a write waits while this many bytes wait to be serialized, like a full socket buffer.
+    sndbuf: Option<usize>,
+}
+
+thread_local! {
+    static SNDBUF: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 #[derive(Default)]
@@ -59,6 +65,7 @@ impl Dir {
             inner: Default::default(),
             rate: mbit * 1e6 / 8.0,
             delay,
+            sndbuf: SNDBUF.get(),
         })
     }
 
@@ -82,6 +89,7 @@ struct End {
     tx: Arc<Dir>,
     rx: Arc<Dir>,
     sleep: Pin<Box<Sleep>>,
+    write_sleep: Pin<Box<Sleep>>,
     /// Delivered, not read yet.
     ready: Bytes,
 }
@@ -93,6 +101,7 @@ fn link(mbit: f64, one_way: Duration) -> (End, End, Arc<Dir>, Arc<Dir>) {
         tx: tx.clone(),
         rx: rx.clone(),
         sleep: Box::pin(tokio::time::sleep(Duration::ZERO)),
+        write_sleep: Box::pin(tokio::time::sleep(Duration::ZERO)),
         ready: Bytes::new(),
     };
     (end(&a_to_b, &b_to_a), end(&b_to_a, &a_to_b), a_to_b, b_to_a)
@@ -101,12 +110,36 @@ fn link(mbit: f64, one_way: Duration) -> (End, End, Arc<Dir>, Arc<Dir>) {
 impl AsyncWrite for End {
     fn poll_write(
         self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let dir = &self.tx;
+        let this = self.get_mut();
+        let dir = this.tx.clone();
+        let dir = &dir;
         let mut inner = dir.inner.lock().unwrap();
         let now = Instant::now();
+        if let Some(sndbuf) = dir.sndbuf {
+            loop {
+                let now = Instant::now();
+                while inner
+                    .queue
+                    .front()
+                    .is_some_and(|(finish, _)| *finish <= now)
+                {
+                    inner.queue.pop_front();
+                }
+                let queued: usize = inner.queue.iter().map(|(_, len)| len).sum();
+                if queued < sndbuf {
+                    break;
+                }
+                let finish = inner.queue.front().unwrap().0;
+                this.write_sleep.as_mut().reset(finish);
+                if this.write_sleep.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+            }
+        }
+        let now = now.max(Instant::now());
         inner.writes += 1;
         if inner.last_write != Some(now) {
             inner.instants += 1;
@@ -199,6 +232,9 @@ async fn drive(
 struct Rig {
     open: mpsc::UnboundedSender<Open>,
     client_stats: Arc<Mutex<RammuxStats>>,
+    server_stats: Arc<Mutex<RammuxStats>>,
+    /// Bytes read by the client, per download, in the order of opening.
+    down: Vec<Arc<AtomicU64>>,
     forward: Arc<Dir>,
     backward: Arc<Dir>,
     /// Bytes read by the server, per stream, in the order of opening.
@@ -217,17 +253,20 @@ impl Rig {
         let (server_in, server_streams) = mpsc::unbounded_channel();
         let client_stats = Arc::new(Mutex::new(RammuxStats::default()));
         tokio::spawn(drive(client, open_rx, client_in, client_stats.clone()));
+        let server_stats = Arc::new(Mutex::new(RammuxStats::default()));
         tokio::spawn(drive(
             server,
             server_open_rx,
             server_in,
-            Arc::new(Mutex::new(RammuxStats::default())),
+            server_stats.clone(),
         ));
         std::mem::forget(_server_open);
         std::mem::forget(_client_in_rx);
         Self {
             open,
             client_stats,
+            server_stats,
+            down: Vec::new(),
             forward,
             backward,
             read: Vec::new(),
@@ -854,5 +893,107 @@ mod credit_experiment {
                 println!("{label:28} {result}");
             }
         }
+    }
+}
+
+// EXPERIMENT: does data hold up the credit of the other direction? Run with
+// `cargo test --release --lib direction_experiment -- --ignored --nocapture`.
+mod direction_experiment {
+    use super::*;
+    use crate::stream::credit::CONTROL_FIRST;
+
+    impl Rig {
+        /// Starts a bulk download: the client opens the stream, and the server writes as fast as it can.
+        async fn download(&mut self) {
+            let (tx, rx) = oneshot::channel();
+            self.open.send(tx).unwrap();
+            let stream = rx.await.unwrap();
+            let (mut sink, mut stream) = stream.into_split();
+            // A stream has to send something to be announced.
+            sink.send(Bytes::from_static(b"!")).await.unwrap();
+            let counter = Arc::new(AtomicU64::new(0));
+            self.down.push(counter.clone());
+            tokio::spawn(async move {
+                let _sink = sink;
+                while let Some(data) = stream.next().await {
+                    counter.fetch_add(data.len() as u64, Ordering::Relaxed);
+                }
+            });
+            let server_stream = self.server_streams.recv().await.unwrap();
+            tokio::spawn(async move {
+                let (mut sink, _stream) = server_stream.into_split();
+                let chunk = Bytes::from(vec![5_u8; 64 * 1024]);
+                while sink.send(chunk.clone()).await.is_ok() {}
+            });
+        }
+
+        fn down_total(&self) -> u64 {
+            self.down.iter().map(|d| d.load(Ordering::Relaxed)).sum()
+        }
+    }
+
+    /// One upload next to `downloads` downloads. Returns the rates, and the loop times the senders see.
+    async fn one_against_many(downloads: usize, mbit: f64, rtt: Duration) -> String {
+        let mut config = RammuxConfig::new();
+        config.max_inbound_streams = 512;
+        config.max_outbound_streams = 512;
+        config.inbound_frame_timeout = Duration::from_secs(3600);
+        let mut rig = Rig::new(mbit, rtt, config);
+        for _ in 0..downloads {
+            rig.download().await;
+        }
+        rig.bulk(None).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let (up, down) = (rig.bytes(0), rig.down_total());
+        let window = Duration::from_secs(20);
+        tokio::time::sleep(window).await;
+        let rate = |bytes: u64| bytes as f64 * 8.0 / 1e6 / window.as_secs_f64();
+        let ms = |stats: &RammuxStats| stats.srtt.map_or(0.0, |srtt| srtt.as_secs_f64() * 1e3);
+        let (client, server) = (rig.stats(), rig.server_stats.lock().unwrap().clone());
+        format!(
+            "upload {:6.1} Mbit/s   downloads {:6.1} Mbit/s   srtt: uploader {:5.0} ms, downloader {:5.0} ms   upload borrows {:7}",
+            rate(rig.bytes(0) - up),
+            rate(rig.down_total() - down),
+            ms(&client),
+            ms(&server),
+            client.pool_tx_used,
+        )
+    }
+
+    #[test]
+    #[ignore = "an experiment, prints a table"]
+    fn direction_experiment() {
+        for (sndbuf, label) in [
+            (Some(256 * 1024), "256 KiB send buffer"),
+            (None, "unbounded send buffer"),
+        ] {
+            for control_first in [false, true] {
+                println!(
+                    "\n== 100 Mbit/s each way, 50 ms, {label}, {}",
+                    if control_first {
+                        "credit before data"
+                    } else {
+                        "one queue (today)"
+                    }
+                );
+                for downloads in [0, 1, 8, 32, 128, 400] {
+                    SNDBUF.set(sndbuf);
+                    CONTROL_FIRST.set(control_first);
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_time()
+                        .start_paused(true)
+                        .build()
+                        .unwrap();
+                    let result = runtime.block_on(one_against_many(
+                        downloads,
+                        100.0,
+                        Duration::from_millis(50),
+                    ));
+                    println!("{downloads:4} downloads: {result}");
+                }
+            }
+        }
+        SNDBUF.set(None);
+        CONTROL_FIRST.set(false);
     }
 }

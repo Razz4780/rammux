@@ -15,6 +15,11 @@ use crate::{
 pub struct StreamHandle(pub(super) StreamRef);
 
 impl StreamHandle {
+    /// EXPERIMENT: gives the stream the connection's count of streams with credit due.
+    pub fn set_control_pending(&self, counter: std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        self.0.lock().inbound.set_control_pending(counter);
+    }
+
     /// Updates the stream with the stream part of a received frame.
     ///
     /// The parts of the frame are processed in the order of the protocol:

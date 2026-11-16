@@ -80,6 +80,7 @@ impl Streams {
         }
         let id = StreamId::from_slab_idx(self.outbound.vacant_key(), self.role)?;
         let (handle, updates, duplex) = stream::new(id, true, &self.config);
+        handle.set_control_pending(self.updates.strategy().control_pending.clone());
         self.updates.push(updates);
         self.outbound.insert(handle);
         Some(duplex)
@@ -124,6 +125,7 @@ impl Streams {
                         ));
                     }
                     let (handle, updates, duplex) = stream::new(id, false, &self.config);
+                    handle.set_control_pending(self.updates.strategy().control_pending.clone());
                     self.updates.push(updates);
                     (&*entry.insert(handle), Some(duplex))
                 },
