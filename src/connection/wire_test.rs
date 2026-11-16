@@ -1,6 +1,7 @@
 //! Tests of the connection against a hand-driven peer, frame by frame.
 
 use std::{
+    fmt::Debug,
     future::Future,
     io,
     num::{NonZeroU16, NonZeroU32},
@@ -10,8 +11,11 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::{FutureExt, SinkExt, StreamExt};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, ReadHalf, WriteHalf};
+use futures::{FutureExt, Sink, SinkExt, StreamExt};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, ReadHalf, WriteHalf},
+    time::Instant,
+};
 
 use crate::{
     StreamId,
@@ -36,7 +40,6 @@ pub(super) struct Rig {
 fn config() -> RammuxConfig {
     let mut config = RammuxConfig::new();
     config.frame_limit = NonZeroU16::new(256).unwrap();
-    config.ping_bytes = NonZeroU32::new(1024).unwrap();
     config.inbound_frame_timeout = Duration::from_secs(3600);
     config
 }
@@ -268,59 +271,97 @@ async fn the_reserved_bit_is_a_protocol_violation() {
     assert!(error.is_protocol_violation());
 }
 
-#[tokio::test(start_paused = true)]
-async fn pings_follow_the_data_and_the_clock() {
-    let mut rig = rig(RammuxRole::Client, config());
-    let stream = rig.conn.try_start_outbound().unwrap().unwrap();
-    let (mut sink, _stream) = stream.into_split();
+/// A frame the connection wrote, as the raw peer saw it.
+struct Seen {
+    at: Instant,
+    t_ping: Option<u32>,
+    flow: bool,
+}
 
-    let mut frames = Vec::new();
-    for _ in 0..10 {
-        let chunk = Bytes::from(vec![7_u8; 1024]);
+/// Keeps a stream writing 100 bytes every millisecond for `millis`, while the peer returns the credit
+/// of everything it read. Returns the frames the peer saw.
+async fn write_for(
+    rig: &mut Rig,
+    sink: &mut (impl Sink<Bytes, Error: Debug> + Unpin),
+    millis: u64,
+) -> Vec<Seen> {
+    let mut seen = Vec::new();
+    for _ in 0..millis {
+        let chunk = Bytes::from(vec![7_u8; 100]);
         driving(&mut rig.conn, async {
             sink.send(chunk).await.unwrap();
             sink.flush().await.unwrap();
         })
         .await;
-        frames.extend(rig.frames());
+        let mut read = 0;
+        for frame in rig.frames() {
+            let stream = frame.header.stream.as_ref();
+            read += frame.data.as_ref().len();
+            seen.push(Seen {
+                at: Instant::now(),
+                t_ping: frame.header.ping,
+                flow: stream.is_some_and(|s| s.credit.is_some() || s.data_len.is_some()),
+            });
+        }
+        if read > 0 {
+            let credit = u32::try_from(read).unwrap();
+            rig.write(raw(credit_header(0, ControlFlags::default(), credit), b""))
+                .await;
+        }
+        tokio::time::advance(Duration::from_millis(1)).await;
     }
-    let data = frames
-        .iter()
-        .map(|frame| frame.data.as_ref().len())
-        .sum::<usize>();
-    assert_eq!(data, 10 * 1024);
-    let stamps = frames
-        .iter()
-        .filter_map(|frame| frame.header.ping)
-        .collect::<Vec<_>>();
-    // One at the start, then one per 1024 bytes.
-    assert!((10..=12).contains(&stamps.len()), "{stamps:?}");
+    seen
+}
 
-    // No data, so the clock decides.
-    tokio::time::advance(Duration::from_secs(4)).await;
-    assert_eq!(
-        rig.frames()
-            .iter()
-            .filter(|f| f.header.ping.is_some())
-            .count(),
-        0
-    );
-    tokio::time::advance(Duration::from_secs(1)).await;
-    assert_eq!(
-        rig.frames()
-            .iter()
-            .filter(|f| f.header.ping.is_some())
-            .count(),
-        1
-    );
-    tokio::time::advance(Duration::from_secs(5)).await;
-    assert_eq!(
-        rig.frames()
-            .iter()
-            .filter(|f| f.header.ping.is_some())
-            .count(),
-        1
-    );
+/// The frames with a `PING`.
+fn pings_of(seen: &[Seen]) -> Vec<&Seen> {
+    seen.iter().filter(|frame| frame.t_ping.is_some()).collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn pings_ride_on_flow_frames_and_back_off() {
+    let mut rig = rig(RammuxRole::Client, config());
+    let stream = rig.conn.try_start_outbound().unwrap().unwrap();
+    let (mut sink, _stream) = stream.into_split();
+    let start = Instant::now();
+
+    // The peer never answers a PING: the gap doubles with every one.
+    let seen = write_for(&mut rig, &mut sink, 100).await;
+    let pings = pings_of(&seen);
+    assert_eq!(pings[0].at, start);
+    for ping in &pings[1..] {
+        assert!(ping.flow, "a PING after the first rides on DATA or WINDOW");
+    }
+    let mut min_gap = Duration::from_millis(10);
+    for pair in pings.windows(2) {
+        assert!(pair[1].at - pair[0].at >= min_gap, "{min_gap:?}");
+        min_gap *= 2;
+    }
+    assert!(pings.len() >= 4, "{}", pings.len());
+
+    // A PONG makes the round trip time 40 ms.
+    let last = pings.last().unwrap();
+    let (t_ping, sent_at) = (last.t_ping.unwrap(), last.at);
+    let elapsed = Instant::now() - sent_at;
+    write_for(
+        &mut rig,
+        &mut sink,
+        40 - u64::try_from(elapsed.as_millis()).unwrap(),
+    )
+    .await;
+    rig.write(pong_of(t_ping)).await;
+    assert_eq!(rig.conn.stats().srtt, Some(Duration::from_millis(40)));
+
+    // From now on, the gap is an eighth of it.
+    let seen = write_for(&mut rig, &mut sink, 100).await;
+    let pings = pings_of(&seen);
+    assert!(pings.len() >= 10, "{}", pings.len());
+    for ping in &pings {
+        assert!(ping.flow);
+    }
+    for pair in pings.windows(2) {
+        assert!(pair[1].at - pair[0].at >= Duration::from_millis(5));
+    }
 }
 
 fn credit_header(id: u16, flags: ControlFlags, credit: u32) -> Header {

@@ -7,7 +7,10 @@ use std::{
 };
 
 use futures::{SinkExt, StreamExt};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    time::Instant,
+};
 
 use crate::{
     config::{RammuxConfig, RammuxRole},
@@ -19,7 +22,7 @@ use crate::{
         codec::{
             RammuxCodec,
             decoder::{DecodedFrame, InboundFrame},
-            encoder::OutFrame,
+            encoder::{OutFrame, OutStream},
         },
     },
 };
@@ -50,7 +53,7 @@ impl<IO> Active<IO> {
     pub fn new(io: IO, role: RammuxRole, config: &RammuxConfig) -> Self {
         Self {
             codec: RammuxCodec::new(io, config.frame_limit, config.inbound_frame_timeout),
-            pings: Pings::new(config.ping_interval, config.ping_bytes.get()),
+            pings: Pings::new(config.ping_interval),
             streams: Streams::new(role, config.clone()),
         }
     }
@@ -134,11 +137,19 @@ where
             // 4. stream data.
             // What goes first cannot wait behind what goes later,
             // but it rides along if the later frame is going out anyway.
-            let (pong, ping) = self.pings.take_frame_part(cx);
+            // The stream part is composed first, because whether the frame carries `DATA` or `WINDOW`
+            // decides whether a `PING` may ride on it.
             let stream = match self.streams.poll_update(cx) {
-                Poll::Ready(update) => Some(update.into()),
+                Poll::Ready(update) => Some(OutStream::from(update)),
                 Poll::Pending => None,
             };
+            let carries_flow = stream
+                .as_ref()
+                .is_some_and(|stream| stream.credit > 0 || !stream.data.is_empty());
+            let srtt = self.streams.flow().srtt.get();
+            let (pong, ping) = self
+                .pings
+                .take_frame_part(cx, Instant::now(), srtt, carries_flow);
             let frame = OutFrame {
                 ping,
                 pong,
@@ -149,7 +160,6 @@ where
                 let _ = self.codec.poll_flush_unpin(cx)?;
                 return Poll::Pending;
             }
-            self.pings.data_sent(frame.data_len());
             self.codec.start_send_unpin(frame)?;
         }
     }

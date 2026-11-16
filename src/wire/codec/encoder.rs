@@ -47,11 +47,6 @@ impl OutFrame {
     pub fn is_empty(&self) -> bool {
         !self.ping && self.pong.is_none() && self.stream.is_none() && !self.term
     }
-
-    /// Length of the `DATA` payload in the frame.
-    pub fn data_len(&self) -> usize {
-        self.stream.as_ref().map_or(0, |stream| stream.data.len())
-    }
 }
 
 /// An [`OutFrame`] that is being written.

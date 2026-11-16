@@ -116,12 +116,6 @@ pub struct RammuxConfig {
     ///
     /// Default: 0.25. From [`advance_grant`](Self::advance_grant) to 1. This setting is local.
     pub advance_budget: f32,
-    /// A `PING` is sent after this many bytes of data.
-    ///
-    /// The answers measure the round trip time, which the flow control needs while data flows.
-    ///
-    /// Default: 32 KiB. This setting is local.
-    pub ping_bytes: NonZeroU32,
     /// A `PING` is sent at least this often, which keeps an idle connection alive.
     ///
     /// Default: 5 s. Not zero, and shorter than [`inbound_frame_timeout`](Self::inbound_frame_timeout).
@@ -151,7 +145,6 @@ impl RammuxConfig {
             remote_recv_pool: 4 * 1024 * 1024,
             advance_grant: 0.25,
             advance_budget: 0.25,
-            ping_bytes: NonZeroU32::new(32 * 1024).unwrap(),
             ping_interval: Duration::from_secs(5),
             inbound_frame_timeout: Duration::from_secs(10),
         }

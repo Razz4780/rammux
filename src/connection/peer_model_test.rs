@@ -51,7 +51,6 @@ fn config() -> RammuxConfig {
     config.remote_recv_window = NonZeroU32::new(96).unwrap();
     config.local_recv_pool = 512;
     config.remote_recv_pool = 384;
-    config.ping_bytes = NonZeroU32::new(256).unwrap();
     config.inbound_frame_timeout = Duration::from_secs(3600);
     config
 }
