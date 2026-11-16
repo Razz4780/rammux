@@ -4,12 +4,15 @@ use bytes::Bytes;
 
 use crate::{
     StreamId,
-    wire::header::{ControlFlags, Header, MAX_HEADER_LEN, Pong, StreamHeader},
+    wire::{
+        codec::CONTROL_BATCH,
+        header::{ControlFlags, Header, MAX_HEADER_LEN, Pong, StreamHeader},
+    },
 };
 
 /// A frame to be written, before its header is encoded.
 ///
-/// The header is encoded only when the frame starts being written,
+/// The header is fixed only when the frame starts being written,
 /// because it carries the timestamp of its first byte.
 #[derive(Debug, Default)]
 pub struct OutFrame {
@@ -47,21 +50,10 @@ impl OutFrame {
     pub fn is_empty(&self) -> bool {
         !self.ping && self.pong.is_none() && self.stream.is_none() && !self.term
     }
-}
 
-/// An [`OutFrame`] that is being written.
-pub struct EncoderItem {
-    header: Header,
-    payload: Bytes,
-    encoded: [u8; MAX_HEADER_LEN],
-    header_len: usize,
-    /// How many bytes of the frame were accepted by the transport.
-    consumed: usize,
-}
-
-impl EncoderItem {
-    pub fn new(frame: OutFrame) -> Self {
-        let (stream, payload) = match frame.stream {
+    /// Returns the header of the frame, with `t_ping` 0 if `PING` is carried, and the payload.
+    pub fn into_parts(self) -> (Header, Bytes) {
+        let (stream, payload) = match self.stream {
             Some(stream) => {
                 let data_len = u16::try_from(stream.data.len()).expect("data too big");
                 (
@@ -79,10 +71,26 @@ impl EncoderItem {
         let header = Header {
             stream,
             // The value is set when the frame is written.
-            ping: frame.ping.then_some(0),
-            pong: frame.pong,
-            term: frame.term,
+            ping: self.ping.then_some(0),
+            pong: self.pong,
+            term: self.term,
         };
+        (header, payload)
+    }
+}
+
+/// A frame with a payload that is being written.
+pub struct EncoderItem {
+    header: Header,
+    payload: Bytes,
+    encoded: [u8; MAX_HEADER_LEN],
+    header_len: usize,
+    /// How many bytes of the frame were accepted by the transport.
+    consumed: usize,
+}
+
+impl EncoderItem {
+    pub fn new(header: Header, payload: Bytes) -> Self {
         let mut item = Self {
             header,
             payload,
@@ -90,7 +98,7 @@ impl EncoderItem {
             header_len: 0,
             consumed: 0,
         };
-        item.stamp(0);
+        item.header_len = item.header.encode(&mut item.encoded);
         item
     }
 
@@ -147,6 +155,94 @@ impl EncoderItem {
     }
 }
 
+/// Frames without payload, encoded back to back, so that they are written together.
+///
+/// Holds at most [`CONTROL_BATCH`] bytes.
+pub struct ControlBuffer {
+    bytes: Vec<u8>,
+    /// The frames that carry a `PING`, in order: where each starts in `bytes`, and its header.
+    pings: Vec<(usize, Header)>,
+    /// How many bytes were accepted by the transport.
+    consumed: usize,
+}
+
+impl ControlBuffer {
+    pub fn new() -> Self {
+        Self {
+            bytes: Vec::with_capacity(CONTROL_BATCH),
+            pings: Vec::new(),
+            consumed: 0,
+        }
+    }
+
+    /// Returns whether another frame fits.
+    ///
+    /// The space is freed only when the transport accepted all bytes.
+    pub fn has_room(&self) -> bool {
+        self.bytes.len() + MAX_HEADER_LEN <= CONTROL_BATCH
+    }
+
+    /// Encodes the frame with the given header at the end of the buffer.
+    ///
+    /// The frame must have no payload, and the buffer must [have room](Self::has_room).
+    pub fn push(&mut self, header: Header) {
+        assert!(self.has_room(), "control buffer is full");
+        assert!(
+            header.stream.is_none_or(|stream| stream.data_len.is_none()),
+            "frame with payload"
+        );
+        let mut encoded = [0; MAX_HEADER_LEN];
+        let len = header.encode(&mut encoded);
+        if header.ping.is_some() {
+            self.pings.push((self.bytes.len(), header));
+        }
+        self.bytes.extend_from_slice(&encoded[..len]);
+    }
+
+    /// Returns whether a frame with a `PING` was not started yet, so it needs a stamp.
+    pub fn needs_stamp(&self) -> bool {
+        // The last one is started last.
+        self.pings
+            .last()
+            .is_some_and(|(start, _)| *start >= self.consumed)
+    }
+
+    /// Encodes again, with the given `t_ping`, the frames with a `PING` of which the transport accepted nothing.
+    pub fn stamp(&mut self, t_ping: u32) {
+        let consumed = self.consumed;
+        for (start, header) in &mut self.pings {
+            if *start < consumed {
+                continue;
+            }
+            header.ping = Some(t_ping);
+            let mut encoded = [0; MAX_HEADER_LEN];
+            let len = header.encode(&mut encoded);
+            self.bytes[*start..*start + len].copy_from_slice(&encoded[..len]);
+        }
+    }
+
+    /// Returns the bytes not yet accepted by the transport.
+    pub fn unwritten(&self) -> &[u8] {
+        &self.bytes[self.consumed..]
+    }
+
+    /// Returns whether all frames were accepted by the transport.
+    pub fn is_empty(&self) -> bool {
+        self.unwritten().is_empty()
+    }
+
+    /// Marks the given number of bytes as accepted by the transport.
+    pub fn advance(&mut self, cnt: usize) {
+        assert!(cnt <= self.unwritten().len(), "overflow");
+        self.consumed += cnt;
+        if self.consumed == self.bytes.len() {
+            self.bytes.clear();
+            self.pings.clear();
+            self.consumed = 0;
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use bytes::Bytes;
@@ -154,8 +250,11 @@ mod test {
     use crate::{
         StreamId,
         wire::{
-            codec::encoder::{EncoderItem, OutFrame, OutStream},
-            header::{ControlFlags, Pong},
+            codec::{
+                CONTROL_BATCH,
+                encoder::{ControlBuffer, EncoderItem, OutFrame, OutStream},
+            },
+            header::{ControlFlags, Header, MAX_HEADER_LEN, Pong},
         },
     };
 
@@ -181,9 +280,14 @@ mod test {
         }
     }
 
+    fn item() -> EncoderItem {
+        let (header, payload) = frame().into_parts();
+        EncoderItem::new(header, payload)
+    }
+
     #[test]
     fn slices_follow_the_progress() {
-        let mut item = EncoderItem::new(frame());
+        let mut item = item();
         item.stamp(0x0A0B0C0D);
         let all = collect(&item);
         // 2 flags, 2 id, 4 credit, 2 len, 4 t_ping, 4 pong, 5 payload.
@@ -203,7 +307,7 @@ mod test {
 
     #[test]
     fn restamping_changes_only_the_ping() {
-        let mut item = EncoderItem::new(frame());
+        let mut item = item();
         item.stamp(77);
         let first = collect(&item);
         item.stamp(78);
@@ -217,14 +321,94 @@ mod test {
     #[test]
     #[should_panic(expected = "already fixed")]
     fn header_is_fixed_after_the_first_byte() {
-        let mut item = EncoderItem::new(frame());
+        let mut item = item();
         item.advance(1);
         item.stamp(5);
     }
 
+    fn ping() -> Header {
+        Header {
+            ping: Some(0),
+            ..Default::default()
+        }
+    }
+
+    fn pong() -> Header {
+        Header {
+            pong: Some(Pong { t_echo: 0x0A0B0C0D }),
+            ..Default::default()
+        }
+    }
+
+    fn term() -> Header {
+        OutFrame::terminate().into_parts().0
+    }
+
     #[test]
-    fn term_frame() {
-        let item = EncoderItem::new(OutFrame::terminate());
-        assert_eq!(collect(&item), &[0x00, 0x80]);
+    fn control_frames_are_encoded_back_to_back() {
+        let mut buffer = ControlBuffer::new();
+        buffer.push(pong());
+        buffer.push(term());
+        assert_eq!(
+            buffer.unwritten(),
+            &[0x00, 0x40, 0x0A, 0x0B, 0x0C, 0x0D, 0x00, 0x80]
+        );
+        assert!(!buffer.needs_stamp());
+    }
+
+    #[test]
+    fn stamping_skips_the_started_frames() {
+        let mut buffer = ControlBuffer::new();
+        buffer.push(ping());
+        buffer.push(pong());
+        buffer.push(ping());
+        buffer.stamp(1);
+        assert_eq!(
+            buffer.unwritten(),
+            &[
+                0x00, 0x20, 0, 0, 0, 1, // PING
+                0x00, 0x40, 0x0A, 0x0B, 0x0C, 0x0D, // PONG
+                0x00, 0x20, 0, 0, 0, 1, // PING
+            ]
+        );
+
+        // The first PING is started, the second is not.
+        buffer.advance(1);
+        assert!(buffer.needs_stamp());
+        buffer.stamp(2);
+        assert_eq!(&buffer.unwritten()[..5], &[0x20, 0, 0, 0, 1]);
+        assert_eq!(&buffer.unwritten()[11..], &[0x00, 0x20, 0, 0, 0, 2]);
+
+        // Both are started.
+        buffer.advance(12);
+        assert!(!buffer.needs_stamp());
+        buffer.stamp(3);
+        assert_eq!(buffer.unwritten(), &[0x20, 0, 0, 0, 2]);
+    }
+
+    #[test]
+    fn room_is_freed_when_everything_is_written() {
+        let mut buffer = ControlBuffer::new();
+        while buffer.has_room() {
+            buffer.push(pong());
+        }
+        let len = buffer.unwritten().len();
+        assert!(len <= CONTROL_BATCH && len + MAX_HEADER_LEN > CONTROL_BATCH);
+
+        buffer.advance(len - 1);
+        assert!(!buffer.has_room());
+        buffer.advance(1);
+        assert!(buffer.is_empty());
+        assert!(buffer.has_room());
+        buffer.push(ping());
+        assert!(buffer.needs_stamp());
+        assert_eq!(buffer.unwritten(), &[0x00, 0x20, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "frame with payload")]
+    fn control_buffer_takes_no_payload() {
+        let (header, _) = frame().into_parts();
+        ControlBuffer::new().push(header);
     }
 }
