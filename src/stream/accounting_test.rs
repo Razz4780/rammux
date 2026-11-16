@@ -199,7 +199,7 @@ async fn run(seed: u64, steps: usize) -> u64 {
             for _ in 0..rng.next(4) {
                 let s = usize::try_from(rng.next(STREAMS as u64)).unwrap();
                 if let Some(Some(data)) = right.duplexes[s].next().now_or_never() {
-                    read[s] += data.len();
+                    read[s] += data.unwrap().len();
                 }
             }
             left.flush(lag);

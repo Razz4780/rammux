@@ -11,7 +11,7 @@ use crate::{
     StreamId,
     buffer::Data,
     config::RammuxConfig,
-    error::StreamError,
+    error::StreamViolation,
     stream::{
         ConnFlow, FinState, RammuxDuplex, RxFlow,
         handle::StreamHandle,
@@ -55,7 +55,7 @@ impl Selectors {
         credit: Option<NonZeroU32>,
         data: Data,
         flags: ControlFlags,
-    ) -> Result<FinState, StreamError> {
+    ) -> Result<FinState, StreamViolation> {
         handle.received(
             credit,
             data,
@@ -85,7 +85,7 @@ fn received_alone(
     credit: Option<NonZeroU32>,
     data: Data,
     flags: ControlFlags,
-) -> Result<FinState, StreamError> {
+) -> Result<FinState, StreamViolation> {
     handle.received(
         credit,
         data,
@@ -96,7 +96,7 @@ fn received_alone(
 }
 
 #[tokio::test]
-async fn rammux_duplex_drop_closes_both() {
+async fn rammux_duplex_drop_closes_both_and_aborts_writing() {
     let (_, mut selectors, duplex) = new_stream(0);
     drop(duplex);
     // `SYN` rides on the first frame, whichever direction builds it.
@@ -118,7 +118,7 @@ async fn rammux_duplex_drop_closes_both() {
             fin_read: false,
             fin_write: true,
             syn: false,
-            abort: false,
+            abort: true,
         }
     );
     assert_eq!(
@@ -134,7 +134,7 @@ async fn rammux_duplex_drop_closes_both() {
 }
 
 #[tokio::test]
-async fn rammux_sink_drop_closes_writing() {
+async fn rammux_sink_drop_aborts_writing() {
     let (_, mut selectors, duplex) = new_stream(0);
     let _stream = duplex.into_split().1;
     assert!(selectors.credit.next().now_or_never().is_none());
@@ -145,7 +145,7 @@ async fn rammux_sink_drop_closes_writing() {
             fin_read: false,
             fin_write: true,
             syn: true,
-            abort: false,
+            abort: true,
         }
     );
     assert_eq!(
@@ -212,7 +212,7 @@ async fn credit_is_returned_at_the_threshold() {
         0,
         "the base window is not the pool"
     );
-    duplex.next().await.unwrap();
+    duplex.next().await.unwrap().unwrap();
     // The whole 8 bytes were read, the threshold is passed.
     let (update, _) = selectors.credit.next().await.unwrap();
     assert_eq!(update.credit, 8);
@@ -223,13 +223,13 @@ async fn credit_is_returned_at_the_threshold() {
         selectors
             .received(&handle, None, bytes(1), NO_FINS)
             .unwrap();
-        duplex.next().await.unwrap();
+        duplex.next().await.unwrap().unwrap();
         assert!(selectors.credit.next().now_or_never().is_none());
     }
     selectors
         .received(&handle, None, bytes(1), NO_FINS)
         .unwrap();
-    duplex.next().await.unwrap();
+    duplex.next().await.unwrap().unwrap();
     let (update, _) = selectors.credit.next().await.unwrap();
     assert_eq!(update.credit, 6);
 }
@@ -241,7 +241,7 @@ async fn credit_is_not_sent_for_unread_data() {
         .received(&handle, None, bytes(12), NO_FINS)
         .unwrap();
     assert!(selectors.credit.next().now_or_never().is_none());
-    duplex.next().await.unwrap();
+    duplex.next().await.unwrap().unwrap();
     assert_eq!(selectors.credit.next().await.unwrap().0.credit, 12);
 }
 
@@ -293,7 +293,7 @@ async fn credit_returns_the_pool_share() {
         .received(&handle, None, bytes(12 + 10), NO_FINS)
         .unwrap();
     assert_eq!(selectors.rx_pool_used(), 10);
-    duplex.next().await.unwrap();
+    duplex.next().await.unwrap().unwrap();
     let (update, _) = selectors.credit.next().await.unwrap();
     assert_eq!(update.credit, 22);
     assert_eq!(selectors.rx_pool_used(), 0);
@@ -349,7 +349,7 @@ async fn pool_is_returned_when_the_reader_drains_after_fin_write() {
         .received(&handle, None, bytes(12 + 10), FIN_WRITE)
         .unwrap();
     assert_eq!(selectors.rx_pool_used(), 10);
-    duplex.next().await.unwrap();
+    duplex.next().await.unwrap().unwrap();
     // The reader is done, so FIN_READ zeroes the counter.
     let (update, _) = selectors.credit.next().await.unwrap();
     assert!(update.flags.fin_read || update.credit > 0);
@@ -427,7 +427,10 @@ async fn parts_of_a_frame_are_processed_in_protocol_order() {
     // DATA is processed before FIN_WRITE.
     let (handle, _selectors, mut duplex) = new_stream(0);
     received_alone(&handle, None, Data::copy_from_slice(b"a"), FIN_WRITE).unwrap();
-    assert_eq!(duplex.next().await.unwrap(), Bytes::from_static(b"a"));
+    assert_eq!(
+        duplex.next().await.unwrap().unwrap(),
+        Bytes::from_static(b"a")
+    );
     assert!(duplex.next().await.is_none());
 
     // WINDOW is processed before FIN_READ.

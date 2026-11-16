@@ -7,8 +7,10 @@
 //!
 //! - [`RammuxConnection`](connection::RammuxConnection) owns the transport and runs the protocol.
 //!   Nothing happens in the background: your code polls it, and all streams stall when it does not.
-//! - [`RammuxDuplex`](stream::RammuxDuplex) is one stream: a [`Sink`](futures::Sink) and a
-//!   [`Stream`](futures::Stream) of [`Bytes`](bytes::Bytes).
+//! - [`RammuxDuplex`](stream::RammuxDuplex) is one stream: a [`Sink`](futures::Sink) of
+//!   [`Bytes`](bytes::Bytes), and a [`Stream`](futures::Stream) of them. Only closing the sink ends
+//!   a stream cleanly. Otherwise the reader on the other side gets a [`StreamError`](stream::StreamError)
+//!   that says why the stream ended.
 //! - [`RammuxConfig`](config::RammuxConfig) holds the settings, which the two peers have to agree on.
 //! - When the peers are done, [`downgrade`](connection::RammuxConnection::downgrade) ends the session
 //!   and gives the transport back.
@@ -21,6 +23,7 @@
 //! use rammux::{
 //!     config::{RammuxConfig, RammuxRole},
 //!     connection::{RammuxConnection, RammuxProgress},
+//!     stream::StreamError,
 //! };
 //!
 //! # #[tokio::main]
@@ -36,8 +39,9 @@
 //!     loop {
 //!         match server.progress().await? {
 //!             RammuxProgress::Inbound(stream) => {
+//!                 // Writes back what it reads, and closes its sink when the client closes its own.
 //!                 let (sink, stream) = stream.into_split();
-//!                 tokio::spawn(stream.map(Ok).forward(sink));
+//!                 tokio::spawn(stream.forward(sink));
 //!             },
 //!             // Completes the downgrade, and returns the transport.
 //!             RammuxProgress::Downgraded(downgraded) => break downgraded.await,
@@ -52,7 +56,13 @@
 //!     .expect("the stream limit is not reached");
 //! let mut echo = tokio::spawn(async move {
 //!     stream.send(Bytes::from_static(b"hello")).await?;
-//!     Ok::<_, std::io::Error>(stream.next().await)
+//!     // Only closing the sink ends the stream cleanly. The server's reader ends, and so does the echo.
+//!     stream.close().await?;
+//!     let mut reply = Vec::new();
+//!     while let Some(chunk) = stream.next().await {
+//!         reply.extend_from_slice(&chunk?);
+//!     }
+//!     Ok::<_, StreamError>(reply)
 //! });
 //!
 //! // Nothing runs in the background: streams make progress only while the connection is polled.
@@ -62,7 +72,7 @@
 //!         progress = client.progress() => { progress?; },
 //!     }
 //! };
-//! assert_eq!(reply.as_deref(), Some(&b"hello"[..]));
+//! assert_eq!(reply, b"hello");
 //!
 //! // End the session, and take the transports back.
 //! let _client_io = client.downgrade()?.await?;

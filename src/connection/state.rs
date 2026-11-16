@@ -1,6 +1,6 @@
 use crate::{
     connection::{active::Active, downgrade::Downgraded},
-    error::ErrorKind,
+    error::{ErrorKind, StreamError},
 };
 
 /// Inner state of a [`RammuxConnection`](super::RammuxConnection).
@@ -31,15 +31,26 @@ impl<IO> ConnState<IO> {
         }
     }
 
-    /// Starts the downgrade. The streams are aborted.
+    /// Starts the downgrade. The streams end with [`StreamError::ConnectionDowngraded`].
     pub fn downgrade(&mut self, term_received: bool) -> Result<Downgraded<IO>, ErrorKind> {
         match std::mem::replace(self, Self::Downgraded) {
-            Self::Active(active) => Ok(Downgraded::new(active.into_codec(), term_received)),
+            Self::Active(mut active) => {
+                active.end_streams(StreamError::ConnectionDowngraded);
+                Ok(Downgraded::new(active.into_codec(), term_received))
+            },
             Self::Poisoned => {
                 *self = Self::Poisoned;
                 Err(ErrorKind::Poisoned)
             },
             Self::Downgraded => Err(ErrorKind::AlreadyDowngraded),
         }
+    }
+
+    /// The connection failed. The streams end with [`StreamError::ConnectionFailed`].
+    pub fn poison(&mut self) {
+        if let Self::Active(active) = self {
+            active.end_streams(StreamError::ConnectionFailed);
+        }
+        *self = Self::Poisoned;
     }
 }

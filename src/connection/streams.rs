@@ -14,7 +14,7 @@ use crate::{
     StreamId,
     buffer::Data,
     config::{RammuxConfig, RammuxRole},
-    error::{ErrorKind, StreamError},
+    error::{ErrorKind, StreamError, StreamViolation},
     flow::Srtt,
     stream::{
         self, ConnFlow, FinState, RammuxDuplex, RxFlow,
@@ -28,7 +28,8 @@ use crate::{
 /// the outbound ones, and the [`RxFlow`] and [`ConnFlow`] they share.
 ///
 /// A stream is forgotten once it is closed on both sides. Its ID can then be reused.
-/// All streams are [aborted](StreamHandle::abort) when this struct is dropped.
+/// The streams that are left are [aborted](StreamHandle::abort) when the connection ends:
+/// with [`Self::end`], or with [`StreamError::ConnectionDropped`] when this struct is dropped.
 pub struct Streams {
     role: RammuxRole,
     config: RammuxConfig,
@@ -113,7 +114,7 @@ impl Streams {
         let id = header.id;
         let violation = |error: &'static str| ErrorKind::Stream {
             id,
-            error: StreamError(error),
+            error: StreamViolation(error),
         };
 
         let (handle, new_stream) = if id.initiated_by() == self.role {
@@ -196,6 +197,16 @@ impl Streams {
         Poll::Ready(update)
     }
 
+    /// Aborts all streams, because the connection is gone. Their applications get the `reason`.
+    pub fn end(&mut self, reason: StreamError) {
+        for handle in self.outbound.drain() {
+            handle.abort(reason);
+        }
+        for (_, handle) in self.inbound.drain() {
+            handle.abort(reason);
+        }
+    }
+
     fn remove(&mut self, id: StreamId) {
         if id.initiated_by() == self.role {
             self.outbound.remove(id.slab_idx());
@@ -207,11 +218,6 @@ impl Streams {
 
 impl Drop for Streams {
     fn drop(&mut self) {
-        for handle in self.outbound.drain() {
-            handle.abort();
-        }
-        for (_, handle) in self.inbound.drain() {
-            handle.abort();
-        }
+        self.end(StreamError::ConnectionDropped);
     }
 }

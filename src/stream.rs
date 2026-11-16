@@ -19,6 +19,8 @@ use crate::{
 pub(crate) use conn_flow::{ConnFlow, RxFlow};
 pub use duplex::{RammuxDuplex, RammuxSink, RammuxStream};
 
+pub use crate::error::StreamError;
+
 #[cfg(test)]
 mod accounting_test;
 mod conn_flow;

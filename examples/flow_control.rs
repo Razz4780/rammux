@@ -35,15 +35,17 @@ async fn run_client(mut rammux: RammuxConnection<DuplexStream>) {
         println!("[{role}] Started stream {}", stream.id());
         tokio::spawn(async move {
             loop {
-                if stream.send(DATA.clone()).await.is_ok() {
-                    println!(
+                match stream.send(DATA.clone()).await {
+                    Ok(()) => println!(
                         "[{role}] Sent and flushed {} bytes in stream {}",
                         DATA.len(),
                         stream.id(),
-                    );
-                } else {
-                    println!("[{role}] Stream {} was closed.", stream.id());
-                    break;
+                    ),
+                    // The server stops reading the first stream, and the downgrade ends the second.
+                    Err(error) => {
+                        println!("[{role}] Stream {} ended: {error}.", stream.id());
+                        break;
+                    },
                 }
             }
         });
@@ -94,11 +96,17 @@ async fn run_server(mut rammux: RammuxConnection<DuplexStream>) {
                             stream.id()
                         );
                         while let Some(chunk) = stream.next().await {
-                            println!(
-                                "[{role}] Read {} bytes from stream {}.",
-                                chunk.len(),
-                                stream.id()
-                            );
+                            match chunk {
+                                Ok(chunk) => println!(
+                                    "[{role}] Read {} bytes from stream {}.",
+                                    chunk.len(),
+                                    stream.id()
+                                ),
+                                // The client never closes the stream: the downgrade ends it.
+                                Err(error) => {
+                                    println!("[{role}] Stream {} ended: {error}.", stream.id());
+                                },
+                            }
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     });

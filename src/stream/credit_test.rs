@@ -71,7 +71,7 @@ impl Rx {
         self.inbound
             .received_data(Data::copy_from_slice(&vec![0; len]), &mut self.flow.pool)
             .unwrap();
-        let Poll::Ready(Some(data)) = self.inbound.poll_read(Waker::noop(), &self.credit_task)
+        let Poll::Ready(Some(Ok(data))) = self.inbound.poll_read(Waker::noop(), &self.credit_task)
         else {
             panic!("the data is ready");
         };

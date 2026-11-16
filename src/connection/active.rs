@@ -15,7 +15,7 @@ use tokio::{
 use crate::{
     config::{RammuxConfig, RammuxRole},
     connection::{RammuxStats, pings::Pings, streams::Streams},
-    error::ErrorKind,
+    error::{ErrorKind, StreamError},
     stream::{RammuxDuplex, updates::StreamUpdate},
     wire::{
         clock,
@@ -67,6 +67,11 @@ impl<IO> Active<IO> {
     /// Starts a new stream, unless the configured limit or the IDs are exhausted.
     pub fn open_outbound(&mut self) -> Option<RammuxDuplex> {
         self.streams.open_outbound()
+    }
+
+    /// Aborts all streams, because the connection is gone. Their applications get the `reason`.
+    pub fn end_streams(&mut self, reason: StreamError) {
+        self.streams.end(reason);
     }
 
     /// Returns the transport, and drops the streams.

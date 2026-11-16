@@ -15,7 +15,10 @@ use tokio::time::Instant;
 
 use crate::{
     StreamId,
-    stream::{ConnFlow, FinState, RxFlow, StreamRef, outbound::Ctx},
+    stream::{
+        ConnFlow, FinState, RxFlow, StreamRef,
+        outbound::{Ctx, FinWrite},
+    },
     wire::{codec::encoder::OutStream, header::ControlFlags},
 };
 
@@ -138,12 +141,12 @@ impl Task<ConnFlow> for DataUpdates {
             flags: ControlFlags {
                 syn: std::mem::take(&mut state.syn_pending),
                 fin_read: false,
-                fin_write,
-                abort: false,
+                fin_write: fin_write.is_some(),
+                abort: fin_write == Some(FinWrite::Abort),
             },
         };
         let fin_state = state.fin_state();
-        Poll::Ready(if fin_write {
+        Poll::Ready(if fin_write.is_some() {
             // Nothing more will be sent.
             ControlFlow::Break((update, fin_state))
         } else {

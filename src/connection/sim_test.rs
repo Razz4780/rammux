@@ -262,7 +262,8 @@ impl Rig {
         let read = counter.clone();
         tokio::spawn(async move {
             let (_sink, mut stream) = server_stream.into_split();
-            while let Some(data) = stream.next().await {
+            // The writer never closes: the stream ends with the connection.
+            while let Some(Ok(data)) = stream.next().await {
                 read.fetch_add(data.len() as u64, Ordering::Relaxed);
             }
         });
@@ -295,7 +296,8 @@ impl Rig {
         self.read.push(counter.clone());
         tokio::spawn(async move {
             let (_sink, mut stream) = server_stream.into_split();
-            while let Some(data) = stream.next().await {
+            // The writer never closes: the stream ends with the connection.
+            while let Some(Ok(data)) = stream.next().await {
                 counter.fetch_add(data.len() as u64, Ordering::Relaxed);
                 if stall_at.is_some_and(|at| Instant::now() >= at) {
                     std::future::pending::<()>().await;
@@ -321,7 +323,8 @@ impl Rig {
         self.read.push(counter.clone());
         tokio::spawn(async move {
             let (_sink, mut stream) = client_stream.into_split();
-            while let Some(data) = stream.next().await {
+            // The writer never closes: the stream ends with the connection.
+            while let Some(Ok(data)) = stream.next().await {
                 counter.fetch_add(data.len() as u64, Ordering::Relaxed);
             }
         });
@@ -471,7 +474,7 @@ async fn talk(stream: RammuxDuplex, bytes: usize) -> usize {
     });
     let mut read = 0;
     while let Some(data) = stream.next().await {
-        read += data.len();
+        read += data.unwrap().len();
     }
     writer.await.unwrap();
     read

@@ -47,6 +47,7 @@ use futures::{SinkExt, StreamExt};
 use rammux::{
     config::{RammuxConfig, RammuxRole},
     connection::{RammuxConnection, RammuxProgress},
+    stream::StreamError,
 };
 
 #[tokio::main]
@@ -62,8 +63,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             match server.progress().await? {
                 RammuxProgress::Inbound(stream) => {
+                    // Writes back what it reads, and closes its sink when the client closes its own.
                     let (sink, stream) = stream.into_split();
-                    tokio::spawn(stream.map(Ok).forward(sink));
+                    tokio::spawn(stream.forward(sink));
                 },
                 // Completes the downgrade, and returns the transport.
                 RammuxProgress::Downgraded(downgraded) => break downgraded.await,
@@ -78,7 +80,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("the stream limit is not reached");
     let mut echo = tokio::spawn(async move {
         stream.send(Bytes::from_static(b"hello")).await?;
-        Ok::<_, std::io::Error>(stream.next().await)
+        // Only closing the sink ends the stream cleanly. The server's reader ends, and so does the echo.
+        stream.close().await?;
+        let mut reply = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            reply.extend_from_slice(&chunk?);
+        }
+        Ok::<_, StreamError>(reply)
     });
 
     // Nothing runs in the background: streams make progress only while the connection is polled.
@@ -88,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             progress = client.progress() => { progress?; },
         }
     };
-    assert_eq!(reply.as_deref(), Some(&b"hello"[..]));
+    assert_eq!(reply, b"hello");
 
     // End the session, and take the transports back.
     let _client_io = client.downgrade()?.await?;
@@ -116,11 +124,20 @@ Either peer starts a stream with `RammuxConnection::try_start_outbound`, up to t
 A stream is a `RammuxDuplex`:
 
 - a `futures::Sink<bytes::Bytes>` for writing,
-- a `futures::Stream<Item = bytes::Bytes>` for reading.
+- a `futures::Stream<Item = Result<bytes::Bytes, StreamError>>` for reading.
 
-It can move to another task, and `into_split` separates the two halves. The directions close independently:
-closing or dropping the sink ends the stream for the peer's reader, and dropping the reader tells the peer's
-writer to stop. Flushing the sink waits until the connection has taken the data, not until the peer has read it.
+It can move to another task, and `into_split` separates the two halves. Flushing the sink waits until the
+connection has taken the data, not until the peer has read it.
+
+The directions close independently, and the reader learns how the writer on the other side ended:
+
+- Closing the sink is the only clean end. The peer's reader gets the data, and then `None`.
+- Dropping the sink without closing it aborts the stream. The data that the connection has not taken yet is
+  discarded, and the peer's reader gets the data that arrived, then `StreamError::PeerAborted`, then `None`.
+- Dropping the reader tells the peer's writer to stop: its sink fails with `StreamError::PeerStoppedReading`.
+- When the connection ends, so do the streams that are still open. Their readers get the data that arrived,
+  then `StreamError::ConnectionFailed`, `ConnectionDowngraded` or `ConnectionDropped`, and their sinks fail
+  with the same error.
 
 ### Configuration
 
@@ -156,8 +173,11 @@ rammux never closes the transport. `RammuxConnection::downgrade` ends the sessio
 and returns the transport, ready for whatever comes next. The peer learns about it from
 `RammuxProgress::Downgraded`, and gets its transport back the same way.
 
-A downgrade ends all streams, so finish them first: data that the connection has not sent yet is lost.
-Dropping the connection instead ends everything abruptly, and the peer sees an error.
+A downgrade ends the streams that are still open, on both sides, with `StreamError::ConnectionDowngraded`, and
+the data that the connection has not sent yet is lost. So close the sinks first: a stream whose sink completed
+its close before the downgrade ends cleanly for its reader. Dropping the connection instead ends everything
+abruptly: its streams end with `StreamError::ConnectionDropped`, and the peer's connection fails with an error,
+which ends the peer's streams with `StreamError::ConnectionFailed`.
 
 ## Requirements
 

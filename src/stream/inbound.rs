@@ -7,7 +7,7 @@ use tokio::time::Instant;
 
 use crate::{
     buffer::{Data, DataList},
-    error::StreamError,
+    error::{StreamError, StreamViolation},
     flow::{self, CREDIT_STEP_DIVISOR, Pool, RateEstimate, Window},
     stream::{FinState, RxFlow, waker::WakerSlot},
 };
@@ -60,15 +60,21 @@ enum InboundState {
         /// Waits for [`Self::Open::ready_data`].
         reader: WakerSlot,
     },
-    /// `FIN_WRITE` was received, and the application still reads the rest of the data.
+    /// `FIN_WRITE` was received, or the connection is gone, and the application still reads the rest of the data.
     ///
     /// `FIN_READ` is sent, and the stream can close, only once everything is read.
     HalfClosed {
         /// Never empty.
         ready_data: DataList,
+        /// What the application reads after the data: [`None`] for a clean end.
+        error: Option<StreamError>,
     },
     /// Nothing more will be read. `FIN_READ` is sent if it was not sent yet.
-    Closed { fin_state: FinState },
+    Closed {
+        fin_state: FinState,
+        /// The error that the application reads before the end of the stream, if it did not read it yet.
+        error: Option<StreamError>,
+    },
 }
 
 impl InboundTraffic {
@@ -90,7 +96,7 @@ impl InboundTraffic {
     pub fn fin_state(&self) -> FinState {
         match &self.state {
             InboundState::Open { .. } | InboundState::HalfClosed { .. } => FinState::default(),
-            InboundState::Closed { fin_state } => *fin_state,
+            InboundState::Closed { fin_state, .. } => *fin_state,
         }
     }
 
@@ -98,8 +104,13 @@ impl InboundTraffic {
 
     /// Returns the next chunk of data for the application, or [`None`] at the end of the stream.
     ///
+    /// A stream that did not end cleanly returns the error once, after the data and before the end.
     /// Wakes the `credit_task` of the stream when the read makes credit or `FIN_READ` due.
-    pub fn poll_read(&mut self, waker: &Waker, credit_task: &AtomicWaker) -> Poll<Option<Data>> {
+    pub fn poll_read(
+        &mut self,
+        waker: &Waker,
+        credit_task: &AtomicWaker,
+    ) -> Poll<Option<Result<Data, StreamError>>> {
         let data = match &mut self.state {
             InboundState::Open { ready_data, reader } => {
                 let Some(data) = ready_data.pop_front() else {
@@ -109,31 +120,33 @@ impl InboundTraffic {
                 data
             },
 
-            InboundState::HalfClosed { ready_data } => {
+            InboundState::HalfClosed { ready_data, error } => {
                 let data = ready_data
                     .pop_front()
                     .expect("a half-closed direction has data to read");
                 if ready_data.is_empty() {
-                    // Everything is read. The sender gets `FIN_READ` (and the stream's share of the pool back).
+                    // Everything is read. The sender gets `FIN_READ` (and the stream's share of the pool back),
+                    // whatever the application reads next.
                     self.state = InboundState::Closed {
                         fin_state: FinState {
                             sent: false,
                             received: true,
                         },
+                        error: *error,
                     };
                     credit_task.wake();
                 }
                 data
             },
 
-            InboundState::Closed { .. } => return Poll::Ready(None),
+            InboundState::Closed { error, .. } => return Poll::Ready(error.take().map(Err)),
         };
 
         self.credit += data.as_ref().len() as u64;
         if self.credit >= self.step {
             credit_task.wake();
         }
-        Poll::Ready(Some(data))
+        Poll::Ready(Some(Ok(data)))
     }
 
     /// The application stops reading. `FIN_READ` follows, and the data that arrives is discarded.
@@ -150,6 +163,7 @@ impl InboundTraffic {
                 sent: false,
                 received,
             },
+            error: None,
         };
         credit_task.wake();
     }
@@ -203,7 +217,7 @@ impl InboundTraffic {
                 Poll::Ready((credit, false))
             },
 
-            InboundState::Closed { fin_state } => {
+            InboundState::Closed { fin_state, .. } => {
                 if fin_state.sent {
                     return Poll::Pending;
                 }
@@ -229,7 +243,7 @@ impl InboundTraffic {
     }
 
     /// The peer sent data.
-    pub fn received_data(&mut self, data: Data, pool: &mut Pool) -> Result<(), StreamError> {
+    pub fn received_data(&mut self, data: Data, pool: &mut Pool) -> Result<(), StreamViolation> {
         let len = data.as_ref().len() as u64;
         if len == 0 {
             return Ok(());
@@ -246,10 +260,12 @@ impl InboundTraffic {
             InboundState::HalfClosed { .. }
             | InboundState::Closed {
                 fin_state: FinState { received: true, .. },
-            } => Err(StreamError("sent data after FIN_WRITE")),
+                ..
+            } => Err(StreamViolation("sent data after FIN_WRITE")),
 
             InboundState::Closed {
                 fin_state: FinState { sent: false, .. },
+                ..
             } => {
                 // We stopped reading, but the sender does not know yet.
                 // The data counts against the pool until `FIN_READ` is written, but we drop it.
@@ -258,6 +274,7 @@ impl InboundTraffic {
 
             InboundState::Closed {
                 fin_state: FinState { sent: true, .. },
+                ..
             } => {
                 // The sender has not read our `FIN_READ` yet.
                 Ok(())
@@ -265,14 +282,37 @@ impl InboundTraffic {
         }
     }
 
-    /// The peer stopped writing.
+    /// The peer stopped writing: it closed its sink, or it dropped it if `abort`.
     ///
     /// Wakes the `credit_task` of the stream if `FIN_READ` is due now: nothing is left to read.
-    pub fn received_fin_write(&mut self, credit_task: &AtomicWaker) -> Result<(), StreamError> {
+    pub fn received_fin_write(
+        &mut self,
+        abort: bool,
+        credit_task: &AtomicWaker,
+    ) -> Result<(), StreamViolation> {
+        self.writing_ended(abort.then_some(StreamError::PeerAborted), credit_task)
+    }
+
+    /// The connection is gone. The application reads the data that arrived, and then the reason.
+    ///
+    /// A direction that already received `FIN_WRITE` keeps the end it got.
+    pub fn abort(&mut self, reason: StreamError, credit_task: &AtomicWaker) {
+        let _ = self.writing_ended(Some(reason), credit_task);
+    }
+
+    /// Nothing more will arrive. The application reads the data that did, and then the `error`, if any.
+    ///
+    /// Wakes the `credit_task` of the stream if `FIN_READ` is due now: nothing is left to read.
+    fn writing_ended(
+        &mut self,
+        error: Option<StreamError>,
+        credit_task: &AtomicWaker,
+    ) -> Result<(), StreamViolation> {
         match &mut self.state {
             InboundState::Open { ready_data, .. } if !ready_data.is_empty() => {
                 self.state = InboundState::HalfClosed {
                     ready_data: std::mem::take(ready_data),
+                    error,
                 };
                 Ok(())
             },
@@ -285,6 +325,7 @@ impl InboundTraffic {
                         sent: false,
                         received: true,
                     },
+                    error,
                 };
                 Ok(())
             },
@@ -292,9 +333,11 @@ impl InboundTraffic {
             InboundState::HalfClosed { .. }
             | InboundState::Closed {
                 fin_state: FinState { received: true, .. },
-            } => Err(StreamError("sent duplicate FIN_WRITE")),
+                ..
+            } => Err(StreamViolation("sent duplicate FIN_WRITE")),
 
-            InboundState::Closed { fin_state } => {
+            InboundState::Closed { fin_state, .. } => {
+                // The application stopped reading: nobody reads the error.
                 fin_state.received = true;
                 Ok(())
             },
@@ -314,10 +357,10 @@ impl InboundTraffic {
 }
 
 /// Accounts for received data, and checks that the sender stays within the pool.
-fn count(window: &mut Window, pool: &mut Pool, len: u64) -> Result<(), StreamError> {
+fn count(window: &mut Window, pool: &mut Pool, len: u64) -> Result<(), StreamViolation> {
     window.add(pool, len);
     if pool.is_overdrawn() {
-        return Err(StreamError("exceeded the receive pool"));
+        return Err(StreamViolation("exceeded the receive pool"));
     }
     Ok(())
 }

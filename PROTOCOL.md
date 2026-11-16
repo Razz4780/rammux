@@ -40,25 +40,27 @@ A session is a sequence of frames in each direction. There is one frame type. Al
 | `0x0020` | `PING` | `t_ping: u32` | A timestamp to echo. |
 | `0x0040` | `PONG` | `t_echo: u32` | The echo of a `PING`. |
 | `0x0080` | `TERM` | | The sender of the frame ends the session. |
-| `0xFF00` | reserved | | Must be zero. |
+| `0x0100` | `ABORT` | `stream_id` | With `FIN_WRITE`: the sender of the frame stopped writing before it finished. |
+| `0xFE00` | reserved | | Must be zero. |
 
 The fields follow the flags in this order: `stream_id`, `credit`, `len`, `t_ping`, `t_echo`. The payload follows
 the fields. The longest header is 18 bytes.
 
-`stream_id` is a `u16`. It is present once if any of `SYN`, `FIN_READ`, `FIN_WRITE`, `WINDOW` and `DATA` is set,
-and all of them then refer to that stream.
+`stream_id` is a `u16`. It is present once if any of `SYN`, `FIN_READ`, `FIN_WRITE`, `ABORT`, `WINDOW` and `DATA`
+is set, and all of them then refer to that stream.
 
-A frame has at least one flag. The stream flags can be combined freely, and `PING` and `PONG` can be added
-to any frame. `TERM` stands alone.
+A frame has at least one flag. The stream flags can be combined freely, except that `ABORT` comes only with
+`FIN_WRITE`, and `PING` and `PONG` can be added to any frame. `TERM` stands alone.
 
-The parts of a frame take effect in this order: `PONG`, `PING`, `SYN`, `WINDOW`, `DATA`, `FIN_WRITE`, `FIN_READ`.
+The parts of a frame take effect in this order: `PONG`, `PING`, `SYN`, `WINDOW`, `DATA`, `FIN_WRITE` (with `ABORT`),
+`FIN_READ`.
 
 ## Protocol violations
 
 A frame that breaks a rule of this document is a protocol violation. A violation is fatal: the peer that
 detects it stops using the session, and the transport cannot be recovered. The violations are:
 
-- reserved bits set, no flags set, or `TERM` combined with another flag;
+- reserved bits set, no flags set, `TERM` combined with another flag, or `ABORT` without `FIN_WRITE`;
 - `DATA` with `len = 0` or `len > frame_limit`;
 - `WINDOW` with `credit = 0`;
 - the violations listed under [Streams](#streams) and [Flow control](#flow-control).
@@ -91,6 +93,10 @@ The two directions of a stream close independently.
 
 `FIN_WRITE` ends the data that its sender writes to the stream. A peer that receives it sends `FIN_READ`
 once its application has consumed the data that arrived, or earlier.
+
+A writer that gives up before it finished sends `FIN_WRITE` with `ABORT`. The data that it sent before still
+counts, and is delivered: `ABORT` only tells the receiver that the data is incomplete. A plain `FIN_WRITE`
+tells that the data is complete. The `FIN_WRITE` that answers `FIN_READ` may be either.
 
 `FIN_READ` tells that its sender discards any more data of the stream. A peer that receives it sends
 `FIN_WRITE`, and should not send more `DATA` first.

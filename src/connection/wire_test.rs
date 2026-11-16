@@ -708,7 +708,13 @@ async fn a_stream_id_can_be_reused_after_both_sides_closed_it() {
         // We read everything and close our halves.
         let (sink, mut reader) = stream.into_split();
         assert_eq!(
-            reader.next().now_or_never().unwrap().unwrap().as_ref(),
+            reader
+                .next()
+                .now_or_never()
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .as_ref(),
             [round; 3]
         );
         assert!(reader.next().now_or_never().unwrap().is_none());
@@ -776,7 +782,16 @@ async fn a_window_update_does_not_wait_behind_the_data_of_other_streams() {
     settle(&mut conn);
     drop(settle);
     let mut download = accepted.pop().expect("the stream of the peer");
-    assert_eq!(download.next().now_or_never().unwrap().unwrap().len(), 256);
+    assert_eq!(
+        download
+            .next()
+            .now_or_never()
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .len(),
+        256
+    );
 
     // The transport drains.
     let mut codec = RammuxCodec::new(
@@ -834,7 +849,16 @@ async fn credit_does_not_starve_data() {
 
     // All of them owe credit at the same moment, and then the upload has data.
     for stream in &mut accepted {
-        assert_eq!(stream.next().now_or_never().unwrap().unwrap().len(), 256);
+        assert_eq!(
+            stream
+                .next()
+                .now_or_never()
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .len(),
+            256
+        );
     }
     upload
         .feed(Bytes::from(vec![1_u8; 256]))
@@ -899,4 +923,75 @@ async fn a_stream_announces_itself_once() {
     assert_eq!(stream_frames(&two.frames()), [(0, 0, 3, syn())]);
     drop(reader);
     assert_eq!(stream_frames(&two.frames()), [(0, 0, 0, fin_read)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sink_dropped_before_close_sends_abort() {
+    let abort = ControlFlags {
+        fin_write: true,
+        abort: true,
+        ..Default::default()
+    };
+    let mut rig = rig(RammuxRole::Client, config());
+    rig.frames();
+    let (mut sink, _reader) = rig.conn.try_start_outbound().unwrap().unwrap().into_split();
+    sink.feed(Bytes::from_static(b"abc"))
+        .now_or_never()
+        .unwrap()
+        .unwrap();
+    drop(sink);
+    // The connection did not take the data before the drop: it is discarded.
+    assert_eq!(
+        stream_frames(&rig.frames()),
+        [(0, 0, 0, ControlFlags { syn: true, ..abort })]
+    );
+
+    // Closing first makes a clean end, even if the close did not complete.
+    let (mut sink, _reader) = rig.conn.try_start_outbound().unwrap().unwrap().into_split();
+    sink.feed(Bytes::from_static(b"abc"))
+        .now_or_never()
+        .unwrap()
+        .unwrap();
+    assert!(sink.close().now_or_never().is_none());
+    drop(sink);
+    assert_eq!(
+        stream_frames(&rig.frames()),
+        [(
+            2,
+            0,
+            3,
+            ControlFlags {
+                syn: true,
+                fin_write: true,
+                ..Default::default()
+            }
+        )]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_answer_to_fin_read_is_a_plain_fin_write() {
+    let mut rig = rig(RammuxRole::Server, config());
+    rig.frames();
+    rig.peer_out
+        .write_all(&data(0, syn(), b"abc"))
+        .await
+        .unwrap();
+    let stream = loop {
+        match rig.conn.progress().now_or_never() {
+            Some(Ok(RammuxProgress::Inbound(stream))) => break stream,
+            Some(result) => {
+                result.unwrap();
+            },
+            None => panic!("the stream was not accepted"),
+        }
+    };
+    let (sink, _reader) = stream.into_split();
+    let stops_reading = ControlFlags {
+        fin_read: true,
+        ..Default::default()
+    };
+    rig.write(control(0, stops_reading)).await;
+    drop(sink);
+    assert_eq!(stream_frames(&rig.frames()), [(0, 0, 0, fin_write())]);
 }
