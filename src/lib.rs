@@ -50,7 +50,8 @@
 //!     }
 //! });
 //!
-//! // A stream is a `Sink` of `Bytes` and a `Stream` of `Result<Bytes, StreamError>`. It can move to another task.
+//! // A stream is a `Sink` of `Bytes` and a `Stream` of `Result<Bytes, StreamError>`.
+//! // It can move to another task.
 //! let mut stream = client
 //!     .try_start_outbound()?
 //!     .expect("the stream limit is not reached");

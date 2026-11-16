@@ -52,7 +52,7 @@ pub const CONTROL_BATCH: usize = 1024;
 /// Either way the bytes reach the transport in the order the frames were sent.
 ///
 /// The codec is ready for the next frame when no frame with a payload waits and the control buffer has room.
-/// After a flush that did not finish, it is ready only when everything is written.
+/// After a flush or a close whose writes did not finish, it is ready only when everything is written.
 /// There is no queue beyond that, so the caller decides what goes next.
 ///
 /// The header of a frame with a `PING` is encoded again before each write, until the transport

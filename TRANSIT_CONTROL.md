@@ -49,7 +49,7 @@ Nothing of this is on the wire. The peer sees only `DATA` that stays within its 
 | `unacked` | Bytes sent on a stream and not credited back. |
 | `borrowed` | `max(0, unacked - B)`: what a stream uses of the pool. The sum over the streams, `U`, never exceeds `P`. |
 | `srtt` | Smoothed round trip time, measured with `PING` and `PONG`. |
-| `T_c` | `min(32 KiB, B / 2)`: the smallest step in which the receiver returns credit. |
+| `T_c` | `max(1, min(32 KiB, B / 2))`: the smallest step in which the receiver returns credit. |
 | `g`, `G` | The advance: what one stream may take, and all streams together (`advance_grant`, `advance_budget`). |
 
 ### Within the base window
@@ -156,10 +156,10 @@ TCP makes them, for every multiplexer.
   A stream that writes less than `frame_limit` bytes at a time gets a proportionally smaller share next to a
   stream that writes more.
 - **More small packets when data flows one way.** The receiver returns credit in steps of at least `T_c`, which
-  grow to an eighth of what its reader consumes per round trip. Each side adds a `PING` to its data or credit at
-  most every eighth of a round trip, and the other side answers with a `PONG`. Control frames that are ready
-  together leave in one packet. When the other direction has data, they ride along. When it has none, they are
-  packets of their own.
+  grow to an eighth of what its reader consumes per round trip. Once it has measured the round trip, each side
+  adds a `PING` to its data or credit at most every eighth of it, and the other side answers with a `PONG`.
+  Control frames that are ready together leave in one packet. When the other direction has data, they ride
+  along. When it has none, they are packets of their own.
 - **The queue is not limited.** Like the other multiplexers, a connection with enough data fills what it is
   given, here `streams * B + P`, and an interactive stream waits behind the bulk that is already on the path.
   The pool is the bound. `TCP_NOTSENT_LOWAT` can be used as a mitigation on platforms that support it.

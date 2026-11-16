@@ -109,7 +109,7 @@ pub struct StreamViolation(pub &'static str);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum StreamError {
-    /// The peer dropped its sink without closing it. The data it wrote before was delivered.
+    /// The peer dropped its sink without closing it. The data that arrived before was delivered.
     #[error("the peer stopped writing without closing the stream")]
     PeerAborted,
     /// The peer dropped its reader. Nothing more can be written to the stream.

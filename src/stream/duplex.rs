@@ -111,9 +111,9 @@ impl Sink<Bytes> for RammuxDuplex {
 ///
 /// [`Sink::poll_flush`] and [`Sink::poll_close`] return `Ok` as soon as all pending data
 /// is framed and enqueued for sending through the IO transport, and `poll_close` once the end of the stream
-/// is enqueued too. So a downgrade right after `close()` completed does not cut the stream short.
-/// It does not mean that the peer received the data: data that is still on its way when the connection fails
-/// is lost.
+/// is enqueued too. So a downgrade that this side starts right after `close()` completed does not cut
+/// the stream short. It does not mean that the peer received the data: data that is still on its way when
+/// the connection fails, or when the peer starts a downgrade, is lost.
 pub struct RammuxSink {
     id: StreamId,
     shared: StreamRef,

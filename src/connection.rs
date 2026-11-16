@@ -56,9 +56,12 @@ const INBOUND_BATCH: usize = 16;
 ///
 /// A downgrade, started by either side, ends the streams that are still open with
 /// [`StreamError::ConnectionDowngraded`], on both sides: their readers get the data that arrived and then
-/// the error, and their sinks return the error. The data that the connection has not sent yet is lost.
-/// So close the sinks first: a stream whose sink completed its close before the downgrade ends cleanly
-/// for its reader.
+/// the error, and their sinks return the error.
+///
+/// The side that calls `downgrade` loses only the data that its connection has not sent yet: a stream whose
+/// sink completed its close before the call ends cleanly for the peer's reader. What the peer sent and this
+/// side had not received at the call is not delivered, even from sinks that the peer closed. So close your
+/// sinks and read your streams to the end before you call `downgrade`.
 ///
 /// An error of [`poll_progress`](Self::poll_progress) ends the streams in the same way,
 /// with [`StreamError::ConnectionFailed`].

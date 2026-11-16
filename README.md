@@ -74,7 +74,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // A stream is a `Sink` of `Bytes` and a `Stream` of `Result<Bytes, StreamError>`. It can move to another task.
+    // A stream is a `Sink` of `Bytes` and a `Stream` of `Result<Bytes, StreamError>`.
+    // It can move to another task.
     let mut stream = client
         .try_start_outbound()?
         .expect("the stream limit is not reached");
@@ -173,11 +174,13 @@ rammux never closes the transport. `RammuxConnection::downgrade` ends the sessio
 and returns the transport, ready for whatever comes next. The peer learns about it from
 `RammuxProgress::Downgraded`, and gets its transport back the same way.
 
-A downgrade ends the streams that are still open, on both sides, with `StreamError::ConnectionDowngraded`, and
-the data that the connection has not sent yet is lost. So close the sinks first: a stream whose sink completed
-its close before the downgrade ends cleanly for its reader. Dropping the connection instead ends everything
-abruptly: its streams end with `StreamError::ConnectionDropped`, and the peer's connection fails with an error,
-which ends the peer's streams with `StreamError::ConnectionFailed`.
+A downgrade ends the streams that are still open, on both sides, with `StreamError::ConnectionDowngraded`.
+The side that calls `downgrade` loses only the data that its connection has not sent yet: a stream whose sink
+completed its close before the call ends cleanly for the peer's reader. What the peer sent and this side had not
+received at the call is not delivered, even from sinks that the peer closed. So close your sinks and read your
+streams to the end before you call `downgrade`. Dropping the connection instead ends everything abruptly: its
+streams end with `StreamError::ConnectionDropped`, and the peer's connection fails with an error, which ends
+the peer's streams with `StreamError::ConnectionFailed`.
 
 ## Requirements
 

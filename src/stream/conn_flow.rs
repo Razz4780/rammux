@@ -100,8 +100,8 @@ impl RxFlow {
     ///
     /// A reader that keeps its pace returns credit about `CREDIT_STEP_DIVISOR` times per loop, so a quarter of
     /// a loop without credit means that it slowed down or stopped. Together with [`Self::settle_period`], the
-    /// credit it held back goes out within `srtt / 4 + max(srtt / 8, 1 ms)`: always less than half a loop
-    /// plus 1 ms, the bound that `PROTOCOL.md` gives.
+    /// credit it held back goes out within `srtt / 4 + max(srtt / 8, 1 ms)`, plus up to 1 ms by which a timer
+    /// can fire late: never more than half a loop plus 2 ms, the bound that `PROTOCOL.md` gives.
     pub fn settle_after(&self) -> Option<Duration> {
         self.srtt.get().map(|srtt| srtt / 4)
     }

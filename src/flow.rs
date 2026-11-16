@@ -24,7 +24,7 @@ mod rate;
 /// about 1.65 times per loop.
 pub const ALLOWANCE_RTTS: f64 = 2.0;
 
-/// Bytes of credit at which the receiver returns credit to the sender, unless the base window is small.
+/// The smallest step in which the receiver returns credit to the sender, unless the base window is small.
 pub const CREDIT_THRESHOLD: u32 = 32 * 1024;
 
 /// A receiver whose reader keeps a fast pace returns credit in steps of this fraction of what the reader
@@ -41,7 +41,7 @@ pub const SRTT_GAIN: f64 = 1.0 / 8.0;
 /// with the microsecond resolution of the clock.
 pub const SRTT_MIN: Duration = Duration::from_micros(1);
 
-/// Returns `T_c`: how much credit has to accumulate on a stream before it is sent to the peer.
+/// Returns `T_c`: the smallest step in which a stream returns credit to the peer.
 ///
 /// It is at most half of the base window, so a stream with less than `T_c` uncredited bytes
 /// always has room in its base window, and credit cannot deadlock.

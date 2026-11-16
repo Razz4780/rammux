@@ -128,11 +128,11 @@ The sender:
 The receiver:
 
 1. returns credit for the bytes that its application consumed, and never more than the stream's `unacked`;
-2. returns it without undue delay. It may hold credit back, to send fewer and larger `WINDOW`s, but it must not
-   hold back `min(32 KiB, B / 2)` consumed bytes or more for longer than half a round trip plus 1 ms.
-   Otherwise a sender with a full window could wait forever. rammux returns credit in steps of
-   `max(min(32 KiB, B / 2), an eighth of what the application consumed over the last round trip)` (at least 1),
-   and keeps to that bound when the application stops in the middle of a larger step.
+2. returns it without undue delay. Let `T_c = max(1, min(32 KiB, B / 2))`. The receiver may hold credit back,
+   to send fewer and larger `WINDOW`s, but it must not hold back `T_c` consumed bytes or more for longer than
+   half a round trip plus 2 ms. Otherwise a sender with a full window could wait forever. rammux returns credit
+   in steps of `max(T_c, an eighth of what the application consumed over the last round trip)`, and keeps to
+   that bound when the application stops or slows down in the middle of a larger step.
 
 `FIN_READ` sets `unacked` of the direction to zero, for its sender when it is sent and for its receiver when
 it arrives. After sending `FIN_READ`, a peer does not count the `DATA` that still arrives on the stream.
