@@ -74,10 +74,9 @@ impl Streams {
         self.tx_flow().srtt
     }
 
-    /// Folds a round trip sample into the smoothed round trip time of both directions.
+    /// Folds a round trip sample into the smoothed round trip time.
     pub fn observe_rtt(&mut self, rtt: Duration) {
         self.data.strategy_mut().srtt.observe(rtt);
-        self.credit.strategy_mut().srtt.observe(rtt);
     }
 
     /// Returns the number of streams that the peer started.
@@ -167,11 +166,7 @@ impl Streams {
 
     /// Polls for the stream part of the next frame that carries `WINDOW` or `FIN_READ`.
     pub fn poll_credit(&mut self, cx: &mut Context<'_>) -> Poll<StreamUpdate> {
-        // The streams that the timer wakes are polled in this pass.
-        self.credit.strategy_mut().settle.poll(cx);
         let polled = self.credit.poll_next_unpin(cx);
-        // A stream may have armed the timer in this pass, and the timer wakes only the task that polled it.
-        self.credit.strategy_mut().settle.poll(cx);
         self.take_update(polled)
     }
 
@@ -246,14 +241,25 @@ mod test {
         wire::header::{ControlFlags, StreamHeader},
     };
 
-    /// The call that makes a stream hold credit back in a larger step also arms the timer that settles it,
-    /// for the task that polled.
+    /// Credit goes back in steps of exactly `T_c`, whatever the pace of the reader, and whether or not the
+    /// connection measured its round trip. The read that completes a step wakes the credit task, and no other
+    /// read does.
+    #[rstest::rstest]
+    #[case::slow_reader_without_a_sample(Duration::from_millis(100), None)]
+    #[case::slow_reader_with_a_sample(Duration::from_millis(100), Some(Duration::from_millis(80)))]
+    #[case::fast_reader_without_a_sample(Duration::from_millis(1), None)]
+    #[case::fast_reader_with_a_sample(Duration::from_millis(1), Some(Duration::from_millis(80)))]
     #[tokio::test(start_paused = true)]
-    async fn the_credit_that_grows_the_step_arms_the_settle_timer() {
+    async fn credit_goes_back_in_steps_of_t_c(
+        #[case] pace: Duration,
+        #[case] rtt: Option<Duration>,
+    ) {
         let config = RammuxConfig::new();
-        let min_step = flow::credit_threshold(config.local_recv_window.get());
+        let t_c = flow::credit_threshold(config.local_recv_window.get());
         let mut streams = Streams::new(RammuxRole::Server, config);
-        streams.observe_rtt(Duration::from_millis(80));
+        if let Some(rtt) = rtt {
+            streams.observe_rtt(rtt);
+        }
         let woken = Arc::new(Flag(AtomicBool::new(false)));
         let waker = futures::task::waker(woken.clone());
         let mut cx = Context::from_waker(&waker);
@@ -261,11 +267,11 @@ mod test {
         let id = StreamId::from_slab_idx(0, RammuxRole::Client).unwrap();
         let chunk = 8 * 1024;
         let mut stream = None;
-        let mut grown = false;
-        // The peer sends 8 KiB every millisecond, and the application reads it at once: 640 KiB per round trip.
-        // A credit of `T_c` goes every 4 ms, until the step grows.
+        let mut consumed = 0;
+        let mut credited = 0;
+        // The peer sends 8 KiB at the given pace, and the application reads it at once.
         for _ in 0..500 {
-            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::time::advance(pace).await;
             let header = StreamHeader {
                 id,
                 flags: ControlFlags {
@@ -281,25 +287,25 @@ mod test {
             {
                 stream = Some(new);
             }
+            woken.0.store(false, Ordering::SeqCst);
             let read = stream.as_mut().unwrap().poll_next_unpin(&mut cx);
             assert!(matches!(read, Poll::Ready(Some(Ok(..)))));
+            consumed += chunk as u64;
 
-            let unused = streams.rx_flow().settle.is_unused();
-            let polled = streams.poll_credit(&mut cx);
-            if unused && !streams.rx_flow().settle.is_unused() {
-                // The first step above `T_c` registered the stream with the timer.
-                let Poll::Ready(update) = polled else {
-                    panic!("only a credit grows the step");
-                };
-                assert_eq!(u64::from(update.credit), min_step);
-                grown = true;
-                break;
+            let due = consumed - credited >= t_c;
+            if credited > 0 {
+                // The task registered its waker when it last had nothing to send.
+                assert_eq!(woken.0.load(Ordering::SeqCst), due);
+            }
+            match streams.poll_credit(&mut cx) {
+                Poll::Ready(update) => {
+                    assert!(due);
+                    assert_eq!(u64::from(update.credit), t_c);
+                    credited += t_c;
+                },
+                Poll::Pending => assert!(!due),
             }
         }
-        assert!(grown, "the step never grew above T_c");
-
-        woken.0.store(false, Ordering::SeqCst);
-        tokio::time::advance(streams.rx_flow().settle_period().unwrap()).await;
-        assert!(woken.0.load(Ordering::SeqCst));
+        assert_eq!(credited, consumed / t_c * t_c);
     }
 }

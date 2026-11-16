@@ -24,15 +24,8 @@ mod rate;
 /// about 1.65 times per loop.
 pub const ALLOWANCE_RTTS: f64 = 2.0;
 
-/// The smallest step in which the receiver returns credit to the sender, unless the base window is small.
+/// Bytes of credit at which the receiver returns credit to the sender, unless the base window is small.
 pub const CREDIT_THRESHOLD: u32 = 32 * 1024;
-
-/// A receiver whose reader keeps a fast pace returns credit in steps of this fraction of what the reader
-/// consumed over the last loop: about this many times per loop.
-///
-/// Fewer and larger credits mean fewer small packets on a link with one-way traffic, and the sender's estimate
-/// of the rate still sees several credits per loop.
-pub const CREDIT_STEP_DIVISOR: f64 = 8.0;
 
 /// Weight of a new round trip time sample in the smoothed one.
 pub const SRTT_GAIN: f64 = 1.0 / 8.0;
@@ -41,7 +34,7 @@ pub const SRTT_GAIN: f64 = 1.0 / 8.0;
 /// with the microsecond resolution of the clock.
 pub const SRTT_MIN: Duration = Duration::from_micros(1);
 
-/// Returns `T_c`: the smallest step in which a stream returns credit to the peer.
+/// Returns `T_c`: how much credit has to accumulate on a stream before it is sent to the peer.
 ///
 /// It is at most half of the base window, so a stream with less than `T_c` uncredited bytes
 /// always has room in its base window, and credit cannot deadlock.
@@ -64,11 +57,6 @@ impl Pool {
             size: u64::from(size),
             used: 0,
         }
-    }
-
-    /// Returns the size of the pool, `P`.
-    pub fn size(&self) -> u64 {
-        self.size
     }
 
     /// Returns the sum over the streams of the bytes they borrow.
@@ -209,11 +197,6 @@ impl Window {
             idle_below: credit_threshold(base),
             unacked: 0,
         }
-    }
-
-    /// Returns the base window, `B`.
-    pub fn base(&self) -> u64 {
-        self.base
     }
 
     /// Returns the bytes in flight.

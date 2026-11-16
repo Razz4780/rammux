@@ -50,11 +50,8 @@ impl Task<RxFlow> for CreditUpdates {
         let this = self.get_mut();
         let mut state = this.stream.lock();
 
-        let Poll::Ready((credit, fin_read)) =
-            state.inbound.poll_update(flow, Instant::now(), cx.waker())
-        else {
-            // Every change that makes the direction ready wakes it while holding the lock,
-            // or is the passing of time, which `RxFlow::settle` wakes it for.
+        let Poll::Ready((credit, fin_read)) = state.inbound.poll_update(&mut flow.pool) else {
+            // Every change that makes the direction ready wakes it while holding the lock.
             this.stream.credit_task.register(cx.waker());
             return Poll::Pending;
         };

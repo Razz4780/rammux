@@ -64,10 +64,8 @@ impl End {
         let srtt = Srtt::of(Duration::from_millis(100));
         let mut tx = ConnFlow::new(POOL);
         tx.srtt = srtt;
-        let mut rx = RxFlow::new(POOL);
-        rx.srtt = srtt;
         let mut end = Self {
-            selectors: Selectors::new(rx, tx),
+            selectors: Selectors::new(RxFlow::new(POOL), tx),
             handles: Vec::new(),
             duplexes: Vec::new(),
             ids: Vec::new(),

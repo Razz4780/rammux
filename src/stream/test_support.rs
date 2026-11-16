@@ -77,18 +77,15 @@ impl Selectors {
         self.credit.strategy().pool.used()
     }
 
-    /// Polls until the selectors have nothing more, and nobody woke them up, credit first like the connection,
-    /// with the settle timer polled before and after the credit selector. Hands every update to `each`.
+    /// Polls until the selectors have nothing more, and nobody woke them up, credit first like the connection.
+    /// Hands every update to `each`.
     pub fn drain(&mut self, mut each: impl FnMut(StreamUpdate, FinState)) {
         let flag = Arc::new(Flag(AtomicBool::new(false)));
         let waker = futures::task::waker(flag.clone());
         let mut cx = Context::from_waker(&waker);
         loop {
             flag.0.store(false, Ordering::SeqCst);
-            self.credit.strategy_mut().settle.poll(&mut cx);
-            let credit = self.credit.poll_next_unpin(&mut cx);
-            self.credit.strategy_mut().settle.poll(&mut cx);
-            let polled = match credit {
+            let polled = match self.credit.poll_next_unpin(&mut cx) {
                 Poll::Ready(Some(yielded)) => Poll::Ready(Some(yielded)),
                 _ => self.data.poll_next_unpin(&mut cx),
             };

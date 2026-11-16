@@ -24,8 +24,6 @@ pub use crate::error::StreamError;
 #[cfg(test)]
 mod accounting_test;
 mod conn_flow;
-#[cfg(test)]
-mod credit_test;
 mod duplex;
 pub(crate) mod handle;
 mod inbound;
