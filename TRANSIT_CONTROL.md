@@ -49,7 +49,7 @@ Nothing of this is on the wire. The peer sees only `DATA` that stays within its 
 | `unacked` | Bytes sent on a stream and not credited back. |
 | `borrowed` | `max(0, unacked - B)`: what a stream uses of the pool. The sum over the streams, `U`, never exceeds `P`. |
 | `srtt` | Smoothed round trip time, measured with `PING` and `PONG`. |
-| `T_c` | `min(32 KiB, B / 2)`: the step in which the receiver returns credit. |
+| `T_c` | `min(32 KiB, B / 2)`: the smallest step in which the receiver returns credit. |
 | `g`, `G` | The advance: what one stream may take, and all streams together (`advance_grant`, `advance_budget`). |
 
 ### Within the base window

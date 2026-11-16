@@ -109,7 +109,10 @@ impl End {
         let mut cx = Context::from_waker(&waker);
         loop {
             flag.0.store(false, Ordering::SeqCst);
-            let polled = match self.credit.poll_next_unpin(&mut cx) {
+            self.credit.strategy_mut().settle.poll(&mut cx);
+            let credit = self.credit.poll_next_unpin(&mut cx);
+            self.credit.strategy_mut().settle.poll(&mut cx);
+            let polled = match credit {
                 Poll::Ready(Some(yielded)) => Poll::Ready(Some(yielded)),
                 _ => self.data.poll_next_unpin(&mut cx),
             };

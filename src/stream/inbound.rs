@@ -3,19 +3,27 @@
 use std::task::{Poll, Waker};
 
 use futures::task::AtomicWaker;
+use tokio::time::Instant;
 
 use crate::{
     buffer::{Data, DataList},
     error::StreamError,
-    flow::{self, Pool, Window},
-    stream::{FinState, waker::WakerSlot},
+    flow::{self, CREDIT_STEP_DIVISOR, Pool, RateEstimate, Window},
+    stream::{FinState, RxFlow, waker::WakerSlot},
 };
 
 /// The receiving direction of a stream.
 ///
 /// The receive window is fixed: the stream may have `B` bytes unread, and more only from the connection's pool,
-/// if the sender is allowed to use it (see `TRANSIT_CONTROL.md`). The receiver does not tune anything.
+/// if the sender is allowed to use it (see `TRANSIT_CONTROL.md`). The receiver does not tune it.
 /// It counts what was received and not credited back, checks the pool, and returns credit as the application reads.
+///
+/// Credit goes back in steps. The step is `T_c` and grows with the pace of the reader to
+/// `1 / CREDIT_STEP_DIVISOR` of what it consumes per loop, so a fast stream sends a few large `WINDOW`s per loop
+/// instead of many small ones. A step larger than `T_c` must not strand the credit of a reader that stops between
+/// two steps: the sender would count those bytes as in flight for good, and with a full window it could never send
+/// again. So a stream with such a step falls back to `T_c` when its reader leaves its pace, and the connection's
+/// [`Settle`](super::conn_flow::Settle) timer makes sure that somebody looks at it soon after it goes quiet.
 pub struct InboundTraffic {
     state: InboundState,
     /// Bytes received and not credited back.
@@ -26,8 +34,22 @@ pub struct InboundTraffic {
     window: Window,
     /// Bytes read by the application and not credited back yet. Never more than the bytes in [`Self::window`].
     credit: u64,
-    /// Credit is sent when this much accumulates.
-    credit_threshold: u64,
+    /// Credit is sent when this much accumulates. At least [`Self::min_step`].
+    ///
+    /// Only the connection side changes it. The application side compares with it only, it has no clock.
+    step: u64,
+    /// `T_c`, the smallest step.
+    min_step: u64,
+    /// The credit sent since the first round trip sample, if any was.
+    sent: Option<SentCredit>,
+}
+
+/// The credit that a receiving direction sent.
+struct SentCredit {
+    /// The rate of the credit, with the smoothed round trip time as the time constant.
+    rate: RateEstimate,
+    /// When the last credit was sent.
+    last: Instant,
 }
 
 enum InboundState {
@@ -58,7 +80,9 @@ impl InboundTraffic {
             },
             window: Window::new(base_window),
             credit: 0,
-            credit_threshold: flow::credit_threshold(base_window),
+            step: flow::credit_threshold(base_window),
+            min_step: flow::credit_threshold(base_window),
+            sent: None,
         }
     }
 
@@ -106,7 +130,7 @@ impl InboundTraffic {
         };
 
         self.credit += data.as_ref().len() as u64;
-        if self.credit >= self.credit_threshold {
+        if self.credit >= self.step {
             credit_task.wake();
         }
         Poll::Ready(Some(data))
@@ -134,17 +158,48 @@ impl InboundTraffic {
 
     /// Polls for what this direction sends next: credit, and whether it is `FIN_READ`.
     ///
-    /// Returns [`Poll::Pending`] when there is nothing to send. Registering the waker is up to the caller.
-    pub fn poll_update(&mut self, pool: &mut Pool) -> Poll<(u32, bool)> {
+    /// Returns [`Poll::Pending`] when there is nothing to send. Registering the waker with the stream is up to
+    /// the caller. While the step is larger than `T_c`, the waker is also registered with
+    /// [`RxFlow::settle`], whatever this returns: the reader may stop before the next step, and then only the
+    /// timer looks at the stream again.
+    pub fn poll_update(
+        &mut self,
+        rx: &mut RxFlow,
+        now: Instant,
+        waker: &Waker,
+    ) -> Poll<(u32, bool)> {
         match &mut self.state {
             InboundState::Open { .. } | InboundState::HalfClosed { .. } => {
-                if self.credit < self.credit_threshold {
+                if self.step > self.min_step
+                    && let (Some(after), Some(sent)) = (rx.settle_after(), &self.sent)
+                    && now.saturating_duration_since(sent.last) >= after
+                {
+                    // The reader left its pace. What it consumed since the last credit goes back
+                    // once it reaches `T_c`, and a reader that picks up again starts from there.
+                    self.step = self.min_step;
+                }
+                if self.credit < self.step {
+                    self.settle(rx, waker);
                     return Poll::Pending;
                 }
+
                 let credit = u32::try_from(self.credit).unwrap_or(u32::MAX);
                 self.credit -= u64::from(credit);
                 self.window
-                    .set(pool, self.window.unacked() - u64::from(credit));
+                    .set(&mut rx.pool, self.window.unacked() - u64::from(credit));
+                if let Some(srtt) = rx.srtt.secs() {
+                    let sent = self.sent.get_or_insert_with(|| SentCredit {
+                        rate: RateEstimate::new(now),
+                        last: now,
+                    });
+                    sent.rate.add(credit, now, srtt);
+                    sent.last = now;
+                    // Whole bytes of what the reader consumed over the last loop, as the sender estimates it.
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let step = (sent.rate.value(now, srtt) * srtt / CREDIT_STEP_DIVISOR) as u64;
+                    self.step = step.max(self.min_step);
+                }
+                self.settle(rx, waker);
                 Poll::Ready((credit, false))
             },
 
@@ -155,9 +210,21 @@ impl InboundTraffic {
                 fin_state.sent = true;
                 // The sender forgets the bytes in flight when it reads `FIN_READ`, and the rest of the data is discarded.
                 self.credit = 0;
-                self.window.set(pool, 0);
+                self.window.set(&mut rx.pool, 0);
                 Poll::Ready((0, true))
             },
+        }
+    }
+
+    /// Makes sure that the stream is polled again soon, while it holds credit back in a step larger than `T_c`.
+    ///
+    /// Below `T_c` nothing is needed: the sender always has room in its base window for more data,
+    /// and the reads of that data wake the stream.
+    fn settle(&self, rx: &mut RxFlow, waker: &Waker) {
+        if self.step > self.min_step
+            && let Some(period) = rx.settle_period()
+        {
+            rx.settle.register(waker, period);
         }
     }
 
@@ -237,6 +304,12 @@ impl InboundTraffic {
     #[cfg(test)]
     pub fn unacked(&self) -> u64 {
         self.window.unacked()
+    }
+
+    /// Returns the bytes read by the application and not credited back yet.
+    #[cfg(test)]
+    pub fn pending_credit(&self) -> u64 {
+        self.credit
     }
 }
 

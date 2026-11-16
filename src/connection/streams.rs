@@ -166,7 +166,11 @@ impl Streams {
 
     /// Polls for the stream part of the next frame that carries `WINDOW` or `FIN_READ`.
     pub fn poll_credit(&mut self, cx: &mut Context<'_>) -> Poll<StreamUpdate> {
+        // The streams that the timer wakes are polled in this pass.
+        self.credit.strategy_mut().settle.poll(cx);
         let polled = self.credit.poll_next_unpin(cx);
+        // A stream may have armed the timer in this pass, and the timer wakes only the task that polled it.
+        self.credit.strategy_mut().settle.poll(cx);
         self.take_update(polled)
     }
 

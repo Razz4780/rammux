@@ -47,7 +47,12 @@ struct DirState {
     /// Bytes waiting to be serialized: (finish, len).
     queue: VecDeque<(Instant, usize)>,
     reader: Option<Waker>,
+    /// Writes of fewer than [`SHORT_WRITE`] bytes: the ones that carry no data.
+    short_writes: u64,
 }
+
+/// Writes shorter than this carry only control frames.
+const SHORT_WRITE: usize = 100;
 
 impl Dir {
     fn new(mbit: f64, delay: Duration) -> Arc<Self> {
@@ -70,6 +75,11 @@ impl Dir {
             inner.queue.pop_front();
         }
         inner.queue.iter().map(|(_, len)| len).sum()
+    }
+
+    /// Writes of fewer than [`SHORT_WRITE`] bytes so far.
+    fn short_writes(&self) -> u64 {
+        self.inner.lock().unwrap().short_writes
     }
 }
 
@@ -107,6 +117,9 @@ impl AsyncWrite for End {
         let finish = start + Duration::from_secs_f64(buf.len() as f64 / dir.rate);
         inner.free_at = Some(finish);
         inner.queue.push_back((finish, buf.len()));
+        if buf.len() < SHORT_WRITE {
+            inner.short_writes += 1;
+        }
         inner
             .wire
             .push_back((finish + dir.delay, Bytes::copy_from_slice(buf)));
@@ -192,6 +205,7 @@ struct Rig {
     server_open: mpsc::UnboundedSender<Open>,
     client_stats: Arc<Mutex<RammuxStats>>,
     forward: Arc<Dir>,
+    backward: Arc<Dir>,
     /// Bytes read by the receiver, per stream, in the order of opening.
     read: Vec<Arc<AtomicU64>>,
     server_streams: mpsc::UnboundedReceiver<RammuxDuplex>,
@@ -200,7 +214,7 @@ struct Rig {
 
 impl Rig {
     fn new(mbit: f64, rtt: Duration, config: RammuxConfig) -> Self {
-        let (client_io, server_io, forward, _backward) = link(mbit, rtt / 2);
+        let (client_io, server_io, forward, backward) = link(mbit, rtt / 2);
         let client = RammuxConnection::new(RammuxRole::Client, client_io, config.clone()).unwrap();
         let server = RammuxConnection::new(RammuxRole::Server, server_io, config).unwrap();
         let (open, open_rx) = mpsc::unbounded_channel();
@@ -220,6 +234,7 @@ impl Rig {
             server_open,
             client_stats,
             forward,
+            backward,
             read: Vec::new(),
             server_streams,
             client_streams,
@@ -690,4 +705,44 @@ async fn a_download_keeps_its_share_next_to_many_uploads() {
     let down = mbit(uploads);
     assert!(up > 0.95 * MBIT, "{up} Mbit/s");
     assert!(down > 10.0, "{down} Mbit/s");
+}
+
+/// The link of the tests of credit: 100 Mbit/s, and 25 ms each way.
+const FAST_MBIT: f64 = 100.0;
+
+/// The size of the pool moves where the burst ends between two steps of credit: with some, the last step
+/// happens to take the last byte, with others it would leave up to a step behind.
+#[rstest::rstest]
+#[case::pool_of_512_kib(512 * 1024)]
+#[case::pool_of_1_mib(1024 * 1024)]
+#[case::pool_of_2_mib(2 * 1024 * 1024)]
+#[case::pool_of_4_mib(4 * 1024 * 1024)]
+#[case::pool_of_6_mib(6 * 1024 * 1024)]
+#[tokio::test(start_paused = true)]
+async fn a_burst_ends_with_nothing_borrowed(#[case] pool: u32) {
+    let mut config = config();
+    config.local_recv_pool = pool;
+    config.remote_recv_pool = pool;
+    let mut rig = Rig::new(FAST_MBIT, RTT, config);
+    rig.burst(8 * 1024 * 1024).await;
+    // The stream stays open, and nobody reads or writes on it any more.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let stats = rig.stats();
+    assert_eq!(stats.pool_tx_used, 0, "{stats:?}");
+    assert_eq!(stats.advance_held, 0, "{stats:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_way_bulk_needs_few_control_writes() {
+    let mut rig = Rig::new(FAST_MBIT, RTT, config());
+    rig.bulk(None).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let (bytes, writes) = (rig.bytes(0), rig.backward.short_writes());
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let mb = (rig.bytes(0) - bytes) as f64 / 1e6;
+    let per_mb = (rig.backward.short_writes() - writes) as f64 / mb;
+    // Everything the receiver writes is control: `WINDOW`, `PING` and `PONG`.
+    // Measured: 24.4 per MB, against 65.6 with credit in steps of `T_c`.
+    assert!(per_mb < 32.0, "{per_mb} control writes per MB");
 }
