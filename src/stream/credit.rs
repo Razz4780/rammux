@@ -1,10 +1,14 @@
 //! EXPERIMENT: when the receiver returns credit. Not part of the crate proper.
 
-use std::{cell::Cell, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    collections::{HashMap, VecDeque},
+    time::Duration,
+};
 
 use tokio::time::Instant;
 
-use crate::stream::StreamRef;
+use crate::{StreamId, config::RammuxRole, stream::StreamRef};
 
 /// When a stream's pending credit is sent.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -17,6 +21,9 @@ pub enum CreditPolicy {
     Gate { burst: u32 },
     /// Due at `max(T_c, V / div)`, `V` being what the stream consumed over the last `srtt`.
     Proportional { div: f64 },
+    /// The sender marks the bytes after which it wants credit: every `max(T_c, unacked / div)` while it
+    /// borrows, when its base window fills, and when it is blocked.
+    Marks { div: f64 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -100,7 +107,7 @@ impl CreditGate {
     pub fn request(&mut self, now: Instant, srtt: Option<Duration>) -> bool {
         match self.policy {
             CreditPolicy::Fixed => true,
-            CreditPolicy::Proportional { .. } => {
+            CreditPolicy::Proportional { .. } | CreditPolicy::Marks { .. } => {
                 self.open_flush();
                 true
             },
@@ -132,7 +139,9 @@ impl CreditGate {
 
     /// Credit of at least `T_c` stays behind.
     pub fn tail(&mut self, now: Instant, srtt: Option<Duration>) {
-        if let (CreditPolicy::Proportional { .. }, Some(srtt)) = (self.policy, srtt) {
+        if let (CreditPolicy::Proportional { .. } | CreditPolicy::Marks { .. }, Some(srtt)) =
+            (self.policy, srtt)
+        {
             self.deadline.get_or_insert(now + srtt / 4);
         }
     }
@@ -146,4 +155,65 @@ impl CreditGate {
             self.open_flush();
         }
     }
+}
+
+/// EXPERIMENT: the marks travel out of band. A direction of a stream is known by the role of its sender and the ID.
+/// A mark is a byte offset: it counts once the receiver's application consumed that many bytes, so it never
+/// acts before the marked data could have arrived.
+pub type MarkKey = (RammuxRole, StreamId);
+
+#[derive(Default)]
+struct MarkChannel {
+    marks: VecDeque<u64>,
+    receiver: Option<StreamRef>,
+}
+
+thread_local! {
+    static MARKS: RefCell<HashMap<MarkKey, MarkChannel>> = RefCell::default();
+    /// The one-way delay of the path, which a mark without data (a request) takes.
+    pub static ONE_WAY: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    /// Marks and requests sent.
+    pub static MARK_COUNT: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+}
+
+pub fn reset_marks() {
+    MARKS.with_borrow_mut(HashMap::clear);
+    MARK_COUNT.set((0, 0));
+}
+
+pub fn register_receiver(key: MarkKey, stream: StreamRef) {
+    MARKS.with_borrow_mut(|marks| marks.entry(key).or_default().receiver = Some(stream));
+}
+
+/// The sender marks the offset. A `request` is a frame of its own, which wakes the receiver when it arrives.
+pub fn push_mark(key: MarkKey, offset: u64, request: bool) {
+    let (marks, requests) = MARK_COUNT.get();
+    MARK_COUNT.set((marks + u64::from(!request), requests + u64::from(request)));
+    let receiver = MARKS.with_borrow_mut(|marks| {
+        let channel = marks.entry(key).or_default();
+        channel.marks.push_back(offset);
+        channel.receiver.clone()
+    });
+    if request && let Some(receiver) = receiver {
+        let one_way = ONE_WAY.get();
+        tokio::spawn(async move {
+            tokio::time::sleep(one_way).await;
+            receiver.updates.wake();
+        });
+    }
+}
+
+/// Returns whether the receiver's application consumed a mark.
+pub fn take_marks(key: MarkKey, consumed: u64) -> bool {
+    MARKS.with_borrow_mut(|marks| {
+        let Some(channel) = marks.get_mut(&key) else {
+            return false;
+        };
+        let mut any = false;
+        while channel.marks.front().is_some_and(|mark| *mark <= consumed) {
+            channel.marks.pop_front();
+            any = true;
+        }
+        any
+    })
 }

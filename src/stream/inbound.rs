@@ -12,7 +12,7 @@ use crate::{
     flow::{self, Pool, RateEstimate, Window},
     stream::{
         ConnFlow, FinState, StreamRef,
-        credit::{CreditPolicy, EXPERIMENT},
+        credit::{self, CreditPolicy, EXPERIMENT, MarkKey},
         waker::WakerSlot,
     },
 };
@@ -42,6 +42,10 @@ pub struct InboundTraffic {
     consumed: RateEstimate,
     /// EXPERIMENT: the stream is in the list of waiters.
     waiting: bool,
+    /// EXPERIMENT: the sender's marks, the bytes consumed so far, and whether a mark was consumed.
+    marks: Option<MarkKey>,
+    consumed_total: u64,
+    marked: bool,
 }
 
 enum InboundState {
@@ -80,7 +84,14 @@ impl InboundTraffic {
             seen: 0,
             consumed: RateEstimate::new(Instant::now()),
             waiting: false,
+            marks: None,
+            consumed_total: 0,
+            marked: false,
         }
+    }
+
+    pub fn set_marks(&mut self, key: MarkKey) {
+        self.marks = Some(key);
     }
 
     /// Returns the `FIN_*` state of this direction.
@@ -170,8 +181,16 @@ impl InboundTraffic {
                     self.consumed
                         .add_amount(fresh as f64, now, srtt.as_secs_f64());
                 }
+                self.consumed_total += fresh;
+                if let Some(key) = self.marks
+                    && credit::take_marks(key, self.consumed_total)
+                {
+                    self.marked = true;
+                }
                 let gate = &mut flow.credit;
-                if self.credit < floor(gate.riders(), self.credit_threshold) {
+                if self.credit < floor(gate.riders(), self.credit_threshold)
+                    && !(self.marked && self.credit > 0)
+                {
                     return Poll::Pending;
                 }
                 let due_at = match gate.policy {
@@ -185,7 +204,11 @@ impl InboundTraffic {
                     },
                     _ => self.credit_threshold,
                 };
-                let send = gate.flushing || (self.credit >= due_at && gate.request(now, srtt));
+                let due = match gate.policy {
+                    CreditPolicy::Marks { .. } => self.marked,
+                    _ => self.credit >= due_at,
+                };
+                let send = gate.flushing || (due && gate.request(now, srtt));
                 if !send {
                     if !self.waiting {
                         self.waiting = true;
@@ -197,6 +220,7 @@ impl InboundTraffic {
                     return Poll::Pending;
                 }
                 self.waiting = false;
+                self.marked = false;
                 let credit = u32::try_from(self.credit).unwrap_or(u32::MAX);
                 self.credit -= u64::from(credit);
                 self.seen = self.credit;

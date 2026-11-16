@@ -657,7 +657,7 @@ async fn a_new_stream_starts_within_the_grant_with_the_advance() {
 // `cargo test --release --lib credit_experiment -- --ignored --nocapture`.
 mod credit_experiment {
     use super::*;
-    use crate::stream::credit::{CreditPolicy, EXPERIMENT, Experiment};
+    use crate::stream::credit::{self, CreditPolicy, EXPERIMENT, Experiment};
 
     impl Rig {
         /// Writes and distinct write instants of the reverse direction.
@@ -693,6 +693,7 @@ mod credit_experiment {
     }
 
     async fn bulk_wan(streams: usize, pool: u32) -> String {
+        credit::ONE_WAY.set(Duration::from_millis(125));
         let mut rig = Rig::new(300.0, Duration::from_millis(250), wan(pool));
         let start = Instant::now();
         for _ in 0..streams {
@@ -721,6 +722,7 @@ mod credit_experiment {
         } else {
             without_advance(big_pool_config())
         };
+        credit::ONE_WAY.set(Duration::from_millis(100));
         let mut rig = Rig::new(300.0, Duration::from_millis(200), config);
         tokio::time::sleep(Duration::from_secs(2)).await;
         let before = rig.reverse();
@@ -737,6 +739,7 @@ mod credit_experiment {
 
     /// Streams limited by their base windows: no pool.
     async fn windowed(streams: usize, mbit: f64, rtt: Duration) -> String {
+        credit::ONE_WAY.set(rtt / 2);
         let mut rig = Rig::new(mbit, rtt, wan(0));
         for _ in 0..streams {
             rig.bulk(None).await;
@@ -752,12 +755,19 @@ mod credit_experiment {
 
     fn run<F: std::future::Future<Output = String>>(experiment: Experiment, f: F) -> String {
         EXPERIMENT.set(experiment);
+        credit::reset_marks();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .start_paused(true)
             .build()
             .unwrap();
-        runtime.block_on(f)
+        let result = runtime.block_on(f);
+        let (marks, requests) = credit::MARK_COUNT.get();
+        if marks + requests > 0 {
+            format!("{result}  [{marks} marks, {requests} requests]")
+        } else {
+            result
+        }
     }
 
     #[test]
@@ -785,6 +795,19 @@ mod credit_experiment {
             ("prop V/8 + pong riders", prop(8.0), true, true),
             ("prop V/16 + pong riders", prop(16.0), true, true),
             ("prop V/4 + pong riders", prop(4.0), true, true),
+            ("marks /8", CreditPolicy::Marks { div: 8.0 }, true, false),
+            (
+                "marks /8 + pong riders",
+                CreditPolicy::Marks { div: 8.0 },
+                true,
+                true,
+            ),
+            (
+                "marks /16 + pong riders",
+                CreditPolicy::Marks { div: 16.0 },
+                true,
+                true,
+            ),
         ];
         let only = std::env::var("SCENARIO").ok();
         let wanted = |name: &str| only.as_deref().is_none_or(|only| name.contains(only));

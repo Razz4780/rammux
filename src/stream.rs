@@ -48,6 +48,24 @@ pub(crate) fn new(
         }),
     });
 
+    if let credit::CreditPolicy::Marks { div } = credit::EXPERIMENT.get().policy {
+        use crate::config::RammuxRole;
+        let other = |role| match role {
+            RammuxRole::Client => RammuxRole::Server,
+            RammuxRole::Server => RammuxRole::Client,
+        };
+        let local = if is_outbound {
+            id.initiated_by()
+        } else {
+            other(id.initiated_by())
+        };
+        let mut state = shared.lock();
+        state.outbound.set_marks((local, id), div);
+        state.inbound.set_marks((other(local), id));
+        drop(state);
+        credit::register_receiver((other(local), id), shared.clone());
+    }
+
     (
         StreamHandle(shared.clone()),
         StreamUpdates::new(id, is_outbound, shared.clone()),

@@ -13,7 +13,11 @@ use tokio::time::Instant;
 use crate::{
     error::StreamError,
     flow::{Loan, RateEstimate, Window},
-    stream::{ConnFlow, FinState, StreamRef, waker::WakerSlot},
+    stream::{
+        ConnFlow, FinState, StreamRef,
+        credit::{self, MarkKey},
+        waker::WakerSlot,
+    },
 };
 
 /// What the sending direction of a stream needs from the rest of the connection.
@@ -73,8 +77,16 @@ impl OutboundTraffic {
                 frame_limit: u64::from(frame_limit.get()),
                 loan: Loan::default(),
                 rate: RateEstimate::new(Instant::now()),
+                marks: None,
+                t_c: crate::flow::credit_threshold(base_window),
+                sent_total: 0,
+                since_mark: 0,
             },
         }
+    }
+
+    pub fn set_marks(&mut self, key: MarkKey, div: f64) {
+        self.ledger.marks = Some((key, div));
     }
 
     /// Returns the `FIN_*` state of this direction.
@@ -305,6 +317,12 @@ struct Ledger {
     loan: Loan,
     /// The rate at which the reader of the peer proved to read, `R_s`.
     rate: RateEstimate,
+    /// EXPERIMENT: credit points. The key of the direction and the divisor of the step.
+    marks: Option<(MarkKey, f64)>,
+    t_c: u64,
+    sent_total: u64,
+    /// Bytes sent after the last mark.
+    since_mark: u64,
 }
 
 impl Ledger {
@@ -333,6 +351,41 @@ impl Ledger {
     /// A frame is whatever fits. Waiting for a whole frame would let residue of credit, a small
     /// pool or a small window block a stream that has room.
     fn plan(&mut self, ctx: &mut Ctx<'_>, waiting: usize) -> Option<usize> {
+        let planned = self.plan_inner(ctx, waiting);
+        let Some((key, div)) = self.marks else {
+            return planned;
+        };
+        match planned {
+            Some(n) => {
+                self.sent_total += n as u64;
+                self.since_mark += n as u64;
+                let mark = if self.window.borrowed() == 0 {
+                    // Within the base window, credit is needed only when the window is full.
+                    self.window.base_room() == 0 && self.since_mark >= self.t_c
+                } else {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let step = self.t_c.max((self.window.unacked() as f64 / div) as u64);
+                    self.since_mark >= step
+                };
+                if mark {
+                    self.since_mark = 0;
+                    credit::push_mark(key, self.sent_total, false);
+                }
+            },
+            // Blocked, and no mark is outstanding: no credit would ever come.
+            None if waiting > 0
+                && self.since_mark > 0
+                && self.window.unacked() <= self.since_mark =>
+            {
+                self.since_mark = 0;
+                credit::push_mark(key, self.sent_total, true);
+            },
+            None => {},
+        }
+        planned
+    }
+
+    fn plan_inner(&mut self, ctx: &mut Ctx<'_>, waiting: usize) -> Option<usize> {
         let waiting = waiting as u64;
         if waiting == 0 {
             ctx.flow.pass_turn(ctx.me);
