@@ -427,6 +427,9 @@ mod tests {
         vectored: bool,
         refuse: Arc<Mutex<bool>>,
         max_accept: usize,
+        /// Refuses every write that follows an accepted one, so that each poll writes once.
+        one_write_per_poll: bool,
+        accepted: bool,
     }
 
     impl MockIo {
@@ -438,12 +441,17 @@ mod tests {
                 vectored,
                 refuse: refuse.clone(),
                 max_accept: usize::MAX,
+                one_write_per_poll: false,
+                accepted: false,
             };
             (io, writes, refuse)
         }
 
         fn write(&mut self, cx: &mut Context<'_>, bufs: &[&[u8]]) -> Poll<io::Result<usize>> {
-            if std::mem::take(&mut *self.refuse.lock().unwrap()) {
+            let refuse = std::mem::take(&mut *self.refuse.lock().unwrap())
+                || (self.one_write_per_poll && self.accepted);
+            self.accepted = !refuse;
+            if refuse {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
@@ -916,6 +924,51 @@ mod tests {
         assert_all_same(&sent(), &frames);
         let t_write = clock.micros(t0 + Duration::from_millis(50));
         assert_eq!(pings_of(&frames), [t_write, t_write]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_ping_carries_the_time_of_the_write_that_takes_its_first_byte() {
+        let (mut io, writes, _) = MockIo::new(true);
+        io.max_accept = 4;
+        io.one_write_per_poll = true;
+        let mut codec = codec(io);
+        let clock = codec.clock();
+        tokio::time::advance(Duration::from_millis(1)).await;
+
+        // 8 bytes of `WINDOW`, 6 of `PING`, then the `DATA` with a `PING`.
+        let sent = || {
+            vec![
+                window(1),
+                ping(),
+                OutFrame {
+                    ping: true,
+                    ..stream_frame(2, ControlFlags::default(), 0, b"payload")
+                },
+            ]
+        };
+        for frame in sent() {
+            codec.feed(frame).await.unwrap();
+        }
+        // 4 bytes per write, 100 us apart.
+        let mut writes_at = Vec::new();
+        let mut flush = codec.flush();
+        loop {
+            writes_at.push(Instant::now());
+            if (&mut flush).now_or_never().is_some() {
+                break;
+            }
+            tokio::time::advance(Duration::from_micros(100)).await;
+        }
+
+        let bytes = writes.lock().unwrap().concat();
+        let frames = decode_all(&bytes).await;
+        assert_all_same(&sent(), &frames);
+        // The third write takes the first byte of the `PING`, the fourth the rest of it and the first bytes
+        // of the `DATA`.
+        assert_eq!(
+            pings_of(&frames),
+            [clock.micros(writes_at[2]), clock.micros(writes_at[3])]
+        );
     }
 
     #[tokio::test]

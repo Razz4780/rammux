@@ -221,3 +221,89 @@ impl Drop for Streams {
         self.end(StreamError::ConnectionDropped);
     }
 }
+
+#[cfg(test)]
+mod test {
+    use std::{
+        num::NonZeroU16,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    use futures::{StreamExt, task::ArcWake};
+
+    use crate::{
+        StreamId,
+        buffer::Data,
+        config::{RammuxConfig, RammuxRole},
+        connection::streams::Streams,
+        flow,
+        wire::header::{ControlFlags, StreamHeader},
+    };
+
+    struct Flag(AtomicBool);
+
+    impl ArcWake for Flag {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The call that makes a stream hold credit back in a larger step also arms the timer that settles it,
+    /// for the task that polled.
+    #[tokio::test(start_paused = true)]
+    async fn the_credit_that_grows_the_step_arms_the_settle_timer() {
+        let config = RammuxConfig::new();
+        let min_step = flow::credit_threshold(config.local_recv_window.get());
+        let mut streams = Streams::new(RammuxRole::Server, config);
+        streams.observe_rtt(Duration::from_millis(80));
+        let woken = Arc::new(Flag(AtomicBool::new(false)));
+        let waker = futures::task::waker(woken.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        let id = StreamId::from_slab_idx(0, RammuxRole::Client).unwrap();
+        let chunk = 8 * 1024;
+        let mut stream = None;
+        // The peer sends 8 KiB every millisecond, and the application reads it at once: 640 KiB per round trip.
+        // A credit of `T_c` goes every 4 ms, until the step grows.
+        loop {
+            tokio::time::advance(Duration::from_millis(1)).await;
+            let header = StreamHeader {
+                id,
+                flags: ControlFlags {
+                    syn: stream.is_none(),
+                    ..Default::default()
+                },
+                credit: None,
+                data_len: NonZeroU16::new(u16::try_from(chunk).unwrap()),
+            };
+            if let Some(new) = streams
+                .receive(header, Data::copy_from_slice(&vec![0; chunk]))
+                .unwrap()
+            {
+                stream = Some(new);
+            }
+            let read = stream.as_mut().unwrap().poll_next_unpin(&mut cx);
+            assert!(matches!(read, Poll::Ready(Some(Ok(..)))));
+
+            let unused = streams.rx_flow().settle.is_unused();
+            let polled = streams.poll_credit(&mut cx);
+            if unused && !streams.rx_flow().settle.is_unused() {
+                // The first step above `T_c` registered the stream with the timer.
+                let Poll::Ready(update) = polled else {
+                    panic!("only a credit grows the step");
+                };
+                assert_eq!(u64::from(update.credit), min_step);
+                break;
+            }
+        }
+
+        woken.0.store(false, Ordering::SeqCst);
+        tokio::time::advance(streams.rx_flow().settle_period().unwrap()).await;
+        assert!(woken.0.load(Ordering::SeqCst));
+    }
+}

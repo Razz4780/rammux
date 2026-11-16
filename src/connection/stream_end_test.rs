@@ -5,11 +5,16 @@ use std::{
     io,
     num::{NonZeroU16, NonZeroU32},
     pin::pin,
+    time::Duration,
 };
 
 use bytes::Bytes;
 use futures::{FutureExt, SinkExt, Stream, StreamExt};
-use tokio::{io::DuplexStream, task::unconstrained};
+use tokio::{
+    io::DuplexStream,
+    sync::mpsc,
+    task::{JoinHandle, unconstrained},
+};
 
 use crate::{
     config::{RammuxConfig, RammuxRole},
@@ -489,4 +494,197 @@ async fn a_close_before_a_downgrade_is_a_clean_end() {
         }
     };
     assert_eq!(read_to_end(&mut b, nothing), (b"abc".to_vec(), None));
+}
+
+/// Starts a stream on A, and a task that writes more to it than the window lets in and then waits for
+/// `close()`, or for `flush()`. B does not read, so the task does not finish. Returns the task, and the end
+/// of the stream on B.
+async fn pending_call(
+    pair: &mut Pair,
+    close: bool,
+) -> (JoinHandle<Result<(), StreamError>>, RammuxDuplex) {
+    let (a, b) = pair.open(b"abc");
+    let task = tokio::spawn(async move {
+        let (mut sink, _reader) = a.into_split();
+        sink.feed(chunk(4096)).await?;
+        if close {
+            sink.close().await
+        } else {
+            sink.flush().await
+        }
+    });
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+        pair.run();
+    }
+    assert!(!task.is_finished());
+    (task, b)
+}
+
+/// Lets the task run, with `run` called in between, and returns its result. Fails if nothing woke the task.
+async fn woken<T>(task: JoinHandle<T>, mut run: impl FnMut()) -> T {
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+        run();
+    }
+    assert!(task.is_finished(), "the pending call was not woken");
+    task.await.unwrap()
+}
+
+#[rstest::rstest]
+#[tokio::test(start_paused = true)]
+async fn a_pending_close_or_flush_is_woken_when_the_direction_ends(
+    #[values(true, false)] close: bool,
+) {
+    {
+        // The peer stops reading.
+        let mut pair = pair();
+        let (task, b) = pending_call(&mut pair, close).await;
+        drop(b);
+        assert_eq!(
+            woken(task, || pair.run()).await,
+            Err(StreamError::PeerStoppedReading)
+        );
+    }
+
+    {
+        // The connection is dropped.
+        let mut pair = pair();
+        let (task, _b) = pending_call(&mut pair, close).await;
+        let Pair {
+            a: side_a,
+            b: _side_b,
+        } = pair;
+        drop(side_a);
+        assert_eq!(
+            woken(task, nothing).await,
+            Err(StreamError::ConnectionDropped)
+        );
+    }
+
+    {
+        // The connection fails.
+        let mut pair = pair();
+        let (task, _b) = pending_call(&mut pair, close).await;
+        let Pair {
+            a: mut side_a,
+            b: side_b,
+        } = pair;
+        drop(side_b);
+        assert!(side_a.conn.progress().now_or_never().unwrap().is_err());
+        assert_eq!(
+            woken(task, nothing).await,
+            Err(StreamError::ConnectionFailed)
+        );
+    }
+
+    {
+        // The connection is downgraded.
+        let mut pair = pair();
+        let (task, _b) = pending_call(&mut pair, close).await;
+        let Pair {
+            a: side_a,
+            b: _side_b,
+        } = pair;
+        let _downgraded = side_a.conn.downgrade().unwrap();
+        assert_eq!(
+            woken(task, nothing).await,
+            Err(StreamError::ConnectionDowngraded)
+        );
+    }
+}
+
+/// Streams in both directions, with the connections and the applications on the threads of a multi-thread
+/// runtime, so that streams are woken from other threads than the ones that poll them. Every stream carries
+/// all of its data and ends cleanly.
+///
+/// The runtime cannot pause time, so this test runs in real time. Nothing in it sleeps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streams_end_cleanly_with_the_applications_on_other_threads() {
+    const STREAMS: usize = 48;
+    const BYTES: usize = 256 * 1024;
+
+    /// Writes [`BYTES`] in writes of varying size and closes, while reading the peer's [`BYTES`] to the end.
+    /// Both now and then let other tasks run. Returns how many bytes it read.
+    async fn talk(stream: RammuxDuplex, seed: u64) -> usize {
+        let (mut sink, mut reader) = stream.into_split();
+        let next = |n: u64| {
+            n.wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407)
+        };
+        let write = tokio::spawn(async move {
+            let mut left = BYTES;
+            let mut n = seed;
+            while left > 0 {
+                n = next(n);
+                let len = (1 + usize::try_from(n >> 33).unwrap() % 8192).min(left);
+                sink.send(Bytes::from(vec![1_u8; len])).await.unwrap();
+                left -= len;
+                if (n >> 20).is_multiple_of(8) {
+                    tokio::task::yield_now().await;
+                }
+            }
+            sink.close().await.unwrap();
+        });
+        let read = tokio::spawn(async move {
+            let mut read = 0;
+            let mut n = !seed;
+            while let Some(chunk) = reader.next().await {
+                read += chunk.unwrap().len();
+                n = next(n);
+                if (n >> 20).is_multiple_of(8) {
+                    tokio::task::yield_now().await;
+                }
+            }
+            read
+        });
+        write.await.unwrap();
+        read.await.unwrap()
+    }
+
+    let mut config = RammuxConfig::new();
+    config.frame_limit = NonZeroU16::new(4096).unwrap();
+    config.local_recv_window = NonZeroU32::new(4096).unwrap();
+    config.remote_recv_window = NonZeroU32::new(4096).unwrap();
+    config.local_recv_pool = 64 * 1024;
+    config.remote_recv_pool = 64 * 1024;
+    let (io_a, io_b) = tokio::io::duplex(64 * 1024);
+    let mut a = RammuxConnection::new(RammuxRole::Client, io_a, config.clone()).unwrap();
+    let mut b = RammuxConnection::new(RammuxRole::Server, io_b, config).unwrap();
+
+    let mut talks = Vec::new();
+    for seed in 0..STREAMS {
+        let stream = a.try_start_outbound().unwrap().unwrap();
+        talks.push(tokio::spawn(talk(stream, seed as u64)));
+    }
+    let conn_a = tokio::spawn(async move {
+        loop {
+            a.progress().await.unwrap();
+        }
+    });
+    let (inbound, mut inbound_talks) = mpsc::unbounded_channel();
+    let conn_b = tokio::spawn(async move {
+        let mut seed = 1000;
+        loop {
+            if let RammuxProgress::Inbound(stream) = b.progress().await.unwrap() {
+                let _ = inbound.send(tokio::spawn(talk(stream, seed)));
+                seed += 1;
+            }
+        }
+    });
+
+    let all = async {
+        for talk in talks {
+            assert_eq!(talk.await.unwrap(), BYTES);
+        }
+        for _ in 0..STREAMS {
+            let talk = inbound_talks.recv().await.unwrap();
+            assert_eq!(talk.await.unwrap(), BYTES);
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), all)
+        .await
+        .expect("the streams are stuck");
+    conn_a.abort();
+    conn_b.abort();
 }

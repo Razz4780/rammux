@@ -715,6 +715,12 @@ const FAST_MBIT: f64 = 100.0;
 
 /// The size of the pool moves where the burst ends between two steps of credit: with some, the last step
 /// happens to take the last byte, with others it would leave up to a step behind.
+///
+/// The stats show what the receiver left uncredited only beyond the base window of 32 KiB, which is `2 * T_c`.
+/// So the test proves that the tail was credited down to less than the base window, not down to less than
+/// `T_c`: `credit_test.rs` checks that. Without the settle timer, the cases of 1, 2 and 6 MiB fail: their
+/// bursts end more than 32 KiB past a step. The bursts of the cases of 512 KiB and 4 MiB end within 32 KiB
+/// of a step, so these two pass without the timer too.
 #[rstest::rstest]
 #[case::pool_of_512_kib(512 * 1024)]
 #[case::pool_of_1_mib(1024 * 1024)]
@@ -731,6 +737,70 @@ async fn a_burst_ends_with_nothing_borrowed(#[case] pool: u32) {
     // The stream stays open, and nobody reads or writes on it any more.
     tokio::time::sleep(Duration::from_secs(1)).await;
     let stats = rig.stats();
+    assert_eq!(stats.pool_tx_used, 0, "{stats:?}");
+    assert_eq!(stats.advance_held, 0, "{stats:?}");
+}
+
+/// Like [`a_burst_ends_with_nothing_borrowed`], and with the same limit of what it proves, with connections
+/// that are polled only when they are woken: nothing else polls them now and then, so the timer that settles
+/// the credit has to wake its connection. The stats are taken inside the poll. Both cases fail without
+/// the timer.
+#[rstest::rstest]
+#[case::reader_reads_everything(2 * 1024 * 1024, 0)]
+#[case::reader_stops_16_kib_early(4 * 1024 * 1024, 16 * 1024)]
+#[tokio::test(start_paused = true)]
+async fn the_tail_of_a_burst_is_credited_on_the_wake_ups_of_the_connection(
+    #[case] pool: u32,
+    #[case] unread: u64,
+) {
+    let mut config = config();
+    config.local_recv_pool = pool;
+    config.remote_recv_pool = pool;
+    let (client_io, server_io, ..) = link(FAST_MBIT, RTT / 2);
+    let mut client = RammuxConnection::new(RammuxRole::Client, client_io, config.clone()).unwrap();
+    let mut server = RammuxConnection::new(RammuxRole::Server, server_io, config).unwrap();
+    let stream = client.try_start_outbound().unwrap().unwrap();
+    let stats = Arc::new(Mutex::new(RammuxStats::default()));
+    let client_stats = stats.clone();
+    tokio::spawn(async move {
+        loop {
+            futures::future::poll_fn(|cx| {
+                let progress = client.poll_progress(cx);
+                *client_stats.lock().unwrap() = client.stats();
+                progress
+            })
+            .await
+            .expect("the connection works");
+        }
+    });
+    let (inbound, mut server_streams) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let progress = server.progress().await.expect("the connection works");
+            if let RammuxProgress::Inbound(stream) = progress {
+                let _ = inbound.send(stream);
+            }
+        }
+    });
+
+    let bytes = 8 * 1024 * 1024;
+    let (mut sink, stream) = stream.into_split();
+    tokio::spawn(async move {
+        let chunk = Bytes::from(vec![5_u8; 16 * 1024]);
+        for _ in 0..bytes / chunk.len() as u64 {
+            sink.send(chunk.clone()).await.unwrap();
+        }
+        std::future::pending::<()>().await;
+        drop(stream);
+    });
+    let (_sink, mut reader) = server_streams.recv().await.unwrap().into_split();
+    let mut read = 0;
+    while read < bytes - unread {
+        read += reader.next().await.unwrap().unwrap().len() as u64;
+    }
+    // The reader stops, and keeps the stream.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let stats = stats.lock().unwrap().clone();
     assert_eq!(stats.pool_tx_used, 0, "{stats:?}");
     assert_eq!(stats.advance_held, 0, "{stats:?}");
 }

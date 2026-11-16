@@ -184,6 +184,11 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn the_first_flow_frame_carries_a_ping() {
+        // The piggyback rule alone, without the interval, which is due at once too.
+        let schedule = PingSchedule::new(Duration::from_secs(5));
+        assert!(schedule.piggyback_due(Instant::now(), None));
+        assert!(schedule.piggyback_due(Instant::now(), Some(Duration::from_millis(80))));
+
         let mut pings = Pings::new(Duration::from_secs(5));
         assert!(ping(&mut pings, None, true));
     }

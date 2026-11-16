@@ -326,7 +326,13 @@ async fn pings_ride_on_flow_frames_and_back_off() {
     let start = Instant::now();
 
     // The peer never answers a PING: the gap doubles with every one.
-    let seen = write_for(&mut rig, &mut sink, 100).await;
+    let mut seen = write_for(&mut rig, &mut sink, 100).await;
+    // The PONG comes 40 ms after the last PING.
+    let last = *pings_of(&seen).last().unwrap();
+    let (t_ping, sent_at) = (last.t_ping.unwrap(), last.at);
+    let elapsed = u64::try_from((Instant::now() - sent_at).as_millis()).unwrap();
+    seen.extend(write_for(&mut rig, &mut sink, 40_u64.saturating_sub(elapsed)).await);
+
     let pings = pings_of(&seen);
     assert_eq!(pings[0].at, start);
     for ping in &pings[1..] {
@@ -338,29 +344,21 @@ async fn pings_ride_on_flow_frames_and_back_off() {
         min_gap *= 2;
     }
     assert!(pings.len() >= 4, "{}", pings.len());
+    assert_eq!(pings.last().unwrap().t_ping, Some(t_ping));
 
     // A PONG makes the round trip time 40 ms.
-    let last = pings.last().unwrap();
-    let (t_ping, sent_at) = (last.t_ping.unwrap(), last.at);
-    let elapsed = Instant::now() - sent_at;
-    write_for(
-        &mut rig,
-        &mut sink,
-        40 - u64::try_from(elapsed.as_millis()).unwrap(),
-    )
-    .await;
     rig.write(pong_of(t_ping)).await;
     assert_eq!(rig.conn.stats().srtt, Some(Duration::from_millis(40)));
 
-    // From now on, the gap is an eighth of it.
+    // From now on, the gap is an eighth of it, and the stream writes every millisecond: a PING every 5 ms.
     let seen = write_for(&mut rig, &mut sink, 100).await;
     let pings = pings_of(&seen);
-    assert!(pings.len() >= 10, "{}", pings.len());
+    assert_eq!(pings.len(), 20);
     for ping in &pings {
         assert!(ping.flow);
     }
     for pair in pings.windows(2) {
-        assert!(pair[1].at - pair[0].at >= Duration::from_millis(5));
+        assert_eq!(pair[1].at - pair[0].at, Duration::from_millis(5));
     }
 }
 
@@ -448,13 +446,18 @@ async fn stream_lifecycle_violations() {
     violation(limited, vec![data(0, syn(), b"x"), data(2, syn(), b"x")]).await;
     // A frame for a stream that does not exist.
     violation(config(), vec![data(2, none, b"x")]).await;
-    // DATA after FIN_WRITE, a second FIN_WRITE.
+    // DATA after FIN_WRITE, a second FIN_WRITE, a FIN_WRITE | ABORT after FIN_WRITE.
     let fw = ControlFlags {
         syn: true,
         ..fin_write()
     };
     violation(config(), vec![data(0, fw, b"x"), data(0, none, b"x")]).await;
     violation(config(), vec![data(0, fw, b"x"), control(0, fin_write())]).await;
+    let abort = ControlFlags {
+        abort: true,
+        ..fin_write()
+    };
+    violation(config(), vec![data(0, fw, b"x"), control(0, abort)]).await;
     // A second FIN_READ, WINDOW after FIN_READ.
     let fr = ControlFlags {
         fin_read: true,

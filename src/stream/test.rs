@@ -455,9 +455,12 @@ async fn a_rejected_write_does_not_lose_the_stream() {
     sink.start_send_unpin(Bytes::from_static(b"b")).unwrap_err();
     drop(sink);
 
-    let mut fin_write = false;
+    let mut fin_write = None;
     while let Some(Some((update, _))) = selectors.data.next().now_or_never() {
-        fin_write |= update.flags.fin_write;
+        if update.flags.fin_write {
+            fin_write = Some(update.flags);
+        }
     }
-    assert!(fin_write, "closing the sink sends FIN_WRITE");
+    let flags = fin_write.expect("dropping the sink sends FIN_WRITE");
+    assert!(flags.abort, "a sink dropped without close() aborts");
 }
