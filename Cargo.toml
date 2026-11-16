@@ -26,7 +26,6 @@ bitflags = "2"
 bytes = "1.1"
 futures = "0.3"
 slab = "0.4.6"
-static_assertions = "1"
 thiserror = "2"
 tokio = { version = "1.7", features = ["time"] }
 

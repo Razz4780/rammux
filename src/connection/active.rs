@@ -68,8 +68,8 @@ impl<IO> Active<IO> {
     pub fn stats(&self) -> RammuxStats {
         let flow = self.streams.flow();
         RammuxStats {
-            inbound_streams: count(self.streams.inbound_count()),
-            outbound_streams: count(self.streams.outbound_count()),
+            inbound_streams: stream_count(self.streams.inbound_count()),
+            outbound_streams: stream_count(self.streams.outbound_count()),
             srtt: flow.srtt.get(),
             pool_tx_used: flow.tx_pool.used(),
             pool_rx_used: flow.rx_pool.used(),
@@ -155,7 +155,12 @@ where
     }
 }
 
-/// Converts a count of streams or queue entries for [`RammuxStats`].
+/// Converts a count of queue entries for [`RammuxStats`].
 fn count(n: usize) -> u32 {
-    u32::try_from(n).expect("there are fewer than u32::MAX streams")
+    u32::try_from(n).expect("there are fewer than u32::MAX queue entries")
+}
+
+/// Converts a count of streams for [`RammuxStats`].
+fn stream_count(n: usize) -> u16 {
+    u16::try_from(n).expect("there are at most `MAX_STREAMS_PER_SIDE` streams per side")
 }

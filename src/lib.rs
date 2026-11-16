@@ -128,17 +128,6 @@ use tokio::time::Instant;
 
 pub use crate::{error::RammuxError, stream_id::StreamId};
 
-static_assertions::const_assert!(std::mem::size_of::<u32>() <= std::mem::size_of::<usize>());
-
-/// Convenience function for casting `u32` to `usize`.
-///
-/// The cast never truncates, as statically asserted above.
-///
-/// It exists only to avoid commenting in all of the places where this cast is used.
-const fn safe_cast_usize(value: u32) -> usize {
-    value as usize
-}
-
 /// Returns the instant `after` from now.
 ///
 /// A duration too long to add, such as [`Duration::MAX`], means "never":

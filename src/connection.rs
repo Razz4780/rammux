@@ -213,9 +213,9 @@ impl<IO> fmt::Debug for RammuxProgress<IO> {
 #[non_exhaustive]
 pub struct RammuxStats {
     /// How many streams started by the peer are open.
-    pub inbound_streams: u32,
+    pub inbound_streams: u16,
     /// How many streams started by this side are open.
-    pub outbound_streams: u32,
+    pub outbound_streams: u16,
     /// Smoothed round trip time of the connection, measured with `PING`s.
     ///
     /// It includes the time that data waits in queues on the way, in both directions.

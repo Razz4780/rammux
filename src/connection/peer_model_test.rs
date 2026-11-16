@@ -230,7 +230,7 @@ impl Peer {
             // Start a stream, maybe with data, maybe closing right away.
             0 | 1 => {
                 let started = ids.iter().filter(|id| *id % 2 == 0).count();
-                if started >= crate::safe_cast_usize(self.config.max_inbound_streams) {
+                if started >= usize::from(self.config.max_inbound_streams) {
                     return None;
                 }
                 let id = rng.u16_below(8) * 2;

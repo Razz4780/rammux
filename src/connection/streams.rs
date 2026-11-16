@@ -75,7 +75,7 @@ impl Streams {
 
     /// Starts a new stream, unless the configured limit or the IDs are exhausted.
     pub fn open_outbound(&mut self) -> Option<RammuxDuplex> {
-        if self.outbound.len() >= crate::safe_cast_usize(self.config.max_outbound_streams) {
+        if self.outbound.len() >= usize::from(self.config.max_outbound_streams) {
             return None;
         }
         let id = StreamId::from_slab_idx(self.outbound.vacant_key(), self.role)?;
@@ -118,7 +118,7 @@ impl Streams {
                 },
                 Entry::Occupied(entry) => (&*entry.into_mut(), None),
                 Entry::Vacant(entry) if header.flags.syn => {
-                    if inbound_count >= crate::safe_cast_usize(self.config.max_inbound_streams) {
+                    if inbound_count >= usize::from(self.config.max_inbound_streams) {
                         return Err(violation(
                             "started a new stream without respecting the configured limit",
                         ));
