@@ -234,7 +234,7 @@ mod test {
         time::Duration,
     };
 
-    use futures::{StreamExt, task::ArcWake};
+    use futures::StreamExt;
 
     use crate::{
         StreamId,
@@ -242,16 +242,9 @@ mod test {
         config::{RammuxConfig, RammuxRole},
         connection::streams::Streams,
         flow,
+        stream::test_support::Flag,
         wire::header::{ControlFlags, StreamHeader},
     };
-
-    struct Flag(AtomicBool);
-
-    impl ArcWake for Flag {
-        fn wake_by_ref(arc_self: &Arc<Self>) {
-            arc_self.0.store(true, Ordering::SeqCst);
-        }
-    }
 
     /// The call that makes a stream hold credit back in a larger step also arms the timer that settles it,
     /// for the task that polled.

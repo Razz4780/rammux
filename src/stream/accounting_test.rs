@@ -3,17 +3,11 @@
 use std::{
     collections::VecDeque,
     num::{NonZeroU16, NonZeroU32},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    task::{Context, Poll},
     time::Duration,
 };
 
-use async_selector::selector::Selector;
 use bytes::Bytes;
-use futures::{FutureExt, SinkExt, StreamExt, task::ArcWake};
+use futures::{FutureExt, SinkExt, StreamExt};
 use tokio::time::Instant;
 
 use crate::{
@@ -24,9 +18,8 @@ use crate::{
     stream::{
         ConnFlow, RammuxDuplex, RxFlow,
         handle::StreamHandle,
-        updates::{CreditUpdates, DataUpdates},
+        test_support::{Selectors, fins},
     },
-    wire::header::ControlFlags,
 };
 
 const POOL: u32 = 40;
@@ -47,14 +40,6 @@ const CONFIG: RammuxConfig = RammuxConfig {
     inbound_frame_timeout: Duration::from_secs(2),
 };
 
-struct Woken(AtomicBool);
-
-impl ArcWake for Woken {
-    fn wake_by_ref(arc_self: &Arc<Self>) {
-        arc_self.0.store(true, Ordering::SeqCst);
-    }
-}
-
 /// A frame in flight.
 struct InFlight {
     at: Instant,
@@ -67,8 +52,7 @@ struct InFlight {
 
 /// One end of the link: streams with both directions.
 struct End {
-    credit: Selector<CreditUpdates, RxFlow>,
-    data: Selector<DataUpdates, ConnFlow>,
+    selectors: Selectors,
     handles: Vec<StreamHandle>,
     duplexes: Vec<RammuxDuplex>,
     ids: Vec<StreamId>,
@@ -83,8 +67,7 @@ impl End {
         let mut rx = RxFlow::new(POOL);
         rx.srtt = srtt;
         let mut end = Self {
-            credit: Selector::new(rx),
-            data: Selector::new(tx),
+            selectors: Selectors::new(rx, tx),
             handles: Vec::new(),
             duplexes: Vec::new(),
             ids: Vec::new(),
@@ -93,8 +76,8 @@ impl End {
         for n in 0..STREAMS {
             let id = StreamId::from_be_bytes((u16::try_from(n).unwrap() * 2).to_be_bytes());
             let (handle, credit, data, duplex) = crate::stream::new(id, initiator, &CONFIG);
-            end.credit.push(credit);
-            end.data.push(data);
+            end.selectors.credit.push(credit);
+            end.selectors.data.push(data);
             end.handles.push(handle);
             end.duplexes.push(duplex);
             end.ids.push(id);
@@ -104,35 +87,23 @@ impl End {
 
     /// Collects the frames the streams want to send, credit first, like the connection does.
     fn flush(&mut self, delay: Duration) {
-        let flag = Arc::new(Woken(AtomicBool::new(false)));
-        let waker = futures::task::waker(flag.clone());
-        let mut cx = Context::from_waker(&waker);
-        loop {
-            flag.0.store(false, Ordering::SeqCst);
-            self.credit.strategy_mut().settle.poll(&mut cx);
-            let credit = self.credit.poll_next_unpin(&mut cx);
-            self.credit.strategy_mut().settle.poll(&mut cx);
-            let polled = match credit {
-                Poll::Ready(Some(yielded)) => Poll::Ready(Some(yielded)),
-                _ => self.data.poll_next_unpin(&mut cx),
-            };
-            match polled {
-                Poll::Ready(Some((update, _))) => {
-                    let stream = self.ids.iter().position(|id| *id == update.id).unwrap();
-                    self.outgoing.push_back(InFlight {
-                        at: Instant::now() + delay,
-                        stream,
-                        credit: update.credit,
-                        data: update.data,
-                        fin_write: update.flags.fin_write,
-                        fin_read: update.flags.fin_read,
-                    });
-                },
-                Poll::Ready(None) => break,
-                Poll::Pending if flag.0.load(Ordering::SeqCst) => {},
-                Poll::Pending => break,
-            }
-        }
+        let Self {
+            selectors,
+            ids,
+            outgoing,
+            ..
+        } = self;
+        selectors.drain(|update, _| {
+            let stream = ids.iter().position(|id| *id == update.id).unwrap();
+            outgoing.push_back(InFlight {
+                at: Instant::now() + delay,
+                stream,
+                credit: update.credit,
+                data: update.data,
+                fin_write: update.flags.fin_write,
+                fin_read: update.flags.fin_read,
+            });
+        });
     }
 
     /// Delivers the frames the peer sent.
@@ -144,8 +115,8 @@ impl End {
                     NonZeroU32::new(f.credit),
                     Data::copy_from_slice(&f.data),
                     fins(f.fin_write, f.fin_read),
-                    self.data.strategy_mut(),
-                    self.credit.strategy_mut(),
+                    self.selectors.data.strategy_mut(),
+                    self.selectors.credit.strategy_mut(),
                 )
                 .expect("the peer follows the rules");
         }
@@ -230,7 +201,10 @@ async fn run(seed: u64, steps: usize) -> u64 {
             sum_tx += tx.saturating_sub(u64::from(BASE));
             sum_rx += rx.saturating_sub(u64::from(BASE));
         }
-        let (g_tx, g_rx) = (left.data.strategy(), right.credit.strategy());
+        let (g_tx, g_rx) = (
+            left.selectors.data.strategy(),
+            right.selectors.credit.strategy(),
+        );
         assert_eq!(g_tx.tx_pool.used(), sum_tx);
         assert_eq!(g_rx.pool.used(), sum_rx);
         assert!(g_tx.tx_pool.used() >= g_rx.pool.used());
@@ -253,9 +227,9 @@ async fn run(seed: u64, steps: usize) -> u64 {
         );
         assert_eq!(left.unacked_tx(s), right.unacked_rx(s));
     }
-    assert_eq!(left.data.strategy().tx_pool.used(), 0);
-    assert_eq!(right.credit.strategy().pool.used(), 0);
-    assert_eq!(left.data.strategy().turns.len(), 0);
+    assert_eq!(left.selectors.data.strategy().tx_pool.used(), 0);
+    assert_eq!(right.selectors.credit.strategy().pool.used(), 0);
+    assert_eq!(left.selectors.data.strategy().turns.len(), 0);
     max_used
 }
 
@@ -268,13 +242,4 @@ async fn sender_never_counts_less_than_receiver() {
     }
     // The runs do use the pool, up to its size.
     assert_eq!(max_used, u64::from(POOL));
-}
-
-fn fins(fin_write: bool, fin_read: bool) -> ControlFlags {
-    ControlFlags {
-        syn: false,
-        fin_read,
-        fin_write,
-        abort: false,
-    }
 }

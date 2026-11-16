@@ -3,7 +3,6 @@ use std::{
     time::Duration,
 };
 
-use async_selector::selector::Selector;
 use bytes::Bytes;
 use futures::{FutureExt, SinkExt, StreamExt};
 
@@ -13,9 +12,7 @@ use crate::{
     config::RammuxConfig,
     error::StreamViolation,
     stream::{
-        ConnFlow, FinState, RammuxDuplex, RxFlow,
-        handle::StreamHandle,
-        updates::{CreditUpdates, DataUpdates},
+        ConnFlow, FinState, RammuxDuplex, RxFlow, handle::StreamHandle, test_support::Selectors,
     },
     wire::header::ControlFlags,
 };
@@ -34,46 +31,10 @@ const CONFIG: RammuxConfig = RammuxConfig {
     inbound_frame_timeout: Duration::from_secs(1),
 };
 
-/// The two selectors of a connection, which poll the tasks of the streams.
-struct Selectors {
-    credit: Selector<CreditUpdates, RxFlow>,
-    data: Selector<DataUpdates, ConnFlow>,
-}
-
-impl Selectors {
-    fn new(rx_pool: u32) -> Self {
-        Self {
-            credit: Selector::new(RxFlow::new(rx_pool)),
-            data: Selector::new(ConnFlow::new(0)),
-        }
-    }
-
-    /// Hands the parts of an inbound frame to the stream, with the shared state of these selectors.
-    fn received(
-        &mut self,
-        handle: &StreamHandle,
-        credit: Option<NonZeroU32>,
-        data: Data,
-        flags: ControlFlags,
-    ) -> Result<FinState, StreamViolation> {
-        handle.received(
-            credit,
-            data,
-            flags,
-            self.data.strategy_mut(),
-            self.credit.strategy_mut(),
-        )
-    }
-
-    fn rx_pool_used(&self) -> u64 {
-        self.credit.strategy().pool.used()
-    }
-}
-
 /// Starts an outbound stream on a connection with the given receive pool.
 fn new_stream(rx_pool: u32) -> (StreamHandle, Selectors, RammuxDuplex) {
     let (handle, credit, data, duplex) = super::new(StreamId::from_be_bytes([0, 0]), true, &CONFIG);
-    let mut selectors = Selectors::new(rx_pool);
+    let mut selectors = Selectors::new(RxFlow::new(rx_pool), ConnFlow::new(0));
     selectors.credit.push(credit);
     selectors.data.push(data);
     (handle, selectors, duplex)

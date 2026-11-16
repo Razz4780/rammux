@@ -21,6 +21,7 @@ use crate::{
     StreamId,
     config::{RammuxConfig, RammuxRole},
     connection::{RammuxConnection, RammuxProgress, active::CREDIT_BURST},
+    stream::RammuxDuplex,
     wire::{
         codec::{
             RammuxCodec,
@@ -541,6 +542,18 @@ impl AsyncWrite for Pipes {
     }
 }
 
+/// Lets the connection do everything it can do now. Returns the streams that the peer started.
+fn settle(conn: &mut RammuxConnection<Pipes>) -> Vec<RammuxDuplex> {
+    let mut started = Vec::new();
+    // Unconstrained: tokio's budget would make a long run of ready reads look like Pending.
+    while let Some(result) = tokio::task::unconstrained(conn.progress()).now_or_never() {
+        if let RammuxProgress::Inbound(stream) = result.unwrap() {
+            started.push(stream);
+        }
+    }
+    started
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_flood_of_pings_is_read_without_a_stall_and_answered_with_the_latest() {
     // A peer that sends only PINGs and does not read for a while. The answers do not fit the pipe
@@ -559,13 +572,6 @@ async fn a_flood_of_pings_is_read_without_a_stall_and_answered_with_the_latest()
             b"",
         )
     };
-    // Unconstrained: tokio's budget would make a long run of ready reads look like Pending.
-    let settle = |conn: &mut RammuxConnection<Pipes>| {
-        while let Some(result) = tokio::task::unconstrained(conn.progress()).now_or_never() {
-            result.unwrap();
-        }
-    };
-
     let sent = 10_000;
     for t_ping in 0..sent {
         peer_out.write_all(&ping(t_ping)).await.unwrap();
@@ -617,11 +623,6 @@ async fn a_blocked_writer_keeps_reading_and_owes_one_pong() {
     let mut conn =
         RammuxConnection::new(RammuxRole::Server, Pipes { read, write }, config()).unwrap();
     let owed = |conn: &RammuxConnection<Pipes>| conn.state.active().unwrap().owed_pong();
-    let settle = |conn: &mut RammuxConnection<Pipes>| {
-        while let Some(result) = tokio::task::unconstrained(conn.progress()).now_or_never() {
-            result.unwrap();
-        }
-    };
 
     // The first PING rides along with the frame that the writer then gets stuck on.
     // The next ones are read all the same, and only the latest is owed.
@@ -755,14 +756,6 @@ async fn a_window_update_does_not_wait_behind_the_data_of_other_streams() {
     small_window.local_recv_window = NonZeroU32::new(512).unwrap();
     let mut conn =
         RammuxConnection::new(RammuxRole::Client, Pipes { read, write }, small_window).unwrap();
-    let mut accepted = Vec::new();
-    let mut settle = |conn: &mut RammuxConnection<Pipes>| {
-        while let Some(result) = tokio::task::unconstrained(conn.progress()).now_or_never() {
-            if let RammuxProgress::Inbound(stream) = result.unwrap() {
-                accepted.push(stream);
-            }
-        }
-    };
 
     // Four streams have four frames of data each, and the transport fills up.
     let mut uploads = Vec::new();
@@ -782,9 +775,7 @@ async fn a_window_update_does_not_wait_behind_the_data_of_other_streams() {
         .write_all(&data(1, syn(), &[2; 256]))
         .await
         .unwrap();
-    settle(&mut conn);
-    drop(settle);
-    let mut download = accepted.pop().expect("the stream of the peer");
+    let mut download = settle(&mut conn).pop().expect("the stream of the peer");
     assert_eq!(
         download
             .next()

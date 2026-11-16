@@ -1,7 +1,8 @@
 //! The steps in which a receiving direction returns credit, with the connection's timer that settles them.
 //!
-//! The base window is 64 KiB, so `T_c` is 32 KiB, and the receive pool is 4 MiB unless a test says otherwise. The direction is polled the way the connection polls it:
-//! only after its task was woken, by a read or by the timer.
+//! The base window is 64 KiB, so `T_c` is 32 KiB, and the receive pool is 4 MiB unless a test says otherwise.
+//! The direction is polled the way the connection polls it: only after its task was woken, by a read or by
+//! the timer.
 
 use std::{
     sync::{
@@ -12,13 +13,13 @@ use std::{
     time::Duration,
 };
 
-use futures::task::{ArcWake, AtomicWaker};
+use futures::task::AtomicWaker;
 use tokio::time::Instant;
 
 use crate::{
     buffer::Data,
     flow::Srtt,
-    stream::{RxFlow, inbound::InboundTraffic},
+    stream::{RxFlow, inbound::InboundTraffic, test_support::Flag},
 };
 
 const KIB: usize = 1024;
@@ -26,14 +27,6 @@ const BASE: u32 = 64 * 1024;
 /// `T_c` of [`BASE`].
 const T_C: u32 = 32 * 1024;
 const POOL: u32 = 4 * 1024 * 1024;
-
-struct Flag(AtomicBool);
-
-impl ArcWake for Flag {
-    fn wake_by_ref(arc_self: &Arc<Self>) {
-        arc_self.0.store(true, Ordering::SeqCst);
-    }
-}
 
 /// A receiving direction, and the connection that polls its credit task.
 struct Rx {
