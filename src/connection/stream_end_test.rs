@@ -504,7 +504,7 @@ async fn pending_call(
     close: bool,
 ) -> (JoinHandle<Result<(), StreamError>>, RammuxDuplex) {
     let (a, b) = pair.open(b"abc");
-    let task = tokio::spawn(async move {
+    let mut task = tokio::spawn(async move {
         let (mut sink, _reader) = a.into_split();
         sink.feed(chunk(4096)).await?;
         if close {
@@ -514,21 +514,23 @@ async fn pending_call(
         }
     });
     for _ in 0..10 {
-        tokio::task::yield_now().await;
+        // `let ()`: the oldest tokio that the crate allows marks the output of `yield_now` as must-use.
+        let () = tokio::task::yield_now().await;
         pair.run();
     }
-    assert!(!task.is_finished());
+    assert!((&mut task).now_or_never().is_none());
     (task, b)
 }
 
 /// Lets the task run, with `run` called in between, and returns its result. Fails if nothing woke the task.
 async fn woken<T>(task: JoinHandle<T>, mut run: impl FnMut()) -> T {
     for _ in 0..10 {
-        tokio::task::yield_now().await;
+        let () = tokio::task::yield_now().await;
         run();
     }
-    assert!(task.is_finished(), "the pending call was not woken");
-    task.await.unwrap()
+    task.now_or_never()
+        .expect("the pending call was not woken")
+        .unwrap()
 }
 
 #[rstest::rstest]
@@ -621,7 +623,7 @@ async fn streams_end_cleanly_with_the_applications_on_other_threads() {
                 sink.send(Bytes::from(vec![1_u8; len])).await.unwrap();
                 left -= len;
                 if (n >> 20).is_multiple_of(8) {
-                    tokio::task::yield_now().await;
+                    let () = tokio::task::yield_now().await;
                 }
             }
             sink.close().await.unwrap();
@@ -633,7 +635,7 @@ async fn streams_end_cleanly_with_the_applications_on_other_threads() {
                 read += chunk.unwrap().len();
                 n = next(n);
                 if (n >> 20).is_multiple_of(8) {
-                    tokio::task::yield_now().await;
+                    let () = tokio::task::yield_now().await;
                 }
             }
             read
