@@ -1,6 +1,6 @@
 //! The steps in which a receiving direction returns credit, with the connection's timer that settles them.
 //!
-//! The base window is 64 KiB, so `T_c` is 32 KiB. The direction is polled the way the connection polls it:
+//! The base window is 64 KiB, so `T_c` is 32 KiB, and the receive pool is 4 MiB unless a test says otherwise. The direction is polled the way the connection polls it:
 //! only after its task was woken, by a read or by the timer.
 
 use std::{
@@ -25,6 +25,7 @@ const KIB: usize = 1024;
 const BASE: u32 = 64 * 1024;
 /// `T_c` of [`BASE`].
 const T_C: u32 = 32 * 1024;
+const POOL: u32 = 4 * 1024 * 1024;
 
 struct Flag(AtomicBool);
 
@@ -49,7 +50,11 @@ struct Rx {
 
 impl Rx {
     fn new(srtt: Option<Duration>) -> Self {
-        let mut flow = RxFlow::new(16 * 1024 * 1024);
+        Self::with_pool(srtt, POOL)
+    }
+
+    fn with_pool(srtt: Option<Duration>, pool: u32) -> Self {
+        let mut flow = RxFlow::new(pool);
         if let Some(srtt) = srtt {
             flow.srtt = Srtt::of(srtt);
         }
@@ -190,6 +195,25 @@ async fn the_step_follows_the_rate() {
     // 8 per round trip are 40.
     assert!((30..=50).contains(&late.len()), "{late:?}");
     assert!(rx.credits.iter().all(|(_, credit)| *credit >= T_C));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_step_stays_within_what_the_sender_can_have_in_flight() {
+    // A round trip time far above the real loop, as after a late first sample: the rate would make a step of
+    // about 1 MiB, more than the 128 KiB that the sender can have in flight on the stream.
+    let mut rx = Rx::with_pool(Some(Duration::from_secs(1)), BASE);
+    for _ in 0..1000 {
+        tokio::time::advance(Duration::from_millis(1)).await;
+        // The sender keeps within the base window and the pool.
+        if rx.inbound.unacked() + 8 * 1024 <= u64::from(2 * BASE) {
+            rx.consume(8 * KIB);
+        }
+        rx.poll();
+    }
+    // An eighth of 128 KiB is below `T_c`.
+    assert!(rx.credits.iter().all(|(_, credit)| *credit == T_C));
+    assert_eq!(rx.credited(), rx.consumed);
+    assert!(rx.flow.settle.is_unused());
 }
 
 #[tokio::test(start_paused = true)]

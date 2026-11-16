@@ -20,7 +20,8 @@ use crate::{
 ///
 /// Credit goes back in steps. The step is `T_c` and grows with the pace of the reader to
 /// `1 / CREDIT_STEP_DIVISOR` of what it consumes per loop, so a fast stream sends a few large `WINDOW`s per loop
-/// instead of many small ones. A step larger than `T_c` must not strand the credit of a reader that stops between
+/// instead of many small ones. It never grows beyond `1 / CREDIT_STEP_DIVISOR` of what the sender can have
+/// in flight on the stream, `B + P`. A step larger than `T_c` must not strand the credit of a reader that stops between
 /// two steps: the sender would count those bytes as in flight for good, and with a full window it could never send
 /// again. So a stream with such a step falls back to `T_c` when its reader leaves its pace, and the connection's
 /// [`Settle`](super::conn_flow::Settle) timer makes sure that somebody looks at it soon after it goes quiet.
@@ -208,9 +209,16 @@ impl InboundTraffic {
                     });
                     sent.rate.add(credit, now, srtt);
                     sent.last = now;
-                    // Whole bytes of what the reader consumed over the last loop, as the sender estimates it.
+                    // What the reader consumed over the last loop, as the sender estimates it, but no more than
+                    // the sender can have in flight on the stream. With a right `srtt` the reader cannot consume
+                    // more than that per loop. With an `srtt` far above the real loop (a late first sample),
+                    // the step could grow beyond what the sender can send, and every credit would wait for
+                    // the settle timer.
+                    let in_flight = (self.window.base() + rx.pool.size()) as f64;
+                    let consumed = (sent.rate.value(now, srtt) * srtt).min(in_flight);
+                    // Whole bytes.
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    let step = (sent.rate.value(now, srtt) * srtt / CREDIT_STEP_DIVISOR) as u64;
+                    let step = (consumed / CREDIT_STEP_DIVISOR) as u64;
                     self.step = step.max(self.min_step);
                 }
                 self.settle(rx, waker);

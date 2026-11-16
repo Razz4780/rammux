@@ -66,6 +66,11 @@ impl Pool {
         }
     }
 
+    /// Returns the size of the pool, `P`.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
     /// Returns the sum over the streams of the bytes they borrow.
     pub fn used(&self) -> u64 {
         self.used
@@ -204,6 +209,11 @@ impl Window {
             idle_below: credit_threshold(base),
             unacked: 0,
         }
+    }
+
+    /// Returns the base window, `B`.
+    pub fn base(&self) -> u64 {
+        self.base
     }
 
     /// Returns the bytes in flight.
