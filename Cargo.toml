@@ -1,13 +1,13 @@
 [package]
 name = "rammux"
-version = "1.0.1"
+version = "0.0.0"
 edition = "2024"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/Razz4780/rammux"
 authors = ["Michał Smolarek <msmolarekg@gmail.com>"]
 description = "Asynchronous stream multiplexer"
-publish = true
+publish = false
 keywords = ["multiplexer", "network", "protocol"]
 categories = ["network-programming"]
 rust-version = "1.89.0"
