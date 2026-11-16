@@ -24,7 +24,7 @@ receiver cannot see what the sender has waiting. Depending on the implementation
 
 In rammux the *sender* decides, for every frame, which stream may use the memory that the receiver offers.
 Streams get equal shares, a latecomer catches up within a few round trips, and a stream whose reader is slow or
-stalled leaves the bandwidth to the others. The cost is about 5% more packets on connections that carry data
+stalled leaves the bandwidth to the others. The cost is some more small packets on connections that carry data
 in one direction only.
 
 [TRANSIT_CONTROL.md](TRANSIT_CONTROL.md) explains how it works, with measurements against hyper and yamux.
@@ -33,7 +33,7 @@ in one direction only.
 
 ```toml
 [dependencies]
-rammux = "1"
+rammux = "0.1"
 bytes = "1"
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }
@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // A stream is a `Sink` and a `Stream` of `Bytes`. It can move to another task.
+    // A stream is a `Sink` of `Bytes` and a `Stream` of `Result<Bytes, StreamError>`. It can move to another task.
     let mut stream = client
         .try_start_outbound()?
         .expect("the stream limit is not reached");
@@ -158,7 +158,7 @@ Every stream may have `local_recv_window` bytes waiting to be read (64 KiB by de
 connection share `local_recv_pool` bytes on top of that (4 MiB by default). The memory that a connection uses
 for received data is bounded by these two.
 
-The pool is also what limits the speed of the connection and the queue it builds: about pne BDP is enough for full speed, and a smaller pool keeps interactive streams more responsive
+The pool is also what limits the speed of the connection and the queue it builds: about one BDP is enough for full speed, and a smaller pool keeps interactive streams more responsive
 next to bulk transfers. See [TRANSIT_CONTROL.md](TRANSIT_CONTROL.md#choosing-the-settings).
 
 ### Keepalive
@@ -202,4 +202,5 @@ The [examples directory](https://github.com/Razz4780/rammux/tree/main/examples) 
 - [PROTOCOL.md](PROTOCOL.md): the wire protocol
 - [TRANSIT_CONTROL.md](TRANSIT_CONTROL.md): how streams share the connection, compared with HTTP/2 and yamux
 
-A new major version of the crate may change the wire protocol: both peers must run the same major version.
+While the crate is at 0.x, a new minor version may change the wire protocol: both peers must run the same
+minor version, such as 0.1.

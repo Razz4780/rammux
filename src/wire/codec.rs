@@ -47,7 +47,8 @@ pub const CONTROL_BATCH: usize = 1024;
 /// Frames without payload are encoded into a control buffer of at most [`CONTROL_BATCH`] bytes.
 /// A frame with a payload waits on its own, and is written in one `poll_write_vectored`
 /// together with the control buffer before it (the control frames, the header, the payload).
-/// The control buffer is written alone only when it has no room for another frame, or on a flush.
+/// The control buffer is written alone when it has no room for another frame, on a flush or a close,
+/// and by `poll_ready` after a flush or a close whose writes did not finish.
 /// Either way the bytes reach the transport in the order the frames were sent.
 ///
 /// The codec is ready for the next frame when no frame with a payload waits and the control buffer has room.

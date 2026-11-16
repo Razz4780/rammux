@@ -8,9 +8,9 @@
 //! - [`RammuxConnection`](connection::RammuxConnection) owns the transport and runs the protocol.
 //!   Nothing happens in the background: your code polls it, and all streams stall when it does not.
 //! - [`RammuxDuplex`](stream::RammuxDuplex) is one stream: a [`Sink`](futures::Sink) of
-//!   [`Bytes`](bytes::Bytes), and a [`Stream`](futures::Stream) of them. Only closing the sink ends
-//!   a stream cleanly. Otherwise the reader on the other side gets a [`StreamError`](stream::StreamError)
-//!   that says why the stream ended.
+//!   [`Bytes`](bytes::Bytes), and a [`Stream`](futures::Stream) of `Result<Bytes, StreamError>`.
+//!   Only closing the sink ends a stream cleanly. Otherwise the reader on the other side gets
+//!   a [`StreamError`](stream::StreamError) that says why the stream ended.
 //! - [`RammuxConfig`](config::RammuxConfig) holds the settings, which the two peers have to agree on.
 //! - When the peers are done, [`downgrade`](connection::RammuxConnection::downgrade) ends the session
 //!   and gives the transport back.
@@ -50,7 +50,7 @@
 //!     }
 //! });
 //!
-//! // A stream is a `Sink` and a `Stream` of `Bytes`. It can move to another task.
+//! // A stream is a `Sink` of `Bytes` and a `Stream` of `Result<Bytes, StreamError>`. It can move to another task.
 //! let mut stream = client
 //!     .try_start_outbound()?
 //!     .expect("the stream limit is not reached");

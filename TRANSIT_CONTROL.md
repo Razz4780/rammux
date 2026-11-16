@@ -155,9 +155,11 @@ TCP makes them, for every multiplexer.
 - **Shares are equal in frames, not in bytes.** A turn moves one frame, and a frame holds at most one write.
   A stream that writes less than `frame_limit` bytes at a time gets a proportionally smaller share next to a
   stream that writes more.
-- **More small packets when data flows one way.** Credit is returned every 32 KiB, and every 32 KiB of data
-  carries a `PING`. When the other direction has data, these ride along. When it has none, they are about 60
-  small packets per MB: 5.5% more packets in total than yamux or hyper, and 0.35 percentage points more bytes.
+- **More small packets when data flows one way.** The receiver returns credit in steps of at least `T_c`, which
+  grow to an eighth of what its reader consumes per round trip. Each side adds a `PING` to its data or credit at
+  most every eighth of a round trip, and the other side answers with a `PONG`. Control frames that are ready
+  together leave in one packet. When the other direction has data, they ride along. When it has none, they are
+  packets of their own.
 - **The queue is not limited.** Like the other multiplexers, a connection with enough data fills what it is
   given, here `streams * B + P`, and an interactive stream waits behind the bulk that is already on the path.
   The pool is the bound. `TCP_NOTSENT_LOWAT` can be used as a mitigation on platforms that support it.
