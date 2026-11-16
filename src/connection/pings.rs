@@ -218,6 +218,9 @@ mod test {
             tokio::time::advance(interval).await;
         }
         assert!(ping(&mut pings, None, false), "the interval still fires");
+        // The gap after 200 `PING`s is evaluated here, and it is long.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!ping(&mut pings, None, true));
     }
 
     #[tokio::test(start_paused = true)]
