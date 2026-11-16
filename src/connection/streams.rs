@@ -261,9 +261,10 @@ mod test {
         let id = StreamId::from_slab_idx(0, RammuxRole::Client).unwrap();
         let chunk = 8 * 1024;
         let mut stream = None;
+        let mut grown = false;
         // The peer sends 8 KiB every millisecond, and the application reads it at once: 640 KiB per round trip.
         // A credit of `T_c` goes every 4 ms, until the step grows.
-        loop {
+        for _ in 0..500 {
             tokio::time::advance(Duration::from_millis(1)).await;
             let header = StreamHeader {
                 id,
@@ -291,9 +292,11 @@ mod test {
                     panic!("only a credit grows the step");
                 };
                 assert_eq!(u64::from(update.credit), min_step);
+                grown = true;
                 break;
             }
         }
+        assert!(grown, "the step never grew above T_c");
 
         woken.0.store(false, Ordering::SeqCst);
         tokio::time::advance(streams.rx_flow().settle_period().unwrap()).await;

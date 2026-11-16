@@ -153,7 +153,7 @@ async fn run_server(mut rammux: RammuxConnection<DuplexStream>) {
         }
     }
 
-    if let Some(stream) = blocked {
+    if let Some(stream) = &blocked {
         println!("[{role}] Stream {} was never read.", stream.id());
     }
     println!("[{role}] Starting downgrade.");
