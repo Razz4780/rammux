@@ -674,13 +674,16 @@ async fn a_new_stream_starts_within_the_grant_with_the_advance() {
         last = now;
     }
     // The first loop is the base window and the grant: the rule changes that on purpose (measured: 1.03 MiB,
-    // 1 MiB of it the grant). The doubling goes on from there, while the link is not the limit.
+    // 1 MiB of it the grant). Its credit comes back in one piece, which proves `ALLOWANCE_RTTS / RATE_RTTS`
+    // of it (measured: 1.65 times). The doubling goes on from there, while the link is not the limit
+    // (measured: 2.09 and 1.99 times).
     assert!(
         per_loop[0] <= 32.0 * 1024.0 + grant as f64 + 1.0,
         "{per_loop:?}"
     );
     assert!(per_loop[0] > grant as f64, "{per_loop:?}");
-    for pair in per_loop.windows(2).take(3) {
+    assert!(per_loop[1] >= 1.6 * per_loop[0], "{per_loop:?}");
+    for pair in per_loop[1..].windows(2).take(2) {
         assert!(pair[1] >= 1.8 * pair[0], "{per_loop:?}");
     }
 }

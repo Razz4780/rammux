@@ -60,22 +60,27 @@ another stream from using its own base window.
 ### The proven rate
 
 Every credit that comes back for a stream feeds an estimate of its reader's rate, a sum that decays with the
-time constant `srtt`:
+time constant `1.5 * srtt`:
 
 ```
-R = R * exp(-dt / srtt) + credit / srtt      on every credit
-A = 2 * srtt * R                             the allowance
+R = R * exp(-dt / (1.5 * srtt)) + credit / (1.5 * srtt)      on every credit
+A = 2.5 * srtt * R                                           the allowance
 ```
 
-A stream may borrow up to its allowance `A`: about twice the bytes that its reader consumed over the last
-round trip.
+A stream may borrow up to its allowance `A`: about two and a half times the bytes that its reader consumes
+in a round trip.
 
 - While the reader keeps up, the window of a stream about doubles every round trip, as in TCP slow start.
-- When the reader slows down, the allowance follows it down. The stream keeps about two round trips of its
-  read rate in flight, and the rest of the pool stays with the others.
+- When the reader slows down, the allowance follows it down. The stream keeps about two and a half round
+  trips of its read rate in flight, and the rest of the pool stays with the others.
 - When the reader stalls, the allowance decays to zero and the stream stops borrowing. What it already
   holds stays in the pool until the reader reads or the stream closes.
-- A stream that pauses for more than a couple of round trips starts over, as TCP does after idle.
+- A stream that pauses for more than a few round trips starts over, as TCP does after idle.
+
+A stream whose reader keeps up has about one round trip of its rate in flight, so it uses less than half of
+its allowance. The rest is slack for credit that comes late. A loss in TCP holds all credit back for about a
+round trip, and afterwards the credit of a whole flight comes back in one piece. An allowance without that
+slack would stop the stream each time, and streams that are stopped lose their turns and drift apart.
 
 Until the first `PONG` arrives there is no `srtt`, and streams use their base windows only.
 
@@ -122,7 +127,7 @@ A 300 Mbit/s link with a 250 ms round trip. Stream A uploads alone, then B joins
 | hyper, default windows | 23 | 23 and 23 | 23 | 23 |
 | hyper, adaptive window | 285 | 143 and 143 | 5 | 161 |
 | yamux | 235 | 265 and 4 | 8 | 8 |
-| rammux | 278 | 143 and 143 | 285 | 285 |
+| rammux | 278 | 143 and 143 | 271 | 285 |
 
 With yamux, B stays choked while A is silent, until A is dropped. With hyper's adaptive window, B gets the link back
 only as A's reader drains the 16 MiB that A holds.
@@ -150,7 +155,7 @@ TCP makes them, for every multiplexer.
   link after 1.25 s (about 3.5 s with the advance turned off). hyper's adaptive window needed 0.25 s, yamux never got there.
 - **A reader that stalls keeps what it holds.** Its stream stops borrowing within a few round trips, but the bytes
   that are already in the pool stay there until they are read or the stream closes. When one of two bulk streams
-  stalled, it held 10.5 MB of the 16 MiB pool, and the other stream got 205 of 287 Mbit/s
+  stalled, it held 12.0 MB of the 16 MiB pool, and the other stream got 154 of 287 Mbit/s
   (8 Mbit/s with yamux, 14 to 136 with hyper's adaptive window).
 - **Shares are equal in frames, not in bytes.** A turn moves one frame, and a frame holds at most one write.
   A stream that writes less than `frame_limit` bytes at a time gets a proportionally smaller share next to a

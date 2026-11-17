@@ -16,13 +16,31 @@ pub use rate::RateEstimate;
 
 mod rate;
 
-/// `k`: an allowance covers this many loops (smoothed round trip times) of the rate estimate.
+/// `m`: the rate estimate of a stream averages over this many loops (smoothed round trip times).
 ///
-/// The estimate averages over one loop and the allowance covers two, so the window of a stream whose
-/// reader keeps up about doubles per loop, and its steady allowance is about twice what it has in flight.
-/// Averaging over the two loops themselves would read simpler, but a new stream would then grow only
-/// about 1.65 times per loop.
-pub const ALLOWANCE_RTTS: f64 = 2.0;
+/// More than one loop, so that the estimate, and with it the allowance, does not collapse while credit is late.
+/// See [`ALLOWANCE_RTTS`].
+pub const RATE_RTTS: f64 = 1.5;
+
+/// `k`: an allowance covers this many loops of the rate estimate.
+///
+/// A stream whose reader keeps up has about one loop of its rate in flight, so it uses less than half of its
+/// allowance. The rest is slack for credit that is late. A loss in the transport holds all credit back
+/// for about a loop, and afterwards the credit of a whole flight comes back in one piece, once per loop,
+/// until the streams spread out again. With credit of `f` bytes every `c` loops, the allowance just before
+/// the next piece is `k * f / (m * (exp(c / m) - 1))`, with `m` = [`RATE_RTTS`]: it covers the flight up to
+/// `c` of about 1.47. Without that slack (`m` = 1, `k` = 2 covers `c` up to 1.1) streams with data in both
+/// directions are stopped by their allowance again and again, lose their turns, and drift apart.
+///
+/// The slack has a price: a reader that slows down keeps `k` loops of its rate in flight, and a reader
+/// that stalls is noticed later. A new stream grows a little faster than with `m` = 1, `k` = 2: its window
+/// about doubles per loop.
+pub const ALLOWANCE_RTTS: f64 = 2.5;
+
+/// Returns the time constant of the rate estimates for a smoothed round trip time of `srtt` seconds.
+pub fn rate_tau(srtt: f64) -> f64 {
+    srtt * RATE_RTTS
+}
 
 /// Bytes of credit at which the receiver returns credit to the sender, unless the base window is small.
 pub const CREDIT_THRESHOLD: u32 = 32 * 1024;
@@ -250,9 +268,14 @@ impl Srtt {
         self.0
     }
 
-    /// Returns the smoothed round trip time in seconds: the time constant of the rate estimates, about one loop.
+    /// Returns the smoothed round trip time in seconds: about one loop.
     pub fn secs(self) -> Option<f64> {
         self.0.map(|srtt| srtt.as_secs_f64())
+    }
+
+    /// Returns the time constant of the rate estimates, in seconds.
+    pub fn rate_tau(self) -> Option<f64> {
+        self.secs().map(rate_tau)
     }
 
     /// Folds a sample into the smoothed value.

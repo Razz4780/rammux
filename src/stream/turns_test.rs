@@ -1,8 +1,8 @@
 //! Tests of the sending rules and the turn queue, with several streams in one data selector.
 //!
 //! The streams have the base window of 16 bytes and frames of 8 bytes.
-//! The loop time is 1 s, so the estimates have the time constant of 1 s and the allowances cover 2 s (the paused clock does not move
-//! unless a test moves it).
+//! The loop time is 1 s, so the estimates have the time constant of 1.5 s and the allowances cover 2.5 s
+//! (the paused clock does not move unless a test moves it).
 
 use std::{
     num::{NonZeroU16, NonZeroU32},
@@ -597,10 +597,10 @@ async fn credit_repays_the_advance_and_still_feeds_the_rate() {
 
     bed.credit(x, 8);
     assert_eq!((bed.advance(x), bed.v()), (8, 8));
-    // The credit proved 16 bytes (8 B/s * 2 s) and the 8 left of the advance count as proven too:
-    // the stream may borrow 16 + 8 - 8 = 16 more. It is not the grant that sends them.
+    // The credit proved 13 bytes (8 bytes over the 1.5 s of the estimate, for 2.5 s) and the 8 left of the
+    // advance count as proven too: the stream may borrow 13 + 8 - 8 = 13 more. It is not the grant that sends them.
     let sent = bed.drain();
-    assert_eq!(sent, [(x, 8), (x, 8)]);
+    assert_eq!(sent, [(x, 8), (x, 5)]);
     assert_eq!(
         (bed.advance(x), bed.v()),
         (8, 8),
