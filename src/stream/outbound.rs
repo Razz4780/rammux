@@ -92,6 +92,19 @@ impl WriteEnd {
     }
 }
 
+/// What the writer of a stream knows about the progress of its reader, see
+/// [`RammuxSink::reader_stall`](super::RammuxSink::reader_stall).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReaderStall {
+    /// How many bytes of the stream are in flight: sent, and not released by the peer's reader yet.
+    /// They count against the buffers of the peer, wherever they are.
+    pub unacked: u64,
+    /// When the peer last released bytes of the stream: when its last window update arrived.
+    /// [`None`] if none has arrived yet.
+    pub last_window_update: Option<Instant>,
+}
+
 /// The `FIN_WRITE` of a sending direction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FinWrite {
@@ -115,6 +128,7 @@ impl OutboundTraffic {
                 frame_limit: u64::from(frame_limit.get()),
                 loan: Loan::default(),
                 rate: RateEstimate::new(Instant::now()),
+                last_window_update: None,
             },
         }
     }
@@ -226,6 +240,14 @@ impl OutboundTraffic {
         };
     }
 
+    /// Returns what this side knows about the progress of the peer's reader.
+    pub fn reader_stall(&self) -> ReaderStall {
+        ReaderStall {
+            unacked: self.ledger.window.unacked(),
+            last_window_update: self.ledger.last_window_update,
+        }
+    }
+
     // The connection side.
 
     /// Polls for what this direction sends next: a chunk of data, and the `FIN_WRITE` that follows it, if any.
@@ -308,6 +330,7 @@ impl OutboundTraffic {
             .ok_or(StreamViolation("returned more credit than was in flight"))?;
 
         let freed = self.ledger.window.set(&mut ctx.flow.tx_pool, unacked);
+        self.ledger.last_window_update = Some(ctx.now);
         // The credit pays back the advance first.
         self.ledger
             .loan
@@ -408,6 +431,8 @@ struct Ledger {
     loan: Loan,
     /// The rate at which the reader of the peer proved to read, `R_s`.
     rate: RateEstimate,
+    /// When the peer last returned credit, if it did.
+    last_window_update: Option<Instant>,
 }
 
 impl Ledger {

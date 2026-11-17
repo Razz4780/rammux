@@ -7,7 +7,11 @@ use std::{
 use bytes::Bytes;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 
-use crate::{StreamId, error::StreamError, stream::StreamRef};
+use crate::{
+    StreamId,
+    error::StreamError,
+    stream::{ReaderStall, StreamRef},
+};
 
 /// Bidirectional virtual data stream created within a rammux connection.
 ///
@@ -44,6 +48,11 @@ impl RammuxDuplex {
     /// Splits this stream into independent [`Sink`] and [`Stream`] handles.
     pub fn into_split(self) -> (RammuxSink, RammuxStream) {
         (self.sink, self.stream)
+    }
+
+    /// Tells how the peer's reader is getting on, see [`RammuxSink::reader_stall`].
+    pub fn reader_stall(&self) -> ReaderStall {
+        self.sink.reader_stall()
     }
 
     /// Gives up on the stream in both directions: [resets](RammuxSink::reset) the sink,
@@ -135,6 +144,39 @@ impl RammuxSink {
     /// Returns the ID of this stream.
     pub fn id(&self) -> StreamId {
         self.id
+    }
+
+    /// Tells how the peer's reader is getting on: how many bytes of the stream are in flight, and when
+    /// the peer last released some. With it, the application can decide that the reader is stalled,
+    /// and [`reset`](Self::reset) the stream.
+    ///
+    /// These are the two facts that this side has, and they do not make a verdict:
+    /// - [`ReaderStall::unacked`] counts the bytes that are still on their way, too. The peer releases
+    ///   bytes in steps of up to 32 KiB (at most half of its receive window for a stream), so a count
+    ///   below that can stay for good while the reader keeps up.
+    /// - On a slow connection, or on one that many streams share, a stream whose reader keeps up also
+    ///   goes for long between two window updates. A limit has to allow for the connection.
+    ///
+    /// Once the peer stopped reading, nothing is in flight. Once the connection is gone, both facts stay
+    /// as they were. The time is a [`tokio::time::Instant`].
+    ///
+    /// ```
+    /// # use std::time::Duration;
+    /// # use rammux::stream::RammuxSink;
+    /// # fn give_up(sink: RammuxSink) {
+    /// let stall = sink.reader_stall();
+    /// let waited = stall.last_window_update.map(|at| at.elapsed());
+    /// if stall.unacked >= 1024 * 1024 && waited.is_some_and(|waited| waited > Duration::from_secs(30)) {
+    ///     sink.reset();
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if another user of the stream panicked while holding its lock.
+    pub fn reader_stall(&self) -> ReaderStall {
+        self.shared.lock().outbound.reader_stall()
     }
 
     /// Resets the stream: the data that the connection has not taken yet is discarded, and so is the data
