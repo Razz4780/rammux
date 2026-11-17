@@ -281,13 +281,30 @@ impl Rig {
 
     /// Like [`Self::bulk`], with the given size of one write.
     async fn bulk_writing(&mut self, stall_at: Option<Instant>, write: usize) {
+        self.bulk_until(stall_at, write, None).await;
+    }
+
+    /// Like [`Self::bulk_writing`], and the client resets the stream at `reset_at`, if given.
+    async fn bulk_until(
+        &mut self,
+        stall_at: Option<Instant>,
+        write: usize,
+        reset_at: Option<Instant>,
+    ) {
         let (tx, rx) = oneshot::channel();
         self.open.send(tx).unwrap();
         let stream = rx.await.unwrap();
         let (mut sink, _stream) = stream.into_split();
         tokio::spawn(async move {
             let chunk = Bytes::from(vec![5_u8; write]);
-            while sink.send(chunk.clone()).await.is_ok() {}
+            let writing = async { while sink.send(chunk.clone()).await.is_ok() {} };
+            match reset_at {
+                Some(at) => {
+                    let _ = tokio::time::timeout_at(at, writing).await;
+                    sink.reset();
+                },
+                None => writing.await,
+            }
             drop(_stream);
         });
 
@@ -411,6 +428,27 @@ async fn a_stalled_reader_does_not_hold_up_the_others() {
     tokio::time::sleep(Duration::from_secs(8)).await;
     let rate = rig.rate(1, Duration::from_secs(10)).await;
     assert!(rate > 0.85 * MBIT, "{rate} Mbit/s");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reset_returns_what_a_stalled_reader_holds() {
+    let mut rig = Rig::new(MBIT, RTT, config());
+    let start = Instant::now();
+    rig.bulk_until(
+        Some(start + Duration::from_millis(150)),
+        64 * 1024,
+        Some(start + Duration::from_secs(5)),
+    )
+    .await;
+
+    tokio::time::sleep_until(start + Duration::from_millis(4900)).await;
+    let stalled = rig.stats();
+    assert!(stalled.pool_tx_used > 0, "{stalled:?}");
+
+    // The reader still does not read. The reset takes a round trip, and a little for the queued data.
+    tokio::time::sleep_until(start + Duration::from_secs(5) + 4 * RTT).await;
+    let reset = rig.stats();
+    assert_eq!(reset.pool_tx_used, 0, "{reset:?}");
 }
 
 #[tokio::test(start_paused = true)]

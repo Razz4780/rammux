@@ -74,7 +74,7 @@ in a round trip.
 - When the reader slows down, the allowance follows it down. The stream keeps about two and a half round
   trips of its read rate in flight, and the rest of the pool stays with the others.
 - When the reader stalls, the allowance decays to zero and the stream stops borrowing. What it already
-  holds stays in the pool until the reader reads or the stream closes.
+  holds stays in the pool until the reader reads, the stream closes, or the writer resets the stream.
 - A stream that pauses for more than a few round trips starts over, as TCP does after idle.
 
 A stream whose reader keeps up has about one round trip of its rate in flight, so it uses less than half of
@@ -156,7 +156,9 @@ TCP makes them, for every multiplexer.
 - **A reader that stalls keeps what it holds.** Its stream stops borrowing within a few round trips, but the bytes
   that are already in the pool stay there until they are read or the stream closes. When one of two bulk streams
   stalled, it held 12.0 MB of the 16 MiB pool, and the other stream got 154 of 287 Mbit/s
-  (8 Mbit/s with yamux, 14 to 136 with hyper's adaptive window).
+  (8 Mbit/s with yamux, 14 to 136 with hyper's adaptive window). A writer that gives up on such a stream
+  can reset it. The receiving side then discards the bytes: 0.6 s after the reset, the other stream had the
+  whole link (286 Mbit/s).
 - **Shares are equal in frames, not in bytes.** A turn moves one frame, and a frame holds at most one write.
   A stream that writes less than `frame_limit` bytes at a time gets a proportionally smaller share next to a
   stream that writes more.

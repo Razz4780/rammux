@@ -68,6 +68,8 @@ enum WriteEnd {
     Closed,
     /// The application dropped its sink without closing it. `FIN_WRITE` carries `ABORT`.
     Dropped,
+    /// The application reset the stream. `FIN_WRITE` carries `RESET`.
+    Reset,
     /// The peer stopped reading, or the connection is gone. The application gets the error.
     Failed(StreamError),
 }
@@ -76,7 +78,7 @@ impl WriteEnd {
     /// Returns what a write of the application gets.
     fn write_error(self) -> StreamError {
         match self {
-            Self::Closed | Self::Dropped => StreamError::SinkClosed,
+            Self::Closed | Self::Dropped | Self::Reset => StreamError::SinkClosed,
             Self::Failed(error) => error,
         }
     }
@@ -84,7 +86,7 @@ impl WriteEnd {
     /// Returns what a flush or a close of the application gets.
     fn flushed(self) -> Result<(), StreamError> {
         match self {
-            Self::Closed | Self::Dropped => Ok(()),
+            Self::Closed | Self::Dropped | Self::Reset => Ok(()),
             Self::Failed(error) => Err(error),
         }
     }
@@ -97,6 +99,8 @@ pub enum FinWrite {
     Clean,
     /// The application dropped its sink without closing it: `FIN_WRITE` with `ABORT`.
     Abort,
+    /// The application reset the stream: `FIN_WRITE` with `RESET`.
+    Reset,
 }
 
 impl OutboundTraffic {
@@ -206,6 +210,22 @@ impl OutboundTraffic {
         };
     }
 
+    /// The application resets the stream: the data that was not sent is dropped, and `FIN_WRITE` with `RESET`
+    /// follows. A sink that started to close is reset too, as long as its `FIN_WRITE` did not go out.
+    ///
+    /// Does nothing once `FIN_WRITE` went out, or once the direction ended for another reason.
+    /// Wakes the `data_task` of the stream, which sends `FIN_WRITE`.
+    pub fn reset_writing(&mut self, data_task: &AtomicWaker) {
+        let (OutboundState::Open { .. } | OutboundState::HalfClosed { .. }) = &self.state else {
+            return;
+        };
+        data_task.wake();
+        self.state = OutboundState::Closed {
+            fin_state: FinState::default(),
+            end: WriteEnd::Reset,
+        };
+    }
+
     // The connection side.
 
     /// Polls for what this direction sends next: a chunk of data, and the `FIN_WRITE` that follows it, if any.
@@ -258,6 +278,7 @@ impl OutboundTraffic {
                 fin_state.sent = true;
                 let fin_write = match end {
                     WriteEnd::Dropped => FinWrite::Abort,
+                    WriteEnd::Reset => FinWrite::Reset,
                     WriteEnd::Closed | WriteEnd::Failed(..) => FinWrite::Clean,
                 };
                 Poll::Ready((Bytes::new(), Some(fin_write)))

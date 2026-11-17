@@ -32,6 +32,9 @@ bitflags! {
         const TERM      = 0x0080;
         /// With `FIN_WRITE`: the sender of the frame stopped writing before it finished.
         const ABORT     = 0x0100;
+        /// With `FIN_WRITE`: the sender of the frame gave up on the stream,
+        /// and the receiver discards the data that it has not consumed.
+        const RESET     = 0x0200;
     }
 }
 
@@ -42,7 +45,8 @@ impl Flags {
         .union(Self::FIN_WRITE)
         .union(Self::WINDOW)
         .union(Self::DATA)
-        .union(Self::ABORT);
+        .union(Self::ABORT)
+        .union(Self::RESET);
 
     /// Returns the length of the whole header with these flags.
     ///
@@ -84,6 +88,12 @@ impl Flags {
         if flags.contains(Self::ABORT) && !flags.contains(Self::FIN_WRITE) {
             return Err(DecodeError("ABORT without FIN_WRITE"));
         }
+        if flags.contains(Self::RESET) && !flags.contains(Self::FIN_WRITE) {
+            return Err(DecodeError("RESET without FIN_WRITE"));
+        }
+        if flags.contains(Self::RESET | Self::ABORT) {
+            return Err(DecodeError("RESET combined with ABORT"));
+        }
         Ok(flags)
     }
 }
@@ -106,6 +116,8 @@ pub struct ControlFlags {
     pub syn: bool,
     /// Only with [`Self::fin_write`].
     pub abort: bool,
+    /// Only with [`Self::fin_write`], and never with [`Self::abort`].
+    pub reset: bool,
 }
 
 /// The part of a header that concerns one stream.
@@ -128,6 +140,7 @@ impl StreamHeader {
         flags.set(Flags::FIN_READ, self.flags.fin_read);
         flags.set(Flags::FIN_WRITE, self.flags.fin_write);
         flags.set(Flags::ABORT, self.flags.abort);
+        flags.set(Flags::RESET, self.flags.reset);
         flags.set(Flags::WINDOW, self.credit.is_some());
         flags.set(Flags::DATA, self.data_len.is_some());
         flags
@@ -164,7 +177,8 @@ impl Header {
     /// # Panics
     ///
     /// Panics if the header is not a legal frame: it has no flags, it has a stream part without flags,
-    /// `TERM` is combined with something else, or `ABORT` comes without `FIN_WRITE`.
+    /// `TERM` is combined with something else, `ABORT` or `RESET` comes without `FIN_WRITE`,
+    /// or the two come together.
     pub fn encode(&self, out: &mut [u8; MAX_HEADER_LEN]) -> usize {
         let flags = self.flags();
         assert!(
@@ -233,6 +247,7 @@ impl Header {
                     fin_write: flags.contains(Flags::FIN_WRITE),
                     syn: flags.contains(Flags::SYN),
                     abort: flags.contains(Flags::ABORT),
+                    reset: flags.contains(Flags::RESET),
                 },
                 credit,
                 data_len,
@@ -399,6 +414,24 @@ mod test {
         },
         &[0x01, 0x05, 0x12, 0x34],
     )]
+    #[case::reset(
+        Header {
+            stream: stream(ControlFlags { fin_write: true, reset: true, ..Default::default() }, None, None),
+            ..Default::default()
+        },
+        &[0x02, 0x04, 0x12, 0x34],
+    )]
+    #[case::reset_with_syn_and_fin_read(
+        Header {
+            stream: stream(
+                ControlFlags { syn: true, fin_read: true, fin_write: true, reset: true, ..Default::default() },
+                None,
+                None,
+            ),
+            ..Default::default()
+        },
+        &[0x02, 0x07, 0x12, 0x34],
+    )]
     #[test]
     fn encode_decode(#[case] header: Header, #[case] expected: &[u8]) {
         let mut buf = [0; MAX_HEADER_LEN];
@@ -414,7 +447,8 @@ mod test {
 
     #[test]
     fn every_legal_flag_combination_roundtrips() {
-        // The combinations of the non-TERM flags, but `ABORT` only with `FIN_WRITE`.
+        // The combinations of the non-TERM flags, but `ABORT` and `RESET` only with `FIN_WRITE`,
+        // and never together.
         let all = Flags::all().difference(Flags::TERM).bits();
         let mut legal = 0;
         for bits in 0..=all {
@@ -423,7 +457,10 @@ mod test {
             else {
                 continue;
             };
-            if flags.contains(Flags::ABORT) && !flags.contains(Flags::FIN_WRITE) {
+            let ends = flags.intersection(Flags::ABORT | Flags::RESET);
+            if (!ends.is_empty() && !flags.contains(Flags::FIN_WRITE))
+                || ends.bits().count_ones() == 2
+            {
                 Flags::validate(bits).unwrap_err();
                 continue;
             }
@@ -436,7 +473,8 @@ mod test {
                             | Flags::FIN_WRITE
                             | Flags::WINDOW
                             | Flags::DATA
-                            | Flags::ABORT,
+                            | Flags::ABORT
+                            | Flags::RESET,
                     )
                     .then(|| StreamHeader {
                         id: StreamId::from_be_bytes([0xFF, 0xFE]),
@@ -445,6 +483,7 @@ mod test {
                             fin_write: flags.contains(Flags::FIN_WRITE),
                             syn: flags.contains(Flags::SYN),
                             abort: flags.contains(Flags::ABORT),
+                            reset: flags.contains(Flags::RESET),
                         },
                         credit: flags.contains(Flags::WINDOW).then_some(NonZeroU32::MIN),
                         data_len: flags.contains(Flags::DATA).then_some(NonZeroU16::MAX),
@@ -460,15 +499,18 @@ mod test {
             assert_eq!(decoded_flags, flags);
             assert_eq!(Header::decode(flags, &buf[..len]).unwrap(), header);
         }
-        // 2^8 - 1 combinations, less the 2^6 with `ABORT` and without `FIN_WRITE`.
-        assert_eq!(legal, 191);
+        // 2^7 - 1 combinations without `ABORT` and `RESET`, and 2^6 with `FIN_WRITE` and each of the two.
+        assert_eq!(legal, 255);
     }
 
     #[rstest]
     #[case::abort_without_fin_write(0x0100)]
     #[case::abort_with_data_without_fin_write(0x0110)]
-    #[case::reserved_bit_0x0200(0x0200)]
-    #[case::reserved(0x0400)]
+    #[case::reset_without_fin_write(0x0200)]
+    #[case::reset_with_data_without_fin_write(0x0210)]
+    #[case::reset_with_abort(0x0304)]
+    #[case::reserved_bit_0x0400(0x0400)]
+    #[case::reserved(0x0800)]
     #[case::reserved_high(0x8001)]
     #[case::no_flags(0x0000)]
     #[case::term_and_ping(0x00A0)]

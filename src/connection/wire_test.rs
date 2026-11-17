@@ -469,6 +469,32 @@ async fn stream_lifecycle_violations() {
     violation(config(), vec![control(0, fin_read()), window]).await;
 }
 
+/// `FIN_WRITE` with `RESET` is a `FIN_WRITE`: it comes once, and no data follows it.
+#[tokio::test(start_paused = true)]
+async fn reset_violations() {
+    let none = ControlFlags::default();
+    let fw = ControlFlags {
+        syn: true,
+        ..fin_write()
+    };
+    let reset = ControlFlags {
+        reset: true,
+        ..fin_write()
+    };
+    let reset_syn = ControlFlags { syn: true, ..reset };
+    violation(config(), vec![data(0, fw, b"x"), control(0, reset)]).await;
+    violation(
+        config(),
+        vec![data(0, reset_syn, b"x"), control(0, fin_write())],
+    )
+    .await;
+    violation(
+        config(),
+        vec![data(0, reset_syn, b"x"), data(0, none, b"x")],
+    )
+    .await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn flow_control_violations() {
     let none = ControlFlags::default();
@@ -885,6 +911,7 @@ async fn a_stream_announces_itself_once() {
         fin_read: true,
         fin_write: false,
         abort: false,
+        reset: false,
     };
     let fin_read = ControlFlags {
         fin_read: true,
@@ -961,6 +988,65 @@ async fn a_sink_dropped_before_close_sends_abort() {
             }
         )]
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reset_sink_sends_reset() {
+    let reset = ControlFlags {
+        fin_write: true,
+        reset: true,
+        ..Default::default()
+    };
+    let mut rig = rig(RammuxRole::Client, config());
+    rig.frames();
+    let (mut sink, _reader) = rig.conn.try_start_outbound().unwrap().unwrap().into_split();
+    sink.feed(Bytes::from_static(b"abc"))
+        .now_or_never()
+        .unwrap()
+        .unwrap();
+    assert_eq!(stream_frames(&rig.frames()), [(0, 0, 3, syn())]);
+    sink.feed(Bytes::from_static(b"def"))
+        .now_or_never()
+        .unwrap()
+        .unwrap();
+    // The connection did not take the second write before the reset: it is discarded.
+    sink.reset();
+    assert_eq!(stream_frames(&rig.frames()), [(0, 0, 0, reset)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reset_is_answered_with_fin_read_at_once() {
+    let reset = ControlFlags {
+        fin_write: true,
+        reset: true,
+        ..Default::default()
+    };
+    let fin_read = ControlFlags {
+        fin_read: true,
+        ..Default::default()
+    };
+    let mut rig = rig(RammuxRole::Server, config());
+    rig.frames();
+    rig.peer_out
+        .write_all(&data(0, syn(), b"abc"))
+        .await
+        .unwrap();
+    let stream = loop {
+        match rig.conn.progress().now_or_never() {
+            Some(Ok(RammuxProgress::Inbound(stream))) => break stream,
+            Some(result) => {
+                result.unwrap();
+            },
+            None => panic!("the stream was not accepted"),
+        }
+    };
+    assert_eq!(rig.conn.stats().pool_rx_used, 0);
+    assert!(stream_frames(&rig.frames()).is_empty());
+
+    // The application holds the stream and reads nothing.
+    rig.write(control(0, reset)).await;
+    assert_eq!(stream_frames(&rig.frames()), [(0, 0, 0, fin_read)]);
+    drop(stream);
 }
 
 #[tokio::test(start_paused = true)]

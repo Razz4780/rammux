@@ -135,6 +135,9 @@ The directions close independently, and the reader learns how the writer on the 
 - Closing the sink is the only clean end. The peer's reader gets the data, and then `None`.
 - Dropping the sink without closing it aborts the stream. The data that the connection has not taken yet is
   discarded, and the peer's reader gets the data that arrived, then `StreamError::PeerAborted`, then `None`.
+- `reset()` gives up on the stream, for example when the peer's reader stalls and its unread data holds
+  buffers that other streams need. The data that the peer's reader has not got yet is discarded: it gets
+  `StreamError::PeerReset`, then `None`, and the peer's buffers are free for other streams.
 - Dropping the reader tells the peer's writer to stop: its sink fails with `StreamError::PeerStoppedReading`.
 - When the connection ends, so do the streams that are still open. Their readers get the data that arrived,
   then `StreamError::ConnectionFailed`, `ConnectionDowngraded` or `ConnectionDropped`, and their sinks fail

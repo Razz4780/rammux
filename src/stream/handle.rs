@@ -18,7 +18,7 @@ impl StreamHandle {
     /// Updates the stream with the stream part of a received frame.
     ///
     /// The parts of the frame are processed in the order of the protocol:
-    /// `WINDOW`, `DATA`, `FIN_WRITE` (with `ABORT`), `FIN_READ`. `SYN` is the business of the caller.
+    /// `WINDOW`, `DATA`, `FIN_WRITE` (with `ABORT` or `RESET`), `FIN_READ`. `SYN` is the business of the caller.
     ///
     /// Returns the new [`FinState`] of the whole stream.
     pub fn received(
@@ -39,7 +39,9 @@ impl StreamHandle {
             state.outbound.received_window_update(credit, &mut ctx)?;
         }
         state.inbound.received_data(data, &mut rx.pool)?;
-        if flags.fin_write {
+        if flags.fin_write && flags.reset {
+            state.inbound.received_reset(&self.0.credit_task)?;
+        } else if flags.fin_write {
             state
                 .inbound
                 .received_fin_write(flags.abort, &self.0.credit_task)?;

@@ -16,6 +16,7 @@ use crate::{StreamId, error::StreamError, stream::StreamRef};
 ///
 /// Dropping it drops both halves: the peer reads [`StreamError::PeerAborted`] after the data it got,
 /// unless the sink was closed first, and the peer's writes fail with [`StreamError::PeerStoppedReading`].
+/// [`reset`](Self::reset) gives up on the stream without making the peer read that data first.
 pub struct RammuxDuplex {
     sink: RammuxSink,
     stream: RammuxStream,
@@ -43,6 +44,14 @@ impl RammuxDuplex {
     /// Splits this stream into independent [`Sink`] and [`Stream`] handles.
     pub fn into_split(self) -> (RammuxSink, RammuxStream) {
         (self.sink, self.stream)
+    }
+
+    /// Gives up on the stream in both directions: [resets](RammuxSink::reset) the sink,
+    /// and drops the [`RammuxStream`].
+    pub fn reset(self) {
+        let Self { sink, stream } = self;
+        sink.reset();
+        drop(stream);
     }
 }
 
@@ -94,6 +103,9 @@ impl Sink<Bytes> for RammuxDuplex {
 /// taken yet is discarded, and the peer's [`RammuxStream`] yields [`StreamError::PeerAborted`]
 /// after the data that it got.
 ///
+/// [`reset`](Self::reset) gives up on the stream. Use it when the data is not worth delivering any more,
+/// for example when the peer's reader stalls and its unread data holds buffers that other streams need.
+///
 /// # Errors
 ///
 /// Once writing ended for a reason other than `close()`, every call returns the reason, including
@@ -123,6 +135,20 @@ impl RammuxSink {
     /// Returns the ID of this stream.
     pub fn id(&self) -> StreamId {
         self.id
+    }
+
+    /// Resets the stream: the data that the connection has not taken yet is discarded, and so is the data
+    /// that the peer's [`RammuxStream`] has not yielded yet, once the peer learns about the reset.
+    /// The peer's [`RammuxStream`] then yields [`StreamError::PeerReset`], and the peer's buffers
+    /// that the stream used are free for other streams.
+    ///
+    /// A sink whose `close()` still waits for its data to go out is reset too. The reset does nothing once
+    /// the connection has taken the end of the stream (`close()` completed, or completes when it is polled
+    /// next), or if writing ended for another reason: the stream keeps the end it got.
+    pub fn reset(self) {
+        if let Some(mut state) = self.shared.try_lock() {
+            state.outbound.reset_writing(&self.shared.data_task);
+        }
     }
 }
 
@@ -172,6 +198,8 @@ impl Drop for RammuxSink {
 /// followed by [`None`]. If the stream ended in another way, the data that arrived is followed by one error
 /// that names the reason, and then by [`None`]:
 /// - [`StreamError::PeerAborted`] when the peer dropped its sink without closing it,
+/// - [`StreamError::PeerReset`] when the peer reset the stream. This one does not wait for the data:
+///   what was not yielded before the reset arrived is discarded,
 /// - [`StreamError::ConnectionFailed`], [`StreamError::ConnectionDowngraded`] or
 ///   [`StreamError::ConnectionDropped`] when the connection ended before the peer closed its sink.
 ///   A stream that the peer closed before that still ends with [`None`].

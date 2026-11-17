@@ -39,6 +39,7 @@ pub fn fins(fin_write: bool, fin_read: bool) -> ControlFlags {
         fin_read,
         fin_write,
         abort: false,
+        reset: false,
     }
 }
 
