@@ -22,8 +22,8 @@ use crate::{
 pub struct Downgraded<IO> {
     /// Recovered from the [`Active`](super::active::Active) connection.
     ///
-    /// Boxed: the codec holds a decoder buffer and the frame waiting to be written,
-    /// which would make every future that holds a [`Downgraded`] large.
+    /// Boxed: the codec holds a decoder buffer and a pending frame, which would make every future
+    /// that holds a [`Downgraded`] large.
     codec: Option<Box<RammuxCodec<IO>>>,
     /// Whether we've received the `TERM` frame.
     term_received: bool,

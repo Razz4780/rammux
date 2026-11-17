@@ -747,8 +747,9 @@ async fn one_way_bulk_needs_few_control_writes() {
     let mb = (rig.bytes(0) - bytes) as f64 / 1e6;
     let per_mb = (rig.backward.short_writes() - writes) as f64 / mb;
     // Everything the receiver writes is control: `WINDOW`, `PING` and `PONG`. A `WINDOW` goes for every `T_c`
-    // of 16 KiB, about 61 per MB. The `PING`s, at most one every eighth of a round trip, and the `PONG`s add
-    // few writes of their own: control frames that are ready together leave in one write.
+    // of 16 KiB, about 61 per MB. The `PING`s and the `PONG`s add few writes of their own: the schedule sends
+    // a `PING` at most every eighth of a round trip, on a `WINDOW` when one goes, and a `PONG` rides on the
+    // next frame.
     // Measured: 65.6 per MB.
     assert!(per_mb < 72.0, "{per_mb} control writes per MB");
 }

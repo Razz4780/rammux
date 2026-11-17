@@ -1,5 +1,5 @@
 use std::{
-    io::{self, IoSlice},
+    io,
     num::NonZeroU16,
     pin::Pin,
     task::{Context, Poll},
@@ -19,7 +19,7 @@ use crate::{
         clock::Clock,
         codec::{
             decoder::{DecodedFrame, DecoderState, InboundFrame},
-            encoder::{ControlBuffer, EncoderItem, OutFrame},
+            encoder::{EncoderItem, OutFrame},
         },
         header::{Flags, Header},
     },
@@ -27,9 +27,6 @@ use crate::{
 
 pub mod decoder;
 pub mod encoder;
-
-/// Most bytes of frames without payload that the codec holds before it writes them.
-pub const CONTROL_BATCH: usize = 1024;
 
 /// rammux frame codec applied to an IO transport.
 ///
@@ -44,34 +41,22 @@ pub const CONTROL_BATCH: usize = 1024;
 ///
 /// # Encoder
 ///
-/// Frames without payload are encoded into a control buffer of at most [`CONTROL_BATCH`] bytes.
-/// A frame with a payload waits on its own, and is written in one `poll_write_vectored`
-/// together with the control buffer before it (the control frames, the header, the payload).
-/// The control buffer is written alone when it has no room for another frame, on a flush or a close,
-/// and by `poll_ready` after a flush or a close whose writes did not finish.
-/// Either way the bytes reach the transport in the order the frames were sent.
+/// This codec holds at most one frame. It is written to the IO transport completely
+/// (as one `poll_write_vectored` of the header and the payload) before the next frame can be sent.
+/// There is no queue, so the caller decides what goes next.
 ///
-/// The codec is ready for the next frame when no frame with a payload waits and the control buffer has room.
-/// After a flush or a close whose writes did not finish, it is ready only when everything is written.
-/// There is no queue beyond that, so the caller decides what goes next.
-///
-/// The header of a frame with a `PING` is encoded again before each write, until the transport
-/// accepts a byte of the frame, so that the `PING` timestamp is the time of the first accepted byte.
+/// The header is encoded when the transport is first asked to write the frame,
+/// and encoded again if the transport accepts nothing, so that the `PING` timestamp
+/// is the time of the first accepted byte.
 ///
 /// A transport without native vectored writes (`is_write_vectored()` is false) gets tokio's default
-/// `poll_write_vectored`, which writes the first non-empty slice only: the control frames, the header,
-/// and the payload each take a write.
+/// `poll_write_vectored`, which writes the header, and the payload with the next call: two writes per frame.
 /// Such a transport is best wrapped in a buffered writer (e.g. `tokio::io::BufWriter`), which this codec flushes
 /// after the last frame it has ready. A buffered reader is fine: what it has buffered stays in the transport
 /// returned by the downgrade.
 pub struct RammuxCodec<IO> {
     io: IO,
-    /// Frames without payload, not yet written.
-    control: ControlBuffer,
-    /// The frame with a payload that waits behind `control`.
     pending: Option<EncoderItem>,
-    /// Whether a flush or a close did not finish writing the frames.
-    flush_unfinished: bool,
     decoder: DecoderState,
     frame_limit: NonZeroU16,
     clock: Clock,
@@ -83,9 +68,7 @@ impl<IO> RammuxCodec<IO> {
     pub fn new(io: IO, frame_limit: NonZeroU16, inbound_frame_timeout: Duration) -> Self {
         Self {
             io,
-            control: ControlBuffer::new(),
             pending: None,
-            flush_unfinished: false,
             decoder: Default::default(),
             frame_limit,
             clock: Clock::new(),
@@ -101,12 +84,7 @@ impl<IO> RammuxCodec<IO> {
         self.clock
     }
 
-    /// Returns the transport. Everything sent must have been written by a flush or a close.
     pub fn into_inner(self) -> IO {
-        debug_assert!(
-            self.control.is_empty() && self.pending.is_none(),
-            "frames left unwritten"
-        );
         self.io
     }
 }
@@ -242,74 +220,31 @@ impl<IO> RammuxCodec<IO>
 where
     IO: AsyncWrite + Unpin,
 {
-    /// Writes the control buffer and the waiting frame (if any), until the next frame can be sent
-    /// (`all` is false) or everything is written (`all` is true).
-    fn poll_write(&mut self, cx: &mut Context<'_>, all: bool) -> Poll<Result<(), ErrorKind>> {
-        loop {
-            if let Some(item) = &self.pending
-                && item.remaining() == 0
-            {
+    /// Writes the pending item (if any) to the transport completely.
+    fn poll_write_pending(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ErrorKind>> {
+        while let Some(item) = &mut self.pending {
+            if item.remaining() == 0 {
                 self.pending = None;
-            }
-            let done = self.pending.is_none()
-                && if all {
-                    self.control.is_empty()
-                } else {
-                    self.control.has_room()
-                };
-            if done {
-                if all {
-                    self.flush_unfinished = false;
-                }
-                break Poll::Ready(Ok(()));
+                break;
             }
 
-            // Until the transport accepts a byte of a frame, its timestamp is whatever the time is now.
-            let pending_needs_stamp = self
-                .pending
-                .as_ref()
-                .is_some_and(|item| item.has_ping() && !item.is_started());
-            if pending_needs_stamp || self.control.needs_stamp() {
-                let now = self.clock.micros(Instant::now());
-                self.control.stamp(now);
-                if let Some(item) = self.pending.as_mut().filter(|_| pending_needs_stamp) {
-                    item.stamp(now);
-                }
+            // Until the transport accepts a byte of the frame, the timestamp is whatever the time is now.
+            if item.has_ping() && !item.is_started() {
+                item.stamp(self.clock.micros(Instant::now()));
             }
-
-            // The control frames, the header and the payload go to the transport together.
-            // A transport without vectored writes gets them one after another, which is the best it can do.
-            let control = self.control.unwritten();
-            let control_len = control.len();
-            let mut slices = [IoSlice::new(&[]); 3];
-            let mut n_slices = 0;
-            if control_len > 0 {
-                slices[0] = IoSlice::new(control);
-                n_slices = 1;
-            }
-            if let Some(item) = &self.pending {
-                let (item_slices, n_item) = item.slices();
-                slices[n_slices..n_slices + n_item].copy_from_slice(&item_slices[..n_item]);
-                n_slices += n_item;
-            }
+            // The header and the payload go to the transport together. A transport without
+            // vectored writes gets them one after another, which is the best it can do.
+            let (slices, n_slices) = item.slices();
             let written = std::task::ready!(
                 Pin::new(&mut self.io).poll_write_vectored(cx, &slices[..n_slices])
             )?;
             if written == 0 {
                 return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
             }
-
-            // The control frames go first, so what the transport accepted of them
-            // does not start the waiting frame.
-            match &mut self.pending {
-                Some(item) => {
-                    let to_control = written.min(control_len);
-                    self.control.advance(to_control);
-                    item.advance(written - to_control);
-                },
-                None => self.control.advance(written),
-            }
+            item.advance(written);
         }
+
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -320,12 +255,7 @@ where
     type Error = ErrorKind;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let this = self.get_mut();
-        // A flush that did not finish means the transport takes no more. Until it does, the next frames
-        // wait with the caller rather than in the control buffer, where they would go stale: the caller
-        // replaces an owed `PONG` with a newer one, and a window update grows with what is read meanwhile.
-        let all = this.flush_unfinished;
-        this.poll_write(cx, all)
+        self.get_mut().poll_write_pending(cx)
     }
 
     fn start_send(self: Pin<&mut Self>, frame: OutFrame) -> Result<(), Self::Error> {
@@ -334,19 +264,13 @@ where
             panic!("frame encoder is busy");
         }
         assert!(!frame.is_empty(), "empty frame");
-        let (header, payload) = frame.into_parts();
-        if payload.is_empty() {
-            this.control.push(header);
-        } else {
-            this.pending = Some(EncoderItem::new(header, payload));
-        }
+        this.pending = Some(EncoderItem::new(frame));
         Ok(())
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
-        this.flush_unfinished = true;
-        std::task::ready!(this.poll_write(cx, true))?;
+        std::task::ready!(this.poll_write_pending(cx))?;
         Pin::new(&mut this.io)
             .poll_flush(cx)
             .map_err(ErrorKind::from)
@@ -354,8 +278,7 @@ where
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
-        this.flush_unfinished = true;
-        std::task::ready!(this.poll_write(cx, true))?;
+        std::task::ready!(this.poll_write_pending(cx))?;
         Pin::new(&mut this.io)
             .poll_shutdown(cx)
             .map_err(ErrorKind::from)
@@ -369,7 +292,7 @@ mod tests {
         num::{NonZeroU16, NonZeroU32},
         pin::Pin,
         sync::{Arc, Mutex},
-        task::{Context, Poll, Waker},
+        task::{Context, Poll},
         time::Duration,
     };
 
@@ -386,7 +309,7 @@ mod tests {
         error::ErrorKind,
         wire::{
             codec::{
-                CONTROL_BATCH, RammuxCodec,
+                RammuxCodec,
                 decoder::DecodedFrame,
                 encoder::{OutFrame, OutStream},
             },
@@ -823,109 +746,6 @@ mod tests {
             .collect()
     }
 
-    #[tokio::test]
-    async fn control_frames_share_one_write() {
-        let (io, writes, _) = MockIo::new(true);
-        let mut codec = codec(io);
-        for id in 1..=5 {
-            codec.feed(window(id)).await.unwrap();
-        }
-        codec.flush().await.unwrap();
-
-        let writes = writes.lock().unwrap().clone();
-        assert_eq!(writes.len(), 1);
-        let sent = (1..=5).map(window).collect::<Vec<_>>();
-        assert_all_same(&sent, &decode_all(&writes[0]).await);
-    }
-
-    #[tokio::test]
-    async fn control_frames_ride_with_the_next_payload() {
-        let sent = || {
-            vec![
-                window(1),
-                window(2),
-                stream_frame(3, ControlFlags::default(), 0, b"payload"),
-            ]
-        };
-        let (io, writes, _) = MockIo::new(true);
-        let mut codec = codec(io);
-        for frame in sent() {
-            codec.feed(frame).await.unwrap();
-        }
-        codec.flush().await.unwrap();
-
-        let writes = writes.lock().unwrap().clone();
-        assert_eq!(writes.len(), 1);
-        assert_all_same(&sent(), &decode_all(&writes[0]).await);
-    }
-
-    #[tokio::test]
-    async fn a_full_control_buffer_is_written_without_a_flush() {
-        let (io, writes, _) = MockIo::new(true);
-        let mut codec = codec(io);
-        for id in 1..=300 {
-            codec.feed(window(id)).await.unwrap();
-        }
-        assert!(
-            !writes.lock().unwrap().is_empty(),
-            "the buffer was written before the flush"
-        );
-        codec.flush().await.unwrap();
-
-        let writes = writes.lock().unwrap().clone();
-        for write in &writes {
-            assert!(write.len() <= CONTROL_BATCH, "a write of {}", write.len());
-        }
-        let sent = (1..=300).map(window).collect::<Vec<_>>();
-        assert_all_same(&sent, &decode_all(&writes.concat()).await);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_buffered_ping_carries_the_time_of_its_write() {
-        let (io, writes, refuse) = MockIo::new(true);
-        let mut codec = codec(io);
-        let clock = codec.clock();
-        tokio::time::advance(Duration::from_millis(1)).await;
-        let t0 = Instant::now();
-
-        codec.feed(ping()).await.unwrap();
-        *refuse.lock().unwrap() = true;
-        assert!(codec.flush().now_or_never().is_none());
-        tokio::time::advance(Duration::from_millis(50)).await;
-        codec.flush().await.unwrap();
-
-        let bytes = writes.lock().unwrap().concat();
-        let frames = decode_all(&bytes).await;
-        assert_eq!(
-            pings_of(&frames),
-            [clock.micros(t0 + Duration::from_millis(50))]
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn two_buffered_pings_are_both_stamped() {
-        let (io, writes, refuse) = MockIo::new(true);
-        let mut codec = codec(io);
-        let clock = codec.clock();
-        tokio::time::advance(Duration::from_millis(1)).await;
-        let t0 = Instant::now();
-
-        let sent = || vec![ping(), window(1), ping()];
-        for frame in sent() {
-            codec.feed(frame).await.unwrap();
-        }
-        *refuse.lock().unwrap() = true;
-        assert!(codec.flush().now_or_never().is_none());
-        tokio::time::advance(Duration::from_millis(50)).await;
-        codec.flush().await.unwrap();
-
-        let bytes = writes.lock().unwrap().concat();
-        let frames = decode_all(&bytes).await;
-        assert_all_same(&sent(), &frames);
-        let t_write = clock.micros(t0 + Duration::from_millis(50));
-        assert_eq!(pings_of(&frames), [t_write, t_write]);
-    }
-
     #[tokio::test(start_paused = true)]
     async fn a_ping_carries_the_time_of_the_write_that_takes_its_first_byte() {
         let (mut io, writes, _) = MockIo::new(true);
@@ -946,15 +766,17 @@ mod tests {
                 },
             ]
         };
-        for frame in sent() {
-            codec.feed(frame).await.unwrap();
-        }
+        let mut send = Box::pin(async {
+            for frame in sent() {
+                codec.feed(frame).await.unwrap();
+            }
+            codec.flush().await.unwrap();
+        });
         // 4 bytes per write, 100 us apart.
         let mut writes_at = Vec::new();
-        let mut flush = codec.flush();
         loop {
             writes_at.push(Instant::now());
-            if (&mut flush).now_or_never().is_some() {
+            if send.as_mut().now_or_never().is_some() {
                 break;
             }
             tokio::time::advance(Duration::from_micros(100)).await;
@@ -963,33 +785,13 @@ mod tests {
         let bytes = writes.lock().unwrap().concat();
         let frames = decode_all(&bytes).await;
         assert_all_same(&sent(), &frames);
-        // The third write takes the first byte of the `PING`, the fourth the rest of it and the first bytes
-        // of the `DATA`.
+        // Each frame waits for the one before. The `PING` is first tried after the second write, which ends
+        // the `WINDOW`, and the third write takes its first bytes. The `DATA` is first tried after the fourth,
+        // which ends the `PING`, and the fifth takes its first bytes.
         assert_eq!(
             pings_of(&frames),
-            [clock.micros(writes_at[2]), clock.micros(writes_at[3])]
+            [clock.micros(writes_at[2]), clock.micros(writes_at[4])]
         );
-    }
-
-    #[tokio::test]
-    async fn after_an_unfinished_flush_the_next_frame_waits() {
-        let (io, writes, refuse) = MockIo::new(true);
-        let mut codec = codec(io);
-        codec.feed(window(1)).await.unwrap();
-        *refuse.lock().unwrap() = true;
-        assert!(codec.flush().now_or_never().is_none());
-
-        // The control buffer has room, but the transport takes no more.
-        let mut cx = Context::from_waker(Waker::noop());
-        *refuse.lock().unwrap() = true;
-        assert!(codec.poll_ready_unpin(&mut cx).is_pending());
-        assert!(writes.lock().unwrap().is_empty());
-        // Once everything is written, the next frame is taken.
-        assert!(matches!(
-            codec.poll_ready_unpin(&mut cx),
-            Poll::Ready(Ok(()))
-        ));
-        assert_eq!(writes.lock().unwrap().len(), 1);
     }
 
     #[rstest]

@@ -157,8 +157,8 @@ TCP makes them, for every multiplexer.
   stream that writes more.
 - **More small packets when data flows one way.** The receiver returns credit for every `T_c` that its reader
   consumes. Once it has measured the round trip, each side adds a `PING` to its data or credit at most every
-  eighth of it, and the other side answers with a `PONG`. Control frames that are ready together leave in one
-  packet. When the other direction has data, they ride along. When it has none, they are packets of their own.
+  eighth of it, and the other side answers with a `PONG`. When the other direction has data, they ride along.
+  When it has none, they are packets of their own.
 - **The queue is not limited.** Like the other multiplexers, a connection with enough data fills what it is
   given, here `streams * B + P`, and an interactive stream waits behind the bulk that is already on the path.
   The pool is the bound. `TCP_NOTSENT_LOWAT` can be used as a mitigation on platforms that support it.
