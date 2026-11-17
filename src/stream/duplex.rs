@@ -7,7 +7,11 @@ use std::{
 use bytes::Bytes;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 
-use crate::{StreamId, error::StreamError, stream::StreamRef};
+use crate::{
+    StreamId,
+    error::StreamError,
+    stream::{ReaderStall, StreamRef},
+};
 
 /// Bidirectional virtual data stream created within a rammux connection.
 ///
@@ -16,6 +20,7 @@ use crate::{StreamId, error::StreamError, stream::StreamRef};
 ///
 /// Dropping it drops both halves: the peer reads [`StreamError::PeerAborted`] after the data it got,
 /// unless the sink was closed first, and the peer's writes fail with [`StreamError::PeerStoppedReading`].
+/// [`reset`](Self::reset) gives up on the stream without making the peer read that data first.
 pub struct RammuxDuplex {
     sink: RammuxSink,
     stream: RammuxStream,
@@ -43,6 +48,19 @@ impl RammuxDuplex {
     /// Splits this stream into independent [`Sink`] and [`Stream`] handles.
     pub fn into_split(self) -> (RammuxSink, RammuxStream) {
         (self.sink, self.stream)
+    }
+
+    /// Tells how the peer's reader is getting on, see [`RammuxSink::reader_stall`].
+    pub fn reader_stall(&self) -> ReaderStall {
+        self.sink.reader_stall()
+    }
+
+    /// Gives up on the stream in both directions: [resets](RammuxSink::reset) the sink,
+    /// and drops the [`RammuxStream`].
+    pub fn reset(self) {
+        let Self { sink, stream } = self;
+        sink.reset();
+        drop(stream);
     }
 }
 
@@ -94,6 +112,9 @@ impl Sink<Bytes> for RammuxDuplex {
 /// taken yet is discarded, and the peer's [`RammuxStream`] yields [`StreamError::PeerAborted`]
 /// after the data that it got.
 ///
+/// [`reset`](Self::reset) gives up on the stream. Use it when the data is not worth delivering any more,
+/// for example when the peer's reader stalls and its unread data holds buffers that other streams need.
+///
 /// # Errors
 ///
 /// Once writing ended for a reason other than `close()`, every call returns the reason, including
@@ -123,6 +144,53 @@ impl RammuxSink {
     /// Returns the ID of this stream.
     pub fn id(&self) -> StreamId {
         self.id
+    }
+
+    /// Tells how the peer's reader is getting on: how many bytes of the stream are in flight, and when
+    /// the peer last released some. With it, the application can decide that the reader is stalled,
+    /// and [`reset`](Self::reset) the stream.
+    ///
+    /// These are the two facts that this side has, and they do not make a verdict:
+    /// - [`ReaderStall::unacked`] counts the bytes that are still on their way, too. The peer releases
+    ///   bytes in steps of up to 32 KiB (at most half of its receive window for a stream), so a count
+    ///   below that can stay for good while the reader keeps up.
+    /// - On a slow connection, or on one that many streams share, a stream whose reader keeps up also
+    ///   goes for long between two window updates. A limit has to allow for the connection.
+    ///
+    /// Once the peer stopped reading, nothing is in flight. Once the connection is gone, both facts stay
+    /// as they were. The time is a [`tokio::time::Instant`].
+    ///
+    /// ```
+    /// # use std::time::Duration;
+    /// # use rammux::stream::RammuxSink;
+    /// # fn give_up(sink: RammuxSink) {
+    /// let stall = sink.reader_stall();
+    /// let waited = stall.last_window_update.map(|at| at.elapsed());
+    /// if stall.unacked >= 1024 * 1024 && waited.is_some_and(|waited| waited > Duration::from_secs(30)) {
+    ///     sink.reset();
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if another user of the stream panicked while holding its lock.
+    pub fn reader_stall(&self) -> ReaderStall {
+        self.shared.lock().outbound.reader_stall()
+    }
+
+    /// Resets the stream: the data that the connection has not taken yet is discarded, and so is the data
+    /// that the peer's [`RammuxStream`] has not yielded yet, once the peer learns about the reset.
+    /// The peer's [`RammuxStream`] then yields [`StreamError::PeerReset`], and the peer's buffers
+    /// that the stream used are free for other streams.
+    ///
+    /// A sink whose `close()` still waits for its data to go out is reset too. The reset does nothing once
+    /// the connection has taken the end of the stream (`close()` completed, or completes when it is polled
+    /// next), or if writing ended for another reason: the stream keeps the end it got.
+    pub fn reset(self) {
+        if let Some(mut state) = self.shared.try_lock() {
+            state.outbound.reset_writing(&self.shared.data_task);
+        }
     }
 }
 
@@ -172,6 +240,8 @@ impl Drop for RammuxSink {
 /// followed by [`None`]. If the stream ended in another way, the data that arrived is followed by one error
 /// that names the reason, and then by [`None`]:
 /// - [`StreamError::PeerAborted`] when the peer dropped its sink without closing it,
+/// - [`StreamError::PeerReset`] when the peer reset the stream. This one does not wait for the data:
+///   what was not yielded before the reset arrived is discarded,
 /// - [`StreamError::ConnectionFailed`], [`StreamError::ConnectionDowngraded`] or
 ///   [`StreamError::ConnectionDropped`] when the connection ended before the peer closed its sink.
 ///   A stream that the peer closed before that still ends with [`None`].

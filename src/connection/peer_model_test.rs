@@ -130,10 +130,34 @@ struct Peer {
     last_ping: Option<u32>,
     /// Bytes of `DATA` the connection sent.
     received: u64,
-    /// Streams whose sinks the application dropped before closing them, and whose `FIN_WRITE` must carry `ABORT`.
-    dropped_sinks: BTreeSet<u16>,
+    /// Streams whose sinks the application dropped before closing them, or reset, and whose `FIN_WRITE`
+    /// must say so.
+    ended_sinks: BTreeMap<u16, SinkEnd>,
+    /// Streams that the peer reset, and whose `FIN_READ` the connection owes at once.
+    awaiting_fin_read: BTreeSet<u16>,
     /// How many `FIN_WRITE`s with `ABORT` the connection sent.
     aborts: u64,
+    /// How many `FIN_WRITE`s with `RESET` the connection sent.
+    resets: u64,
+}
+
+/// How the application ended a sink without closing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SinkEnd {
+    /// `FIN_WRITE` must carry `ABORT`.
+    Dropped,
+    /// `FIN_WRITE` must carry `RESET`.
+    Reset,
+}
+
+/// Sets `FIN_WRITE` in the flags, in one of its three kinds.
+fn end_writing(flags: &mut ControlFlags, rng: &mut Rng) {
+    flags.fin_write = true;
+    match rng.below(3) {
+        0 => {},
+        1 => flags.abort = true,
+        _ => flags.reset = true,
+    }
 }
 
 impl Peer {
@@ -143,8 +167,10 @@ impl Peer {
             streams: BTreeMap::new(),
             last_ping: None,
             received: 0,
-            dropped_sinks: BTreeSet::new(),
+            ended_sinks: BTreeMap::new(),
+            awaiting_fin_read: BTreeSet::new(),
             aborts: 0,
+            resets: 0,
         }
     }
 
@@ -214,17 +240,25 @@ impl Peer {
         if part.flags.fin_write {
             assert!(!stream.conn_fin_write, "duplicate FIN_WRITE");
             stream.conn_fin_write = true;
+            let end = self.ended_sinks.remove(&id);
             assert_eq!(
                 part.flags.abort,
-                self.dropped_sinks.remove(&id),
+                end == Some(SinkEnd::Dropped),
                 "ABORT if and only if the sink was dropped before it was closed"
             );
+            assert_eq!(
+                part.flags.reset,
+                end == Some(SinkEnd::Reset),
+                "RESET if and only if the sink was reset"
+            );
             self.aborts += u64::from(part.flags.abort);
+            self.resets += u64::from(part.flags.reset);
         }
         if part.flags.fin_read {
             assert!(!stream.conn_fin_read, "duplicate FIN_READ");
             stream.conn_fin_read = true;
             stream.peer_unacked = 0;
+            self.awaiting_fin_read.remove(&id);
         }
         if stream.is_dead() {
             self.streams.remove(&id);
@@ -257,12 +291,16 @@ impl Peer {
                 };
                 stream.peer_unacked = len;
                 stream.peer_fin_write = rng.below(8) == 0;
-                let flags = ControlFlags {
+                let mut flags = ControlFlags {
                     syn: true,
-                    fin_write: stream.peer_fin_write,
-                    fin_read: false,
-                    abort: stream.peer_fin_write && rng.coin(),
+                    ..Default::default()
                 };
+                if stream.peer_fin_write {
+                    end_writing(&mut flags, rng);
+                }
+                if flags.reset {
+                    self.awaiting_fin_read.insert(id);
+                }
                 self.streams.insert(id, stream);
                 Some(stream_frame(id, flags, 0, len))
             },
@@ -305,8 +343,10 @@ impl Peer {
                 let mut flags = ControlFlags::default();
                 if rng.coin() && !stream.peer_fin_write {
                     stream.peer_fin_write = true;
-                    flags.fin_write = true;
-                    flags.abort = rng.coin();
+                    end_writing(&mut flags, rng);
+                    if flags.reset && !stream.conn_fin_read {
+                        self.awaiting_fin_read.insert(id);
+                    }
                 }
                 if rng.coin() && !stream.peer_fin_read {
                     stream.peer_fin_read = true;
@@ -345,11 +385,12 @@ impl Peer {
 fn wild_frame(rng: &mut Rng) -> Vec<u8> {
     let mut flags = ControlFlags {
         syn: rng.below(4) == 0,
-        fin_write: rng.below(6) == 0,
         fin_read: rng.below(6) == 0,
-        abort: false,
+        ..Default::default()
     };
-    flags.abort = flags.fin_write && rng.coin();
+    if rng.below(6) == 0 {
+        end_writing(&mut flags, rng);
+    }
     let credit = if rng.below(3) == 0 { rng.up_to(600) } else { 0 };
     // Sometimes above the frame limit.
     let len = if rng.coin() { rng.up_to(70) } else { 0 };
@@ -389,6 +430,8 @@ struct Session {
     read: u64,
     /// How many streams the application read to [`StreamError::PeerAborted`].
     peer_aborts: u64,
+    /// How many streams the application read to [`StreamError::PeerReset`].
+    peer_resets: u64,
 }
 
 impl Session {
@@ -401,6 +444,7 @@ impl Session {
             app: Vec::new(),
             read: 0,
             peer_aborts: 0,
+            peer_resets: 0,
         }
     }
 
@@ -441,7 +485,7 @@ impl Session {
     /// The application does something with the connection or with one of its streams.
     async fn app_step(&mut self) {
         let at = usize::try_from(self.rng.below(self.app.len().max(1) as u64)).unwrap();
-        match self.rng.below(17) {
+        match self.rng.below(18) {
             0 | 1 => {
                 if let Some(stream) = self.rig.conn.try_start_outbound().unwrap() {
                     let (sink, stream) = stream.into_split();
@@ -477,8 +521,11 @@ impl Session {
                             },
                             Some(Some(Err(error))) => {
                                 // The connection is alive, so only the peer can end the stream so.
-                                assert_eq!(error, StreamError::PeerAborted);
-                                self.peer_aborts += 1;
+                                match error {
+                                    StreamError::PeerAborted => self.peer_aborts += 1,
+                                    StreamError::PeerReset => self.peer_resets += 1,
+                                    other => panic!("{other}"),
+                                }
                             },
                             Some(None) => {
                                 *stream_slot = None;
@@ -514,8 +561,26 @@ impl Session {
                     let flushed = sink.flush().now_or_never();
                     if flushed != Some(Err(StreamError::PeerStoppedReading)) {
                         let id = u16::from_be_bytes(sink.id().to_be_bytes());
-                        self.peer.dropped_sinks.insert(id);
+                        self.peer.ended_sinks.insert(id, SinkEnd::Dropped);
                     }
+                }
+            },
+
+            15 => {
+                // Reset the stream, maybe in the middle of a close.
+                if let Some((sink_slot, _)) = self.app.get_mut(at)
+                    && let Some(mut sink) = sink_slot.take()
+                {
+                    // Unless the peer stopped reading, `FIN_WRITE` did not go out yet: the connection resets.
+                    let flushed = sink.flush().now_or_never();
+                    if flushed != Some(Err(StreamError::PeerStoppedReading)) {
+                        let id = u16::from_be_bytes(sink.id().to_be_bytes());
+                        self.peer.ended_sinks.insert(id, SinkEnd::Reset);
+                    }
+                    if self.rng.coin() {
+                        let _ = sink.close().now_or_never();
+                    }
+                    sink.reset();
                 }
             },
 
@@ -539,6 +604,25 @@ impl Session {
         assert!(stats.outbound_streams <= config.max_outbound_streams);
     }
 
+    /// Checks that the writers are told the bytes in flight that the peer counts.
+    /// Returns how many writers have a window or more in flight.
+    fn check_readers(&self) -> u64 {
+        let window = u64::from(self.peer.config.remote_recv_window.get());
+        let mut full = 0;
+        for sink in self.app.iter().filter_map(|(sink, _)| sink.as_ref()) {
+            let stall = sink.reader_stall();
+            // A stream that the peer stopped reading holds nothing, and its ID may be in use again.
+            if stall.unacked == 0 {
+                continue;
+            }
+            let id = u16::from_be_bytes(sink.id().to_be_bytes());
+            let unacked = self.peer.streams.get(&id).map(|stream| stream.conn_unacked);
+            assert_eq!(Some(stall.unacked), unacked, "stream {id}");
+            full += u64::from(stall.unacked >= window);
+        }
+        full
+    }
+
     /// Drops the connection, if it is still there, and checks that its streams end:
     /// reading reaches the end, and writing fails. A stream that the peer did not end ends with
     /// the `reason` that the connection ended for.
@@ -551,7 +635,8 @@ impl Session {
                 {
                     if let Err(error) = item {
                         assert!(
-                            [StreamError::PeerAborted, reason].contains(&error),
+                            [StreamError::PeerAborted, StreamError::PeerReset, reason]
+                                .contains(&error),
                             "{error}"
                         );
                     }
@@ -575,6 +660,8 @@ impl Session {
 #[tokio::test(start_paused = true)]
 async fn a_peer_that_follows_the_protocol_is_never_rejected() {
     let (mut read, mut received, mut aborts, mut peer_aborts) = (0, 0, 0, 0);
+    let (mut resets, mut peer_resets) = (0, 0);
+    let mut full_windows = 0;
     for seed in 0..SEEDS {
         let mut session = Session::new(seed);
         for step in 0..STEPS {
@@ -590,10 +677,15 @@ async fn a_peer_that_follows_the_protocol_is_never_rejected() {
             }
             assert!(!session.read_frames(true), "seed {seed}: unexpected TERM");
             assert!(
-                session.peer.dropped_sinks.is_empty(),
-                "seed {seed}, step {step}: a dropped sink did not abort"
+                session.peer.ended_sinks.is_empty(),
+                "seed {seed}, step {step}: a sink that was dropped or reset did not end its stream"
+            );
+            assert!(
+                session.peer.awaiting_fin_read.is_empty(),
+                "seed {seed}, step {step}: a reset was not answered with FIN_READ at once"
             );
             session.check_stats();
+            full_windows += session.check_readers();
         }
 
         // The session ends with a clean downgrade, whatever state the streams are in.
@@ -616,13 +708,19 @@ async fn a_peer_that_follows_the_protocol_is_never_rejected() {
         received += session.peer.received;
         aborts += session.peer.aborts;
         peer_aborts += session.peer_aborts;
+        resets += session.peer.resets;
+        peer_resets += session.peer_resets;
         session.streams_end(StreamError::ConnectionDowngraded);
     }
-    // The sessions did move data, both ways, and streams were aborted, both ways.
+    // The sessions did move data, both ways, and streams were aborted and reset, both ways.
     assert!(read > SEEDS * 256, "{read}");
     assert!(received > SEEDS * 512, "{received}");
     assert!(aborts > SEEDS, "{aborts}");
     assert!(peer_aborts > SEEDS, "{peer_aborts}");
+    assert!(resets > SEEDS, "{resets}");
+    assert!(peer_resets > SEEDS, "{peer_resets}");
+    // And writers had full windows to tell about.
+    assert!(full_windows > SEEDS, "{full_windows}");
 }
 
 #[tokio::test(start_paused = true)]

@@ -27,7 +27,7 @@ use tokio::{
 use crate::{
     config::{RammuxConfig, RammuxRole},
     connection::{RammuxConnection, RammuxProgress, RammuxStats},
-    stream::RammuxDuplex,
+    stream::{RammuxDuplex, ReaderStall},
 };
 
 /// One direction of the link.
@@ -200,6 +200,15 @@ async fn drive(
     }
 }
 
+/// What the writer of a stream saw of its reader, see [`Rig::bulk_watched`].
+#[derive(Default)]
+struct Watch {
+    /// The last answer of `reader_stall`.
+    last: Option<ReaderStall>,
+    /// The longest time it saw since the last window update, while a window or more was in flight.
+    longest_wait: Duration,
+}
+
 struct Rig {
     open: mpsc::UnboundedSender<Open>,
     server_open: mpsc::UnboundedSender<Open>,
@@ -281,16 +290,68 @@ impl Rig {
 
     /// Like [`Self::bulk`], with the given size of one write.
     async fn bulk_writing(&mut self, stall_at: Option<Instant>, write: usize) {
+        self.bulk_until(stall_at, write, None).await;
+    }
+
+    /// Like [`Self::bulk_writing`], and the client resets the stream at `reset_at`, if given.
+    async fn bulk_until(
+        &mut self,
+        stall_at: Option<Instant>,
+        write: usize,
+        reset_at: Option<Instant>,
+    ) {
         let (tx, rx) = oneshot::channel();
         self.open.send(tx).unwrap();
         let stream = rx.await.unwrap();
         let (mut sink, _stream) = stream.into_split();
         tokio::spawn(async move {
             let chunk = Bytes::from(vec![5_u8; write]);
-            while sink.send(chunk.clone()).await.is_ok() {}
+            let writing = async { while sink.send(chunk.clone()).await.is_ok() {} };
+            match reset_at {
+                Some(at) => {
+                    let _ = tokio::time::timeout_at(at, writing).await;
+                    sink.reset();
+                },
+                None => writing.await,
+            }
             drop(_stream);
         });
+        self.read_bulk(stall_at).await;
+    }
 
+    /// Starts a bulk upload like [`Self::bulk`], whose writer asks about its reader every 10 ms.
+    async fn bulk_watched(&mut self, stall_at: Option<Instant>) -> Arc<Mutex<Watch>> {
+        let (tx, rx) = oneshot::channel();
+        self.open.send(tx).unwrap();
+        let stream = rx.await.unwrap();
+        let (mut sink, _stream) = stream.into_split();
+        let watch = Arc::new(Mutex::new(Watch::default()));
+        let seen = watch.clone();
+        tokio::spawn(async move {
+            let chunk = Bytes::from(vec![5_u8; 64 * 1024]);
+            loop {
+                let sent =
+                    tokio::time::timeout(Duration::from_millis(10), sink.send(chunk.clone())).await;
+                if matches!(sent, Ok(Err(..))) {
+                    break;
+                }
+                let stall = sink.reader_stall();
+                let mut seen = seen.lock().unwrap();
+                seen.last = Some(stall);
+                if let Some(updated) = stall.last_window_update
+                    && stall.unacked >= WINDOW
+                {
+                    seen.longest_wait = seen.longest_wait.max(updated.elapsed());
+                }
+            }
+            drop(_stream);
+        });
+        self.read_bulk(stall_at).await;
+        watch
+    }
+
+    /// The server reads the stream that the client started last, until `stall_at` (never, if [`None`]).
+    async fn read_bulk(&mut self, stall_at: Option<Instant>) {
         let server_stream = self.server_streams.recv().await.unwrap();
         let counter = Arc::new(AtomicU64::new(0));
         self.read.push(counter.clone());
@@ -348,6 +409,9 @@ impl Rig {
 
 const MBIT: f64 = 20.0;
 const RTT: Duration = Duration::from_millis(50);
+
+/// The base window of the streams.
+const WINDOW: u64 = 32 * 1024;
 
 fn config() -> RammuxConfig {
     let mut config = RammuxConfig::new();
@@ -411,6 +475,74 @@ async fn a_stalled_reader_does_not_hold_up_the_others() {
     tokio::time::sleep(Duration::from_secs(8)).await;
     let rate = rig.rate(1, Duration::from_secs(10)).await;
     assert!(rate > 0.85 * MBIT, "{rate} Mbit/s");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reset_returns_what_a_stalled_reader_holds() {
+    let mut rig = Rig::new(MBIT, RTT, config());
+    let start = Instant::now();
+    rig.bulk_until(
+        Some(start + Duration::from_millis(150)),
+        64 * 1024,
+        Some(start + Duration::from_secs(5)),
+    )
+    .await;
+
+    tokio::time::sleep_until(start + Duration::from_millis(4900)).await;
+    let stalled = rig.stats();
+    assert!(stalled.pool_tx_used > 0, "{stalled:?}");
+
+    // The reader still does not read. The reset takes a round trip, and a little for the queued data.
+    tokio::time::sleep_until(start + Duration::from_secs(5) + 4 * RTT).await;
+    let reset = rig.stats();
+    assert_eq!(reset.pool_tx_used, 0, "{reset:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_writer_sees_that_its_reader_stalled() {
+    let mut rig = Rig::new(MBIT, RTT, config());
+    let stall_at = Instant::now() + Duration::from_millis(150);
+    let stalled = rig.bulk_watched(Some(stall_at)).await;
+    let healthy = rig.bulk_watched(None).await;
+    let waited = Duration::from_secs(20);
+    tokio::time::sleep_until(stall_at + waited).await;
+
+    // The stalled stream holds more than its window, and the last window update is as old as the stall.
+    let stall = stalled.lock().unwrap().last.unwrap();
+    assert!(stall.unacked > WINDOW, "{stall:?}");
+    let since_update = stall.last_window_update.unwrap().elapsed();
+    let slack = Duration::from_millis(200);
+    assert!(
+        since_update > waited - slack && since_update < waited + slack,
+        "{since_update:?}"
+    );
+
+    // The window updates of the healthy stream keep coming.
+    let healthy = healthy.lock().unwrap();
+    let since_update = healthy.last.unwrap().last_window_update.unwrap().elapsed();
+    assert!(since_update < slack, "{since_update:?}");
+    assert!(healthy.longest_wait < slack, "{:?}", healthy.longest_wait);
+}
+
+/// The caveat of `RammuxSink::reader_stall`: the time since the last window update is long on a slow
+/// connection too, with readers that keep up.
+#[tokio::test(start_paused = true)]
+async fn window_updates_are_rare_on_a_slow_link() {
+    // 8 streams share 0.5 Mbit/s: each one moves 16 KiB, a credit step, in about 2 s.
+    let mut rig = Rig::new(0.5, RTT, config());
+    let mut watches = Vec::new();
+    for _ in 0..8 {
+        watches.push(rig.bulk_watched(None).await);
+    }
+    tokio::time::sleep(Duration::from_secs(120)).await;
+
+    for (stream, watch) in watches.iter().enumerate() {
+        assert!(rig.bytes(stream) > 256 * 1024, "{}", rig.bytes(stream));
+        // Measured: 6 to 12 s, with the window full.
+        let longest = watch.lock().unwrap().longest_wait;
+        assert!(longest > Duration::from_secs(4), "{stream}: {longest:?}");
+        assert!(longest < Duration::from_secs(30), "{stream}: {longest:?}");
+    }
 }
 
 #[tokio::test(start_paused = true)]

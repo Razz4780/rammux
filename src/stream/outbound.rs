@@ -68,6 +68,8 @@ enum WriteEnd {
     Closed,
     /// The application dropped its sink without closing it. `FIN_WRITE` carries `ABORT`.
     Dropped,
+    /// The application reset the stream. `FIN_WRITE` carries `RESET`.
+    Reset,
     /// The peer stopped reading, or the connection is gone. The application gets the error.
     Failed(StreamError),
 }
@@ -76,7 +78,7 @@ impl WriteEnd {
     /// Returns what a write of the application gets.
     fn write_error(self) -> StreamError {
         match self {
-            Self::Closed | Self::Dropped => StreamError::SinkClosed,
+            Self::Closed | Self::Dropped | Self::Reset => StreamError::SinkClosed,
             Self::Failed(error) => error,
         }
     }
@@ -84,10 +86,23 @@ impl WriteEnd {
     /// Returns what a flush or a close of the application gets.
     fn flushed(self) -> Result<(), StreamError> {
         match self {
-            Self::Closed | Self::Dropped => Ok(()),
+            Self::Closed | Self::Dropped | Self::Reset => Ok(()),
             Self::Failed(error) => Err(error),
         }
     }
+}
+
+/// What the writer of a stream knows about the progress of its reader, see
+/// [`RammuxSink::reader_stall`](super::RammuxSink::reader_stall).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReaderStall {
+    /// How many bytes of the stream are in flight: sent, and not released by the peer's reader yet.
+    /// They count against the buffers of the peer, wherever they are.
+    pub unacked: u64,
+    /// When the peer last released bytes of the stream: when its last window update arrived.
+    /// [`None`] if none has arrived yet.
+    pub last_window_update: Option<Instant>,
 }
 
 /// The `FIN_WRITE` of a sending direction.
@@ -97,6 +112,8 @@ pub enum FinWrite {
     Clean,
     /// The application dropped its sink without closing it: `FIN_WRITE` with `ABORT`.
     Abort,
+    /// The application reset the stream: `FIN_WRITE` with `RESET`.
+    Reset,
 }
 
 impl OutboundTraffic {
@@ -111,6 +128,7 @@ impl OutboundTraffic {
                 frame_limit: u64::from(frame_limit.get()),
                 loan: Loan::default(),
                 rate: RateEstimate::new(Instant::now()),
+                last_window_update: None,
             },
         }
     }
@@ -206,6 +224,30 @@ impl OutboundTraffic {
         };
     }
 
+    /// The application resets the stream: the data that was not sent is dropped, and `FIN_WRITE` with `RESET`
+    /// follows. A sink that started to close is reset too, as long as its `FIN_WRITE` did not go out.
+    ///
+    /// Does nothing once `FIN_WRITE` went out, or once the direction ended for another reason.
+    /// Wakes the `data_task` of the stream, which sends `FIN_WRITE`.
+    pub fn reset_writing(&mut self, data_task: &AtomicWaker) {
+        let (OutboundState::Open { .. } | OutboundState::HalfClosed { .. }) = &self.state else {
+            return;
+        };
+        data_task.wake();
+        self.state = OutboundState::Closed {
+            fin_state: FinState::default(),
+            end: WriteEnd::Reset,
+        };
+    }
+
+    /// Returns what this side knows about the progress of the peer's reader.
+    pub fn reader_stall(&self) -> ReaderStall {
+        ReaderStall {
+            unacked: self.ledger.window.unacked(),
+            last_window_update: self.ledger.last_window_update,
+        }
+    }
+
     // The connection side.
 
     /// Polls for what this direction sends next: a chunk of data, and the `FIN_WRITE` that follows it, if any.
@@ -258,6 +300,7 @@ impl OutboundTraffic {
                 fin_state.sent = true;
                 let fin_write = match end {
                     WriteEnd::Dropped => FinWrite::Abort,
+                    WriteEnd::Reset => FinWrite::Reset,
                     WriteEnd::Closed | WriteEnd::Failed(..) => FinWrite::Clean,
                 };
                 Poll::Ready((Bytes::new(), Some(fin_write)))
@@ -287,6 +330,7 @@ impl OutboundTraffic {
             .ok_or(StreamViolation("returned more credit than was in flight"))?;
 
         let freed = self.ledger.window.set(&mut ctx.flow.tx_pool, unacked);
+        self.ledger.last_window_update = Some(ctx.now);
         // The credit pays back the advance first.
         self.ledger
             .loan
@@ -387,6 +431,8 @@ struct Ledger {
     loan: Loan,
     /// The rate at which the reader of the peer proved to read, `R_s`.
     rate: RateEstimate,
+    /// When the peer last returned credit, if it did.
+    last_window_update: Option<Instant>,
 }
 
 impl Ledger {

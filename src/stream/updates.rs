@@ -64,6 +64,7 @@ impl Task<RxFlow> for CreditUpdates {
                 fin_read,
                 fin_write: false,
                 abort: false,
+                reset: false,
             },
         };
         let fin_state = state.fin_state();
@@ -140,6 +141,7 @@ impl Task<ConnFlow> for DataUpdates {
                 fin_read: false,
                 fin_write: fin_write.is_some(),
                 abort: fin_write == Some(FinWrite::Abort),
+                reset: fin_write == Some(FinWrite::Reset),
             },
         };
         let fin_state = state.fin_state();

@@ -222,6 +222,95 @@ async fn a_sink_dropped_during_close_closes_cleanly() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_reset_discards_what_the_peer_did_not_read() {
+    let mut pair = pair();
+    let (a, mut b) = pair.open(b"abc");
+    assert_eq!(
+        pair.drive(b.next()).unwrap().unwrap(),
+        Bytes::from_static(b"abc")
+    );
+
+    // B does not read any more. A fills B's window, and has more to send.
+    let (mut sink, _reader) = a.into_split();
+    pair.drive(sink.feed(chunk(4096))).unwrap();
+    pair.run();
+    sink.reset();
+    pair.run();
+
+    assert_eq!(
+        read_to_end(&mut b, || pair.run()),
+        (Vec::new(), Some(StreamError::PeerReset))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reset_duplex_resets_writing_and_stops_reading() {
+    let mut pair = pair();
+    let (a, b) = pair.open(b"abc");
+    a.reset();
+    pair.run();
+    let (mut b_sink, mut b_reader) = b.into_split();
+    assert_eq!(
+        read_to_end(&mut b_reader, || pair.run()),
+        (Vec::new(), Some(StreamError::PeerReset))
+    );
+    assert_eq!(
+        pair.drive(b_sink.send(LATE)),
+        Err(StreamError::PeerStoppedReading)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reset_ends_a_close_that_waits_for_the_reader() {
+    let mut pair = pair();
+    let (a, mut b) = pair.open(b"abc");
+    let (mut sink, _reader) = a.into_split();
+    // More than the window, and B does not read: the close cannot complete.
+    sink.feed(chunk(4096)).now_or_never().unwrap().unwrap();
+    assert!(sink.close().now_or_never().is_none());
+    pair.run();
+    assert!(sink.close().now_or_never().is_none());
+    sink.reset();
+    pair.run();
+
+    assert_eq!(
+        read_to_end(&mut b, || pair.run()),
+        (Vec::new(), Some(StreamError::PeerReset))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reset_after_a_close_keeps_the_clean_end() {
+    let mut pair = pair();
+    let (a, mut b) = pair.open(b"abc");
+    let (mut sink, _reader) = a.into_split();
+    pair.drive(sink.close()).unwrap();
+    sink.reset();
+    assert_eq!(read_to_end(&mut b, || pair.run()), (b"abc".to_vec(), None));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reset_closes_the_stream_without_the_reader() {
+    let mut pair = pair();
+    let (a, b) = pair.open(b"abc");
+    assert_eq!(pair.a.conn.stats().outbound_streams, 1);
+    assert_eq!(pair.b.conn.stats().inbound_streams, 1);
+
+    // B never reads, and gives up on its own direction. Only A's data keeps the stream open.
+    let (b_sink, _b_reader) = b.into_split();
+    drop(b_sink);
+    let (sink, reader) = a.into_split();
+    drop(reader);
+    pair.run();
+    assert_eq!(pair.a.conn.stats().outbound_streams, 1);
+
+    sink.reset();
+    pair.run();
+    assert_eq!(pair.a.conn.stats().outbound_streams, 0);
+    assert_eq!(pair.b.conn.stats().inbound_streams, 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn the_writer_learns_that_the_peer_stopped_reading() {
     let mut pair = pair();
     let (a, b) = pair.open(b"abc");
@@ -439,6 +528,7 @@ async fn an_abort_survives_the_connection() {
 fn stream_errors_convert_to_io_errors() {
     for (error, kind) in [
         (StreamError::PeerAborted, io::ErrorKind::ConnectionReset),
+        (StreamError::PeerReset, io::ErrorKind::ConnectionReset),
         (StreamError::PeerStoppedReading, io::ErrorKind::BrokenPipe),
         (
             StreamError::ConnectionFailed,

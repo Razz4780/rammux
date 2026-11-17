@@ -223,26 +223,41 @@ impl InboundTraffic {
         abort: bool,
         credit_task: &AtomicWaker,
     ) -> Result<(), StreamViolation> {
-        self.writing_ended(abort.then_some(StreamError::PeerAborted), credit_task)
+        self.writing_ended(
+            abort.then_some(StreamError::PeerAborted),
+            false,
+            credit_task,
+        )
+    }
+
+    /// The peer reset the stream: the data that the application did not read is dropped,
+    /// and the application reads [`StreamError::PeerReset`].
+    ///
+    /// Wakes the `credit_task` of the stream: `FIN_READ` is due now, and it returns the stream's share of the pool.
+    pub fn received_reset(&mut self, credit_task: &AtomicWaker) -> Result<(), StreamViolation> {
+        self.writing_ended(Some(StreamError::PeerReset), true, credit_task)
     }
 
     /// The connection is gone. The application reads the data that arrived, and then the reason.
     ///
     /// A direction that already received `FIN_WRITE` keeps the end it got.
     pub fn abort(&mut self, reason: StreamError, credit_task: &AtomicWaker) {
-        let _ = self.writing_ended(Some(reason), credit_task);
+        let _ = self.writing_ended(Some(reason), false, credit_task);
     }
 
-    /// Nothing more will arrive. The application reads the data that did, and then the `error`, if any.
+    /// Nothing more will arrive. The application reads the data that did, unless it is to `discard`,
+    /// and then the `error`, if any.
     ///
-    /// Wakes the `credit_task` of the stream if `FIN_READ` is due now: nothing is left to read.
+    /// Wakes the `credit_task` of the stream if `FIN_READ` is due now: nothing is left to read,
+    /// or it was discarded.
     fn writing_ended(
         &mut self,
         error: Option<StreamError>,
+        discard: bool,
         credit_task: &AtomicWaker,
     ) -> Result<(), StreamViolation> {
         match &mut self.state {
-            InboundState::Open { ready_data, .. } if !ready_data.is_empty() => {
+            InboundState::Open { ready_data, .. } if !discard && !ready_data.is_empty() => {
                 self.state = InboundState::HalfClosed {
                     ready_data: std::mem::take(ready_data),
                     error,

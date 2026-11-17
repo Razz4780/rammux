@@ -1,5 +1,10 @@
 use std::{
     num::{NonZeroU16, NonZeroU32},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::Context,
     time::Duration,
 };
 
@@ -10,9 +15,11 @@ use crate::{
     StreamId,
     buffer::Data,
     config::RammuxConfig,
-    error::StreamViolation,
+    error::{StreamError, StreamViolation},
     stream::{
-        ConnFlow, FinState, RammuxDuplex, RxFlow, handle::StreamHandle, test_support::Selectors,
+        ConnFlow, FinState, RammuxDuplex, RxFlow,
+        handle::StreamHandle,
+        test_support::{Flag, Selectors},
     },
     wire::header::ControlFlags,
 };
@@ -69,6 +76,7 @@ async fn rammux_duplex_drop_closes_both_and_aborts_writing() {
             fin_write: false,
             syn: true,
             abort: false,
+            reset: false,
         }
     );
     assert_eq!(fin_state, FinState::default());
@@ -80,6 +88,7 @@ async fn rammux_duplex_drop_closes_both_and_aborts_writing() {
             fin_write: true,
             syn: false,
             abort: true,
+            reset: false,
         }
     );
     assert_eq!(
@@ -107,6 +116,7 @@ async fn rammux_sink_drop_aborts_writing() {
             fin_write: true,
             syn: true,
             abort: true,
+            reset: false,
         }
     );
     assert_eq!(
@@ -131,6 +141,7 @@ async fn rammux_stream_drop_closes_reading() {
             fin_write: false,
             syn: true,
             abort: false,
+            reset: false,
         }
     );
     assert_eq!(
@@ -147,6 +158,7 @@ const NO_FINS: ControlFlags = ControlFlags {
     fin_read: false,
     fin_write: false,
     abort: false,
+    reset: false,
 };
 const FIN_WRITE: ControlFlags = ControlFlags {
     fin_write: true,
@@ -154,6 +166,11 @@ const FIN_WRITE: ControlFlags = ControlFlags {
 };
 const FIN_READ: ControlFlags = ControlFlags {
     fin_read: true,
+    ..NO_FINS
+};
+const RESET: ControlFlags = ControlFlags {
+    fin_write: true,
+    reset: true,
     ..NO_FINS
 };
 
@@ -424,4 +441,290 @@ async fn a_rejected_write_does_not_lose_the_stream() {
     }
     let flags = fin_write.expect("dropping the sink sends FIN_WRITE");
     assert!(flags.abort, "a sink dropped without close() aborts");
+}
+
+#[tokio::test]
+async fn a_reset_discards_the_unread_data_and_returns_the_pool_share() {
+    let (handle, mut selectors, mut duplex) = new_stream(32);
+    selectors
+        .received(&handle, None, bytes(12 + 10), NO_FINS)
+        .unwrap();
+    assert_eq!(selectors.rx_pool_used(), 10);
+    // Data in the frame of the reset is discarded with the rest.
+    selectors.received(&handle, None, bytes(5), RESET).unwrap();
+
+    // `FIN_READ` goes out at once, though the application read nothing.
+    let (update, _) = selectors
+        .credit
+        .next()
+        .now_or_never()
+        .flatten()
+        .expect("FIN_READ is due");
+    assert!(update.flags.fin_read);
+    assert_eq!(update.credit, 0);
+    assert_eq!(selectors.rx_pool_used(), 0);
+
+    assert_eq!(duplex.next().await, Some(Err(StreamError::PeerReset)));
+    assert_eq!(duplex.next().await, None);
+}
+
+#[tokio::test]
+async fn a_reset_wakes_a_reader_that_waits() {
+    let (handle, _selectors, mut duplex) = new_stream(0);
+    let flag = Arc::new(Flag(AtomicBool::new(false)));
+    let waker = futures::task::waker(flag.clone());
+    let mut cx = Context::from_waker(&waker);
+    assert!(duplex.poll_next_unpin(&mut cx).is_pending());
+
+    received_alone(&handle, None, Data::default(), RESET).unwrap();
+    assert!(flag.0.load(Ordering::SeqCst));
+    assert_eq!(duplex.next().await, Some(Err(StreamError::PeerReset)));
+}
+
+#[tokio::test]
+async fn a_reset_of_a_stream_that_is_not_read_any_more_changes_nothing() {
+    let (handle, mut selectors, duplex) = new_stream(0);
+    let (_sink, stream) = duplex.into_split();
+    drop(stream);
+    let (update, _) = selectors.credit.next().await.unwrap();
+    assert!(update.flags.fin_read);
+
+    selectors
+        .received(&handle, None, Data::default(), RESET)
+        .unwrap();
+    assert!(selectors.credit.next().now_or_never().flatten().is_none());
+}
+
+#[tokio::test]
+async fn a_reset_is_a_fin_write() {
+    // Nothing follows it.
+    let (handle, _selectors, _duplex) = new_stream(0);
+    received_alone(&handle, None, Data::default(), RESET).unwrap();
+    received_alone(&handle, None, bytes(1), NO_FINS).unwrap_err();
+    let (handle, _selectors, _duplex) = new_stream(0);
+    received_alone(&handle, None, Data::default(), RESET).unwrap();
+    received_alone(&handle, None, Data::default(), FIN_WRITE).unwrap_err();
+
+    // And it does not follow another one, even while the application still reads the data.
+    let (handle, _selectors, _duplex) = new_stream(0);
+    received_alone(&handle, None, bytes(1), FIN_WRITE).unwrap();
+    received_alone(&handle, None, Data::default(), RESET).unwrap_err();
+}
+
+/// Returns the updates that the sending direction of the stream yields now.
+fn data_updates(selectors: &mut Selectors) -> Vec<(usize, ControlFlags)> {
+    let mut updates = Vec::new();
+    while let Some(Some((update, _))) = selectors.data.next().now_or_never() {
+        updates.push((update.data.len(), update.flags));
+    }
+    updates
+}
+
+#[tokio::test]
+async fn rammux_sink_reset_sends_reset_and_drops_the_data() {
+    let (_, mut selectors, duplex) = new_stream(0);
+    let (mut sink, _stream) = duplex.into_split();
+    sink.feed(Bytes::from_static(b"abc")).await.unwrap();
+    sink.reset();
+    assert_eq!(
+        data_updates(&mut selectors),
+        [(0, ControlFlags { syn: true, ..RESET })]
+    );
+    assert!(selectors.data.is_empty());
+}
+
+#[tokio::test]
+async fn rammux_duplex_reset_resets_writing_and_stops_reading() {
+    let (_, mut selectors, duplex) = new_stream(0);
+    duplex.reset();
+    let (update, _) = selectors.credit.next().await.unwrap();
+    assert_eq!(
+        update.flags,
+        ControlFlags {
+            syn: true,
+            ..FIN_READ
+        }
+    );
+    assert_eq!(data_updates(&mut selectors), [(0, RESET)]);
+}
+
+#[tokio::test]
+async fn a_reset_during_a_close_drops_the_rest_of_the_data() {
+    let (_, mut selectors, duplex) = new_stream(0);
+    let (mut sink, _stream) = duplex.into_split();
+    // More than the window of 14 bytes: 6 bytes wait for credit.
+    sink.feed(Bytes::from(vec![b'a'; 20])).await.unwrap();
+    assert!(sink.close().now_or_never().is_none());
+    let syn = ControlFlags {
+        syn: true,
+        ..NO_FINS
+    };
+    assert_eq!(data_updates(&mut selectors), [(8, syn), (6, NO_FINS)]);
+
+    sink.reset();
+    assert_eq!(data_updates(&mut selectors), [(0, RESET)]);
+    assert!(selectors.data.is_empty());
+}
+
+#[tokio::test]
+async fn a_reset_after_a_close_does_nothing() {
+    let (_, mut selectors, duplex) = new_stream(0);
+    let (mut sink, _stream) = duplex.into_split();
+    sink.feed(Bytes::from_static(b"abc")).await.unwrap();
+    assert!(sink.close().now_or_never().is_none());
+    let clean = ControlFlags {
+        syn: true,
+        ..FIN_WRITE
+    };
+    assert_eq!(data_updates(&mut selectors), [(3, clean)]);
+    sink.close().await.unwrap();
+
+    sink.reset();
+    assert!(selectors.data.is_empty());
+}
+
+#[tokio::test]
+async fn a_reset_after_the_peer_stopped_reading_sends_a_plain_fin_write() {
+    let (handle, mut selectors, duplex) = new_stream(0);
+    let (sink, _stream) = duplex.into_split();
+    selectors
+        .received(&handle, None, Data::default(), FIN_READ)
+        .unwrap();
+    sink.reset();
+    assert_eq!(
+        data_updates(&mut selectors),
+        [(
+            0,
+            ControlFlags {
+                syn: true,
+                ..FIN_WRITE
+            }
+        )]
+    );
+}
+
+#[tokio::test]
+async fn a_reset_after_the_end_of_a_close_went_out_does_nothing() {
+    let (_, mut selectors, duplex) = new_stream(0);
+    let (mut sink, _stream) = duplex.into_split();
+    sink.feed(Bytes::from_static(b"abc")).await.unwrap();
+    assert!(sink.close().now_or_never().is_none());
+    let clean = ControlFlags {
+        syn: true,
+        ..FIN_WRITE
+    };
+    // The connection takes the end of the stream. The application does not look at its close again.
+    assert_eq!(data_updates(&mut selectors), [(3, clean)]);
+
+    sink.reset();
+    assert!(selectors.data.is_empty());
+}
+
+#[tokio::test]
+async fn a_reset_stays_a_reset_when_the_peer_stops_reading_first() {
+    let (handle, mut selectors, duplex) = new_stream(0);
+    let (sink, _stream) = duplex.into_split();
+    sink.reset();
+    // `FIN_READ` of the peer comes before the connection sends anything.
+    selectors
+        .received(&handle, None, Data::default(), FIN_READ)
+        .unwrap();
+    assert_eq!(
+        data_updates(&mut selectors),
+        [(0, ControlFlags { syn: true, ..RESET })]
+    );
+}
+
+#[tokio::test]
+async fn a_reset_that_crosses_fin_read_gets_no_second_one() {
+    let (handle, mut selectors, duplex) = new_stream(32);
+    let (_sink, stream) = duplex.into_split();
+    selectors
+        .received(&handle, None, bytes(12 + 10), NO_FINS)
+        .unwrap();
+    assert_eq!(selectors.rx_pool_used(), 10);
+    // The application stops reading, and the reset arrives before `FIN_READ` goes out.
+    drop(stream);
+    selectors
+        .received(&handle, None, Data::default(), RESET)
+        .unwrap();
+
+    let mut fin_reads = 0;
+    while let Some(Some((update, _))) = selectors.credit.next().now_or_never() {
+        fin_reads += u32::from(update.flags.fin_read);
+        assert_eq!(update.credit, 0);
+    }
+    assert_eq!(fin_reads, 1);
+    assert_eq!(selectors.rx_pool_used(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_writer_sees_the_bytes_in_flight_and_the_last_window_update() {
+    let (handle, mut selectors, mut duplex) = new_stream(0);
+    let stall = duplex.reader_stall();
+    assert_eq!((stall.unacked, stall.last_window_update), (0, None));
+
+    duplex.feed(Bytes::from(vec![b'a'; 12])).await.unwrap();
+    assert_eq!(data_updates(&mut selectors).len(), 2);
+    tokio::time::advance(Duration::from_secs(3)).await;
+    // Time alone changes nothing: no window update came yet.
+    let stall = duplex.reader_stall();
+    assert_eq!((stall.unacked, stall.last_window_update), (12, None));
+
+    selectors
+        .received(&handle, NonZeroU32::new(8), Data::default(), NO_FINS)
+        .unwrap();
+    let stall = duplex.reader_stall();
+    assert_eq!(stall.unacked, 4);
+    let updated = stall.last_window_update.expect("a window update came");
+    assert_eq!(updated.elapsed(), Duration::ZERO);
+
+    // More data does not move the time, another window update does.
+    tokio::time::advance(Duration::from_secs(5)).await;
+    duplex.feed(Bytes::from(vec![b'a'; 2])).await.unwrap();
+    assert_eq!(data_updates(&mut selectors).len(), 1);
+    let stall = duplex.reader_stall();
+    assert_eq!(
+        (stall.unacked, stall.last_window_update),
+        (6, Some(updated))
+    );
+    assert_eq!(updated.elapsed(), Duration::from_secs(5));
+    selectors
+        .received(&handle, NonZeroU32::new(1), Data::default(), NO_FINS)
+        .unwrap();
+    let stall = duplex.reader_stall();
+    assert_eq!(stall.unacked, 5);
+    assert_eq!(stall.last_window_update.unwrap().elapsed(), Duration::ZERO);
+
+    // A reader that is gone holds nothing. That is not a window update.
+    let updated = stall.last_window_update;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    selectors
+        .received(&handle, None, Data::default(), FIN_READ)
+        .unwrap();
+    let stall = duplex.reader_stall();
+    assert_eq!((stall.unacked, stall.last_window_update), (0, updated));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_writer_sees_its_reader_while_a_close_waits_and_after_it() {
+    let (handle, mut selectors, duplex) = new_stream(0);
+    let (mut sink, _stream) = duplex.into_split();
+    // More than the window of 14 bytes: the close waits for the reader.
+    sink.feed(Bytes::from(vec![b'a'; 20])).await.unwrap();
+    assert!(sink.close().now_or_never().is_none());
+    assert_eq!(data_updates(&mut selectors).len(), 2);
+    assert_eq!(sink.reader_stall().unacked, 14);
+
+    // The reader reads, the rest goes out with the end of the stream, and the close completes.
+    selectors
+        .received(&handle, NonZeroU32::new(14), Data::default(), NO_FINS)
+        .unwrap();
+    let last = data_updates(&mut selectors);
+    assert_eq!(last.len(), 1);
+    assert!(last[0].1.fin_write);
+    sink.close().await.unwrap();
+    let stall = sink.reader_stall();
+    assert_eq!(stall.unacked, 6);
+    assert_eq!(stall.last_window_update.unwrap().elapsed(), Duration::ZERO);
 }
