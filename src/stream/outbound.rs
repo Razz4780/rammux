@@ -292,8 +292,8 @@ impl OutboundTraffic {
             .loan
             .repay(&mut ctx.flow.advance, u64::from(credit));
         // The estimate only runs once the loop time is known, or its time constant is not.
-        if let Some(srtt) = ctx.flow.srtt.secs() {
-            self.ledger.rate.add(credit, ctx.now, srtt);
+        if let Some(tau) = ctx.flow.srtt.rate_tau() {
+            self.ledger.rate.add(credit, ctx.now, tau);
         }
         if freed {
             ctx.flow.turns.wake_front();
@@ -367,11 +367,13 @@ impl OutboundTraffic {
     }
 
     /// Gives the stream an allowance of the given size, to decay from now.
+    ///
+    /// Half a byte more than asked, so that rounding in the estimate cannot take a whole byte away.
     #[cfg(test)]
     pub fn prime(&mut self, allowance: u32, srtt: f64, now: Instant) {
         self.ledger
             .rate
-            .grant_allowance(f64::from(allowance), now, srtt);
+            .grant_allowance(f64::from(allowance) + 0.5, now, srtt);
     }
 }
 

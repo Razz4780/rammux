@@ -2,11 +2,12 @@
 
 use tokio::time::Instant;
 
-use crate::flow::ALLOWANCE_RTTS;
+use crate::flow::{ALLOWANCE_RTTS, rate_tau};
 
 /// A decaying sum of credit, in bytes per second.
 ///
-/// The senders use the smoothed round trip time as `tau`: the estimate averages over one loop.
+/// The senders use [`rate_tau`] of the smoothed round trip time as `tau`: the estimate averages
+/// over [`RATE_RTTS`](crate::flow::RATE_RTTS) loops.
 ///
 /// With the time constant `tau`, the estimate of a steady flow of `r` bytes per second is `r`
 /// and the sum of credit over the last `tau` seconds is `r * tau`: the sum is an exponentially
@@ -47,15 +48,16 @@ impl RateEstimate {
     }
 
     /// Returns the allowance at `now`: how many bytes the stream may have borrowed,
-    /// the estimate over `ALLOWANCE_RTTS` loops of `srtt` seconds.
+    /// the rate estimate times [`ALLOWANCE_RTTS`] loops of `srtt` seconds.
     pub fn allowance(&self, now: Instant, srtt: f64) -> f64 {
-        self.value(now, srtt) * ALLOWANCE_RTTS * srtt
+        self.value(now, rate_tau(srtt)) * ALLOWANCE_RTTS * srtt
     }
 
-    /// Makes the allowance larger by `allowance` bytes.
+    /// Makes the allowance at a smoothed round trip time of `srtt` seconds larger by `allowance` bytes.
     #[cfg(test)]
-    pub fn grant_allowance(&mut self, allowance: f64, now: Instant, tau: f64) {
-        self.add_amount(allowance / ALLOWANCE_RTTS, now, tau);
+    pub fn grant_allowance(&mut self, allowance: f64, now: Instant, srtt: f64) {
+        self.rate = self.value(now, rate_tau(srtt)) + allowance / (ALLOWANCE_RTTS * srtt);
+        self.at = now;
     }
 }
 
@@ -65,7 +67,7 @@ mod test {
 
     use tokio::time::Instant;
 
-    use crate::flow::RateEstimate;
+    use crate::flow::{RateEstimate, rate_tau};
 
     #[tokio::test(start_paused = true)]
     async fn steady_credit_gives_the_rate() {
@@ -102,6 +104,42 @@ mod test {
         let ripple = 100_000.0 / (2.0 * tau);
         assert!(max < mean + 1.2 * ripple + 1e4 && max > mean, "{max}");
         assert!(min > mean - 1.2 * ripple - 1e4 && min < mean, "{min}");
+    }
+
+    /// The stream sends `rate * srtt` bytes per loop, and has them in flight when credit stops.
+    /// A loss in the transport holds credit back for about a loop.
+    #[tokio::test(start_paused = true)]
+    async fn allowance_outlasts_a_loop_without_credit() {
+        let srtt = 0.1;
+        let tau = rate_tau(srtt);
+        let mut estimate = RateEstimate::new(Instant::now());
+        for _ in 0..2000 {
+            tokio::time::advance(Duration::from_millis(1)).await;
+            estimate.add(1000, Instant::now(), tau);
+        }
+        let in_flight = 1e6 * srtt;
+        tokio::time::advance(Duration::from_secs_f64(srtt)).await;
+        let allowance = estimate.allowance(Instant::now(), srtt);
+        assert!(allowance > in_flight, "{allowance} {in_flight}");
+    }
+
+    /// After such a loss the credit of a whole flight comes back in one piece, and the next flight leaves
+    /// a loop later, or a little more when the stream has to wait for its turn.
+    #[tokio::test(start_paused = true)]
+    async fn allowance_outlasts_credit_that_comes_once_per_loop() {
+        let srtt = 0.1;
+        let tau = rate_tau(srtt);
+        let flight = 100_000;
+        let mut estimate = RateEstimate::new(Instant::now());
+        for round in 0..20 {
+            tokio::time::advance(Duration::from_secs_f64(srtt * 1.25)).await;
+            if round >= 10 {
+                // Just before the credit of the flight in flight.
+                let allowance = estimate.allowance(Instant::now(), srtt);
+                assert!(allowance > f64::from(flight), "{round}: {allowance}");
+            }
+            estimate.add(flight, Instant::now(), tau);
+        }
     }
 
     #[tokio::test(start_paused = true)]
