@@ -604,6 +604,25 @@ impl Session {
         assert!(stats.outbound_streams <= config.max_outbound_streams);
     }
 
+    /// Checks that the writers are told the bytes in flight that the peer counts.
+    /// Returns how many writers have a window or more in flight.
+    fn check_readers(&self) -> u64 {
+        let window = u64::from(self.peer.config.remote_recv_window.get());
+        let mut full = 0;
+        for sink in self.app.iter().filter_map(|(sink, _)| sink.as_ref()) {
+            let stall = sink.reader_stall();
+            // A stream that the peer stopped reading holds nothing, and its ID may be in use again.
+            if stall.unacked == 0 {
+                continue;
+            }
+            let id = u16::from_be_bytes(sink.id().to_be_bytes());
+            let unacked = self.peer.streams.get(&id).map(|stream| stream.conn_unacked);
+            assert_eq!(Some(stall.unacked), unacked, "stream {id}");
+            full += u64::from(stall.unacked >= window);
+        }
+        full
+    }
+
     /// Drops the connection, if it is still there, and checks that its streams end:
     /// reading reaches the end, and writing fails. A stream that the peer did not end ends with
     /// the `reason` that the connection ended for.
@@ -642,6 +661,7 @@ impl Session {
 async fn a_peer_that_follows_the_protocol_is_never_rejected() {
     let (mut read, mut received, mut aborts, mut peer_aborts) = (0, 0, 0, 0);
     let (mut resets, mut peer_resets) = (0, 0);
+    let mut full_windows = 0;
     for seed in 0..SEEDS {
         let mut session = Session::new(seed);
         for step in 0..STEPS {
@@ -665,6 +685,7 @@ async fn a_peer_that_follows_the_protocol_is_never_rejected() {
                 "seed {seed}, step {step}: a reset was not answered with FIN_READ at once"
             );
             session.check_stats();
+            full_windows += session.check_readers();
         }
 
         // The session ends with a clean downgrade, whatever state the streams are in.
@@ -698,6 +719,8 @@ async fn a_peer_that_follows_the_protocol_is_never_rejected() {
     assert!(peer_aborts > SEEDS, "{peer_aborts}");
     assert!(resets > SEEDS, "{resets}");
     assert!(peer_resets > SEEDS, "{peer_resets}");
+    // And writers had full windows to tell about.
+    assert!(full_windows > SEEDS, "{full_windows}");
 }
 
 #[tokio::test(start_paused = true)]

@@ -156,8 +156,9 @@ TCP makes them, for every multiplexer.
 - **A reader that stalls keeps what it holds.** Its stream stops borrowing within a few round trips, but the bytes
   that are already in the pool stay there until they are read or the stream closes. When one of two bulk streams
   stalled, it held 12.0 MB of the 16 MiB pool, and the other stream got 154 of 287 Mbit/s
-  (8 Mbit/s with yamux, 14 to 136 with hyper's adaptive window). A writer that gives up on such a stream
-  can reset it. The receiving side then discards the bytes: 0.6 s after the reset, the other stream had the
+  (8 Mbit/s with yamux, 14 to 136 with hyper's adaptive window). The writer can ask how many
+  bytes of its stream are in flight and when the reader last released some, and reset the stream when it
+  gives up. The receiving side then discards the bytes: 0.6 s after the reset, the other stream had the
   whole link (286 Mbit/s).
 - **Shares are equal in frames, not in bytes.** A turn moves one frame, and a frame holds at most one write.
   A stream that writes less than `frame_limit` bytes at a time gets a proportionally smaller share next to a

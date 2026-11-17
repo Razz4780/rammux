@@ -657,3 +657,74 @@ async fn a_reset_that_crosses_fin_read_gets_no_second_one() {
     assert_eq!(fin_reads, 1);
     assert_eq!(selectors.rx_pool_used(), 0);
 }
+
+#[tokio::test(start_paused = true)]
+async fn the_writer_sees_the_bytes_in_flight_and_the_last_window_update() {
+    let (handle, mut selectors, mut duplex) = new_stream(0);
+    let stall = duplex.reader_stall();
+    assert_eq!((stall.unacked, stall.last_window_update), (0, None));
+
+    duplex.feed(Bytes::from(vec![b'a'; 12])).await.unwrap();
+    assert_eq!(data_updates(&mut selectors).len(), 2);
+    tokio::time::advance(Duration::from_secs(3)).await;
+    // Time alone changes nothing: no window update came yet.
+    let stall = duplex.reader_stall();
+    assert_eq!((stall.unacked, stall.last_window_update), (12, None));
+
+    selectors
+        .received(&handle, NonZeroU32::new(8), Data::default(), NO_FINS)
+        .unwrap();
+    let stall = duplex.reader_stall();
+    assert_eq!(stall.unacked, 4);
+    let updated = stall.last_window_update.expect("a window update came");
+    assert_eq!(updated.elapsed(), Duration::ZERO);
+
+    // More data does not move the time, another window update does.
+    tokio::time::advance(Duration::from_secs(5)).await;
+    duplex.feed(Bytes::from(vec![b'a'; 2])).await.unwrap();
+    assert_eq!(data_updates(&mut selectors).len(), 1);
+    let stall = duplex.reader_stall();
+    assert_eq!(
+        (stall.unacked, stall.last_window_update),
+        (6, Some(updated))
+    );
+    assert_eq!(updated.elapsed(), Duration::from_secs(5));
+    selectors
+        .received(&handle, NonZeroU32::new(1), Data::default(), NO_FINS)
+        .unwrap();
+    let stall = duplex.reader_stall();
+    assert_eq!(stall.unacked, 5);
+    assert_eq!(stall.last_window_update.unwrap().elapsed(), Duration::ZERO);
+
+    // A reader that is gone holds nothing. That is not a window update.
+    let updated = stall.last_window_update;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    selectors
+        .received(&handle, None, Data::default(), FIN_READ)
+        .unwrap();
+    let stall = duplex.reader_stall();
+    assert_eq!((stall.unacked, stall.last_window_update), (0, updated));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_writer_sees_its_reader_while_a_close_waits_and_after_it() {
+    let (handle, mut selectors, duplex) = new_stream(0);
+    let (mut sink, _stream) = duplex.into_split();
+    // More than the window of 14 bytes: the close waits for the reader.
+    sink.feed(Bytes::from(vec![b'a'; 20])).await.unwrap();
+    assert!(sink.close().now_or_never().is_none());
+    assert_eq!(data_updates(&mut selectors).len(), 2);
+    assert_eq!(sink.reader_stall().unacked, 14);
+
+    // The reader reads, the rest goes out with the end of the stream, and the close completes.
+    selectors
+        .received(&handle, NonZeroU32::new(14), Data::default(), NO_FINS)
+        .unwrap();
+    let last = data_updates(&mut selectors);
+    assert_eq!(last.len(), 1);
+    assert!(last[0].1.fin_write);
+    sink.close().await.unwrap();
+    let stall = sink.reader_stall();
+    assert_eq!(stall.unacked, 6);
+    assert_eq!(stall.last_window_update.unwrap().elapsed(), Duration::ZERO);
+}
