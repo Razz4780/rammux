@@ -49,7 +49,7 @@ Nothing of this is on the wire. The peer sees only `DATA` that stays within its 
 | `unacked` | Bytes sent on a stream and not credited back. |
 | `borrowed` | `max(0, unacked - B)`: what a stream uses of the pool. The sum over the streams, `U`, never exceeds `P`. |
 | `srtt` | Smoothed round trip time, measured with `PING` and `PONG`. |
-| `T_c` | `min(32 KiB, B / 2)`: the step in which the receiver returns credit. |
+| `T_c` | `max(1, min(32 KiB, B / 2))`: the step in which the receiver returns credit. |
 | `g`, `G` | The advance: what one stream may take, and all streams together (`advance_grant`, `advance_budget`). |
 
 ### Within the base window
@@ -155,9 +155,10 @@ TCP makes them, for every multiplexer.
 - **Shares are equal in frames, not in bytes.** A turn moves one frame, and a frame holds at most one write.
   A stream that writes less than `frame_limit` bytes at a time gets a proportionally smaller share next to a
   stream that writes more.
-- **More small packets when data flows one way.** Credit is returned every 32 KiB, and every 32 KiB of data
-  carries a `PING`. When the other direction has data, these ride along. When it has none, they are about 60
-  small packets per MB: 5.5% more packets in total than yamux or hyper, and 0.35 percentage points more bytes.
+- **More small packets when data flows one way.** The receiver returns credit for every `T_c` that its reader
+  consumes. Once it has measured the round trip, each side adds a `PING` to its data or credit at most every
+  eighth of it, and the other side answers with a `PONG`. When the other direction has data, they ride along.
+  When it has none, they are packets of their own.
 - **The queue is not limited.** Like the other multiplexers, a connection with enough data fills what it is
   given, here `streams * B + P`, and an interactive stream waits behind the bulk that is already on the path.
   The pool is the bound. `TCP_NOTSENT_LOWAT` can be used as a mitigation on platforms that support it.

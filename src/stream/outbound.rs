@@ -1,7 +1,6 @@
 //! The sending direction of a stream.
 
 use std::{
-    io,
     num::{NonZeroU16, NonZeroU32},
     task::{Poll, Waker},
 };
@@ -11,7 +10,7 @@ use futures::task::AtomicWaker;
 use tokio::time::Instant;
 
 use crate::{
-    error::StreamError,
+    error::{StreamError, StreamViolation},
     flow::{Loan, RateEstimate, Window},
     stream::{ConnFlow, FinState, StreamRef, waker::WakerSlot},
 };
@@ -27,9 +26,9 @@ pub struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
-    /// Wakes the [`StreamUpdates`](super::updates::StreamUpdates) of this stream.
-    fn wake_updates(&self) {
-        self.me.updates.wake();
+    /// Wakes the [`DataUpdates`](super::updates::DataUpdates) of this stream.
+    fn wake_data_task(&self) {
+        self.me.data_task.wake();
     }
 }
 
@@ -51,14 +50,53 @@ enum OutboundState {
         /// Waits for [`Self::Open::ready_data`] to be sent.
         writer: WakerSlot,
     },
-    /// The application closed writing, and there is still data to send before `FIN_WRITE`.
+    /// The application closed writing, and `FIN_WRITE` was not handed to the connection yet.
     HalfClosed {
-        /// Never empty.
+        /// Data to send before `FIN_WRITE`, if any.
         ready_data: Bytes,
+        /// Waits for `FIN_WRITE` to be sent.
         writer: WakerSlot,
     },
     /// Nothing more will be sent but `FIN_WRITE`, if it was not sent yet.
-    Closed { fin_state: FinState },
+    Closed { fin_state: FinState, end: WriteEnd },
+}
+
+/// Why the sending direction of a stream is closed.
+#[derive(Clone, Copy)]
+enum WriteEnd {
+    /// The application closed it.
+    Closed,
+    /// The application dropped its sink without closing it. `FIN_WRITE` carries `ABORT`.
+    Dropped,
+    /// The peer stopped reading, or the connection is gone. The application gets the error.
+    Failed(StreamError),
+}
+
+impl WriteEnd {
+    /// Returns what a write of the application gets.
+    fn write_error(self) -> StreamError {
+        match self {
+            Self::Closed | Self::Dropped => StreamError::SinkClosed,
+            Self::Failed(error) => error,
+        }
+    }
+
+    /// Returns what a flush or a close of the application gets.
+    fn flushed(self) -> Result<(), StreamError> {
+        match self {
+            Self::Closed | Self::Dropped => Ok(()),
+            Self::Failed(error) => Err(error),
+        }
+    }
+}
+
+/// The `FIN_WRITE` of a sending direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinWrite {
+    /// The application closed writing, or the peer stopped reading, or the connection is gone.
+    Clean,
+    /// The application dropped its sink without closing it: `FIN_WRITE` with `ABORT`.
+    Abort,
 }
 
 impl OutboundTraffic {
@@ -81,76 +119,99 @@ impl OutboundTraffic {
     pub fn fin_state(&self) -> FinState {
         match &self.state {
             OutboundState::Open { .. } | OutboundState::HalfClosed { .. } => FinState::default(),
-            OutboundState::Closed { fin_state } => *fin_state,
+            OutboundState::Closed { fin_state, .. } => *fin_state,
         }
     }
 
     // The application side.
 
     /// Returns whether the application can write.
-    pub fn poll_write_ready(&mut self, waker: &Waker) -> Poll<io::Result<()>> {
-        let OutboundState::Open { ready_data, writer } = &mut self.state else {
-            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
-        };
-        if ready_data.is_empty() {
-            Poll::Ready(Ok(()))
-        } else {
-            writer.register(waker);
-            Poll::Pending
+    pub fn poll_write_ready(&mut self, waker: &Waker) -> Poll<Result<(), StreamError>> {
+        match &mut self.state {
+            OutboundState::Open { ready_data, .. } if ready_data.is_empty() => Poll::Ready(Ok(())),
+            OutboundState::Open { writer, .. } => {
+                writer.register(waker);
+                Poll::Pending
+            },
+            OutboundState::HalfClosed { .. } => Poll::Ready(Err(StreamError::SinkClosed)),
+            OutboundState::Closed { end, .. } => Poll::Ready(Err(end.write_error())),
         }
     }
 
     /// Takes data from the application. The direction must be [ready](Self::poll_write_ready).
-    pub fn write(&mut self, data: Bytes, updates: &AtomicWaker) -> io::Result<()> {
-        let OutboundState::Open { ready_data, .. } = &mut self.state else {
-            return Err(io::ErrorKind::BrokenPipe.into());
-        };
-        if !ready_data.is_empty() {
-            return Err(io::Error::other("pipe not ready"));
+    ///
+    /// Wakes the `data_task` of the stream, which sends the data.
+    pub fn write(&mut self, data: Bytes, data_task: &AtomicWaker) -> Result<(), StreamError> {
+        match &mut self.state {
+            OutboundState::Open { ready_data, .. } if !ready_data.is_empty() => {
+                Err(StreamError::SinkNotReady)
+            },
+            OutboundState::Open { ready_data, .. } => {
+                if !data.is_empty() {
+                    *ready_data = data;
+                    data_task.wake();
+                }
+                Ok(())
+            },
+            OutboundState::HalfClosed { .. } => Err(StreamError::SinkClosed),
+            OutboundState::Closed { end, .. } => Err(end.write_error()),
         }
-        if !data.is_empty() {
-            *ready_data = data;
-            updates.wake();
-        }
-        Ok(())
     }
 
-    /// Returns whether everything the application wrote was handed to the connection.
-    pub fn poll_flushed(&mut self, waker: &Waker) -> Poll<()> {
+    /// Returns whether everything the application wrote was handed to the connection,
+    /// and `FIN_WRITE` too if the application closed writing.
+    ///
+    /// Fails if the direction was closed by anything but the application.
+    pub fn poll_flushed(&mut self, waker: &Waker) -> Poll<Result<(), StreamError>> {
         match &mut self.state {
-            OutboundState::Open { ready_data, .. } if ready_data.is_empty() => Poll::Ready(()),
+            OutboundState::Open { ready_data, .. } if ready_data.is_empty() => Poll::Ready(Ok(())),
             OutboundState::Open { writer, .. } | OutboundState::HalfClosed { writer, .. } => {
                 writer.register(waker);
                 Poll::Pending
             },
-            OutboundState::Closed { .. } => Poll::Ready(()),
+            OutboundState::Closed { end, .. } => Poll::Ready(end.flushed()),
         }
     }
 
     /// The application closes writing. `FIN_WRITE` follows the data that is not sent yet.
-    pub fn close_writing(&mut self, updates: &AtomicWaker) {
+    ///
+    /// Wakes the `data_task` of the stream if `FIN_WRITE` is due now: no data is left to send.
+    pub fn close_writing(&mut self, data_task: &AtomicWaker) {
         let OutboundState::Open { ready_data, writer } = &mut self.state else {
             return;
         };
-        self.state = if ready_data.is_empty() {
-            updates.wake();
-            OutboundState::Closed {
-                fin_state: FinState::default(),
-            }
-        } else {
-            OutboundState::HalfClosed {
-                ready_data: std::mem::take(ready_data),
-                writer: std::mem::take(writer),
-            }
+        if ready_data.is_empty() {
+            data_task.wake();
+        }
+        // The close completes only once `FIN_WRITE` is handed to the connection, and not when the data is:
+        // a downgrade right after the close must not cut `FIN_WRITE` off.
+        self.state = OutboundState::HalfClosed {
+            ready_data: std::mem::take(ready_data),
+            writer: std::mem::take(writer),
+        };
+    }
+
+    /// The application dropped its sink. A sink that was not closed aborts: the data that was not sent
+    /// is dropped, and `FIN_WRITE` with `ABORT` follows. A sink that started to close finishes it.
+    ///
+    /// Wakes the `data_task` of the stream, which sends `FIN_WRITE`.
+    pub fn drop_writing(&mut self, data_task: &AtomicWaker) {
+        let OutboundState::Open { .. } = &self.state else {
+            return;
+        };
+        data_task.wake();
+        self.state = OutboundState::Closed {
+            fin_state: FinState::default(),
+            end: WriteEnd::Dropped,
         };
     }
 
     // The connection side.
 
-    /// Polls for what this direction sends next: a chunk of data, and whether `FIN_WRITE` follows it.
+    /// Polls for what this direction sends next: a chunk of data, and the `FIN_WRITE` that follows it, if any.
     ///
     /// Returns [`Poll::Pending`] when there is nothing to send. Registering the waker is up to the caller.
-    pub fn poll_update(&mut self, ctx: &mut Ctx<'_>) -> Poll<(Bytes, bool)> {
+    pub fn poll_update(&mut self, ctx: &mut Ctx<'_>) -> Poll<(Bytes, Option<FinWrite>)> {
         match &mut self.state {
             OutboundState::Open { ready_data, writer } => {
                 let Some(len) = self.ledger.plan(ctx, ready_data.len()) else {
@@ -160,35 +221,46 @@ impl OutboundTraffic {
                 if ready_data.is_empty() {
                     writer.wake();
                 }
-                Poll::Ready((chunk, false))
+                Poll::Ready((chunk, None))
             },
 
             OutboundState::HalfClosed { ready_data, writer } => {
-                let Some(len) = self.ledger.plan(ctx, ready_data.len()) else {
-                    return Poll::Pending;
+                // Only data waits for room. `FIN_WRITE` alone goes out at once.
+                let chunk = if ready_data.is_empty() {
+                    Bytes::new()
+                } else {
+                    let Some(len) = self.ledger.plan(ctx, ready_data.len()) else {
+                        return Poll::Pending;
+                    };
+                    let chunk = ready_data.split_to(len);
+                    if !ready_data.is_empty() {
+                        return Poll::Ready((chunk, None));
+                    }
+                    chunk
                 };
-                let chunk = ready_data.split_to(len);
-                if !ready_data.is_empty() {
-                    return Poll::Ready((chunk, false));
-                }
                 writer.wake();
                 self.state = OutboundState::Closed {
                     fin_state: FinState {
                         sent: true,
                         received: false,
                     },
+                    end: WriteEnd::Closed,
                 };
-                Poll::Ready((chunk, true))
+                Poll::Ready((chunk, Some(FinWrite::Clean)))
             },
 
-            OutboundState::Closed { fin_state } => {
+            OutboundState::Closed { fin_state, end } => {
                 // A closed stream must not hold up the others.
                 ctx.flow.pass_turn(ctx.me);
                 if fin_state.sent {
                     return Poll::Pending;
                 }
                 fin_state.sent = true;
-                Poll::Ready((Bytes::new(), true))
+                let fin_write = match end {
+                    WriteEnd::Dropped => FinWrite::Abort,
+                    WriteEnd::Closed | WriteEnd::Failed(..) => FinWrite::Clean,
+                };
+                Poll::Ready((Bytes::new(), Some(fin_write)))
             },
         }
     }
@@ -198,20 +270,21 @@ impl OutboundTraffic {
         &mut self,
         credit: NonZeroU32,
         ctx: &mut Ctx<'_>,
-    ) -> Result<(), StreamError> {
+    ) -> Result<(), StreamViolation> {
         let credit = credit.get();
         if let OutboundState::Closed {
             fin_state: FinState { received: true, .. },
+            ..
         } = &self.state
         {
-            return Err(StreamError("sent window update after FIN_READ"));
+            return Err(StreamViolation("sent window update after FIN_READ"));
         }
         let unacked = self
             .ledger
             .window
             .unacked()
             .checked_sub(u64::from(credit))
-            .ok_or(StreamError("returned more credit than was in flight"))?;
+            .ok_or(StreamViolation("returned more credit than was in flight"))?;
 
         let freed = self.ledger.window.set(&mut ctx.flow.tx_pool, unacked);
         // The credit pays back the advance first.
@@ -230,15 +303,15 @@ impl OutboundTraffic {
             &self.state
             && !ready_data.is_empty()
         {
-            ctx.wake_updates();
+            ctx.wake_data_task();
         }
         Ok(())
     }
 
     /// The peer stopped reading. The bytes in flight are forgotten,
     /// which returns the share of the pool that the stream used.
-    pub fn received_fin_read(&mut self, ctx: &mut Ctx<'_>) -> Result<(), StreamError> {
-        self.close_reading_side(&ctx.me.updates)?;
+    pub fn received_fin_read(&mut self, ctx: &mut Ctx<'_>) -> Result<(), StreamViolation> {
+        self.end(StreamError::PeerStoppedReading, &ctx.me.data_task)?;
         if self.ledger.window.set(&mut ctx.flow.tx_pool, 0) {
             ctx.flow.turns.wake_front();
         }
@@ -248,27 +321,34 @@ impl OutboundTraffic {
     }
 
     /// Closes the direction without the accounting, when the connection is gone.
-    pub fn abort(&mut self, updates: &AtomicWaker) {
-        let _ = self.close_reading_side(updates);
+    ///
+    /// A direction that the application closed before stays closed.
+    pub fn abort(&mut self, reason: StreamError, data_task: &AtomicWaker) {
+        let _ = self.end(reason, data_task);
     }
 
-    fn close_reading_side(&mut self, updates: &AtomicWaker) -> Result<(), StreamError> {
+    /// The peer stopped reading, or the connection is gone: nothing more is sent but `FIN_WRITE`,
+    /// the data that was not sent is dropped, and the application gets the `error`.
+    ///
+    /// Wakes the `data_task` of the stream if `FIN_WRITE` is due now.
+    fn end(&mut self, error: StreamError, data_task: &AtomicWaker) -> Result<(), StreamViolation> {
         match &mut self.state {
             OutboundState::Open { writer, .. } | OutboundState::HalfClosed { writer, .. } => {
                 writer.wake();
-                updates.wake();
+                data_task.wake();
                 self.state = OutboundState::Closed {
                     fin_state: FinState {
                         sent: false,
                         received: true,
                     },
+                    end: WriteEnd::Failed(error),
                 };
                 Ok(())
             },
-            OutboundState::Closed { fin_state } if fin_state.received => {
-                Err(StreamError("sent duplicate FIN_READ"))
+            OutboundState::Closed { fin_state, .. } if fin_state.received => {
+                Err(StreamViolation("sent duplicate FIN_READ"))
             },
-            OutboundState::Closed { fin_state } => {
+            OutboundState::Closed { fin_state, .. } => {
                 fin_state.received = true;
                 Ok(())
             },

@@ -62,7 +62,7 @@ pub struct RammuxConfig {
     ///
     /// Default: 128. At most [`MAX_STREAMS_PER_SIDE`], and not less than the peer's
     /// [`max_outbound_streams`](Self::max_outbound_streams).
-    pub max_inbound_streams: u32,
+    pub max_inbound_streams: u16,
     /// How many streams started by this side can be open at a time.
     ///
     /// At the limit, [`try_start_outbound`](crate::connection::RammuxConnection::try_start_outbound)
@@ -70,7 +70,7 @@ pub struct RammuxConfig {
     ///
     /// Default: 128. At most [`MAX_STREAMS_PER_SIDE`], and not more than the peer's
     /// [`max_inbound_streams`](Self::max_inbound_streams).
-    pub max_outbound_streams: u32,
+    pub max_outbound_streams: u16,
     /// Receive window of every stream, in bytes.
     ///
     /// This much data of a stream can wait for the application to read it, whatever the other streams do.
@@ -116,12 +116,6 @@ pub struct RammuxConfig {
     ///
     /// Default: 0.25. From [`advance_grant`](Self::advance_grant) to 1. This setting is local.
     pub advance_budget: f32,
-    /// A `PING` is sent after this many bytes of data.
-    ///
-    /// The answers measure the round trip time, which the flow control needs while data flows.
-    ///
-    /// Default: 32 KiB. This setting is local.
-    pub ping_bytes: NonZeroU32,
     /// A `PING` is sent at least this often, which keeps an idle connection alive.
     ///
     /// Default: 5 s. Not zero, and shorter than [`inbound_frame_timeout`](Self::inbound_frame_timeout).
@@ -151,7 +145,6 @@ impl RammuxConfig {
             remote_recv_pool: 4 * 1024 * 1024,
             advance_grant: 0.25,
             advance_budget: 0.25,
-            ping_bytes: NonZeroU32::new(32 * 1024).unwrap(),
             ping_interval: Duration::from_secs(5),
             inbound_frame_timeout: Duration::from_secs(10),
         }
@@ -202,7 +195,7 @@ impl RammuxConfig {
 /// How many streams each side of a connection can have at most.
 ///
 /// Stream IDs are 16-bit, the lowest bit tells which side initiated the stream.
-pub const MAX_STREAMS_PER_SIDE: u32 = 1 << 15;
+pub const MAX_STREAMS_PER_SIDE: u16 = 1 << 15;
 
 /// Reason why a [`RammuxConfig`] cannot be used.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -214,7 +207,7 @@ pub enum ConfigError {
         /// Name of the offending field.
         field: &'static str,
         /// Configured value.
-        value: u32,
+        value: u16,
     },
     /// An advance setting is not a number from 0 to 1 (NaN and infinities included).
     #[error("{field} must be a finite fraction from 0 to 1")]

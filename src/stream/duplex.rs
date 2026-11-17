@@ -1,5 +1,5 @@
 use std::{
-    fmt, io,
+    fmt,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -7,19 +7,15 @@ use std::{
 use bytes::Bytes;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 
-use crate::{StreamId, stream::StreamRef};
+use crate::{StreamId, error::StreamError, stream::StreamRef};
 
 /// Bidirectional virtual data stream created within a rammux connection.
 ///
-/// Dropping it will close the stream.
+/// It is a [`RammuxSink`] and a [`RammuxStream`] in one, see them for how the stream ends.
+/// [`into_split`](Self::into_split) separates them.
 ///
-/// # Flushing
-///
-/// [`Sink::poll_flush`] and [`Sink::poll_close`] return [`Poll::Ready`] as soon as all pending data
-/// is framed and enqueued for sending through the IO transport.
-/// If the connection is downgraded ([`RammuxConnection::downgrade`](crate::connection::RammuxConnection::downgrade))
-/// before the data is enqueued, the data will be lost.
-/// Note that the data can still be lost if the connection fails.
+/// Dropping it drops both halves: the peer reads [`StreamError::PeerAborted`] after the data it got,
+/// unless the sink was closed first, and the peer's writes fail with [`StreamError::PeerStoppedReading`].
 pub struct RammuxDuplex {
     sink: RammuxSink,
     stream: RammuxStream,
@@ -30,7 +26,7 @@ impl RammuxDuplex {
         Self {
             sink: RammuxSink {
                 id,
-                shared: Some(shared.clone()),
+                shared: shared.clone(),
             },
             stream: RammuxStream {
                 id,
@@ -59,7 +55,7 @@ impl fmt::Debug for RammuxDuplex {
 }
 
 impl Stream for RammuxDuplex {
-    type Item = Bytes;
+    type Item = Result<Bytes, StreamError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.get_mut().stream.poll_next_unpin(cx)
@@ -67,7 +63,7 @@ impl Stream for RammuxDuplex {
 }
 
 impl Sink<Bytes> for RammuxDuplex {
-    type Error = io::Error;
+    type Error = StreamError;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.get_mut().sink.poll_ready_unpin(cx)
@@ -88,19 +84,39 @@ impl Sink<Bytes> for RammuxDuplex {
 
 /// [`Sink`] half of a [`RammuxDuplex`].
 ///
-/// Dropping it will close writing on the stream.
+/// # Ending the stream
+///
+/// Only [`Sink::poll_close`] (`close()` of [`SinkExt`]) ends the stream cleanly: the data that was written goes
+/// out, and then the peer's [`RammuxStream`] ends with [`None`]. A sink that is dropped after `close()` was
+/// called finishes the close, even if `close()` did not complete.
+///
+/// Dropping the sink before `close()` was called aborts the stream: the data that the connection has not
+/// taken yet is discarded, and the peer's [`RammuxStream`] yields [`StreamError::PeerAborted`]
+/// after the data that it got.
+///
+/// # Errors
+///
+/// Once writing ended for a reason other than `close()`, every call returns the reason, including
+/// [`Sink::poll_flush`] and [`Sink::poll_close`]:
+/// - [`StreamError::PeerStoppedReading`] when the peer dropped its [`RammuxStream`],
+/// - [`StreamError::ConnectionFailed`], [`StreamError::ConnectionDowngraded`] or
+///   [`StreamError::ConnectionDropped`] when the connection ended. A sink that completed its `close()`
+///   before that stays closed.
+///
+/// After `close()` completed, writing returns [`StreamError::SinkClosed`], and flushing and closing
+/// return `Ok`. [`Sink::start_send`] before [`Sink::poll_ready`] returned [`Poll::Ready`] returns
+/// [`StreamError::SinkNotReady`], and the sink can still be used.
 ///
 /// # Flushing
 ///
-/// [`Sink::poll_flush`] and [`Sink::poll_close`] return [`Poll::Ready`] as soon as all pending data
-/// is framed and enqueued for sending through the IO transport.
-/// If the connection is downgraded ([`RammuxConnection::downgrade`](crate::connection::RammuxConnection::downgrade))
-/// before the data is enqueued, the data will be lost.
-/// Note that the data can still be lost if the connection fails.
+/// [`Sink::poll_flush`] and [`Sink::poll_close`] return `Ok` as soon as all pending data
+/// is framed and enqueued for sending through the IO transport, and `poll_close` once the end of the stream
+/// is enqueued too. So a downgrade that this side starts right after `close()` completed does not cut
+/// the stream short. It does not mean that the peer received the data: data that is still on its way when
+/// the connection fails, or when the peer starts a downgrade, is lost.
 pub struct RammuxSink {
     id: StreamId,
-    /// [`None`] once writing is closed.
-    shared: Option<StreamRef>,
+    shared: StreamRef,
 }
 
 impl RammuxSink {
@@ -114,74 +130,54 @@ impl fmt::Debug for RammuxSink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RammuxSink")
             .field("id", &self.id)
-            .field("closed", &self.shared.is_none())
             .finish_non_exhaustive()
     }
 }
 
 impl Sink<Bytes> for RammuxSink {
-    type Error = io::Error;
+    type Error = StreamError;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let this = self.get_mut();
-        let shared = this.shared.as_ref().ok_or(io::ErrorKind::BrokenPipe)?;
-        let result = std::task::ready!(shared.lock().outbound.poll_write_ready(cx.waker()));
-        if result.is_err() {
-            this.shared = None;
-        }
-        Poll::Ready(result)
+        self.shared.lock().outbound.poll_write_ready(cx.waker())
     }
 
     fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
-        let this = self.get_mut();
-        let shared = this.shared.as_ref().ok_or(io::ErrorKind::BrokenPipe)?;
-        let result = shared.lock().outbound.write(item, &shared.updates);
-        // Only a closed direction is forgotten. A write that came before the sink was ready is rejected,
-        // and the stream stays: dropping the sink must still close it.
-        if result
-            .as_ref()
-            .is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
-        {
-            this.shared = None;
-        }
-        result
+        let shared = &self.shared;
+        shared.lock().outbound.write(item, &shared.data_task)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let Some(shared) = &self.shared else {
-            return Poll::Ready(Ok(()));
-        };
-        shared.lock().outbound.poll_flushed(cx.waker()).map(Ok)
+        self.shared.lock().outbound.poll_flushed(cx.waker())
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let this = self.get_mut();
-        let Some(shared) = &this.shared else {
-            return Poll::Ready(Ok(()));
-        };
-        {
-            let mut state = shared.lock();
-            state.outbound.close_writing(&shared.updates);
-            std::task::ready!(state.outbound.poll_flushed(cx.waker()));
-        }
-        this.shared = None;
-        Poll::Ready(Ok(()))
+        let shared = &self.shared;
+        let mut state = shared.lock();
+        state.outbound.close_writing(&shared.data_task);
+        state.outbound.poll_flushed(cx.waker())
     }
 }
 
 impl Drop for RammuxSink {
     fn drop(&mut self) {
-        if let Some(shared) = self.shared.take()
-            && let Some(mut state) = shared.try_lock()
-        {
-            state.outbound.close_writing(&shared.updates);
+        if let Some(mut state) = self.shared.try_lock() {
+            state.outbound.drop_writing(&self.shared.data_task);
         }
     }
 }
 
 /// [`Stream`] half of a [`RammuxDuplex`].
 ///
-/// Dropping it will close reading on the stream.
+/// It yields the data in the order the peer wrote it. Once the peer closed its [`RammuxSink`], the data is
+/// followed by [`None`]. If the stream ended in another way, the data that arrived is followed by one error
+/// that names the reason, and then by [`None`]:
+/// - [`StreamError::PeerAborted`] when the peer dropped its sink without closing it,
+/// - [`StreamError::ConnectionFailed`], [`StreamError::ConnectionDowngraded`] or
+///   [`StreamError::ConnectionDropped`] when the connection ended before the peer closed its sink.
+///   A stream that the peer closed before that still ends with [`None`].
+///
+/// Dropping it stops reading: the data that arrives later is discarded, and writing on the peer's side fails
+/// with [`StreamError::PeerStoppedReading`].
 pub struct RammuxStream {
     id: StreamId,
     /// [`None`] once reading is closed.
@@ -205,18 +201,23 @@ impl fmt::Debug for RammuxStream {
 }
 
 impl Stream for RammuxStream {
-    type Item = Bytes;
+    type Item = Result<Bytes, StreamError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         let Some(shared) = &this.shared else {
             return Poll::Ready(None);
         };
-        let data = std::task::ready!(shared.lock().inbound.poll_read(cx.waker(), &shared.updates));
-        if data.is_none() {
+        let item = std::task::ready!(
+            shared
+                .lock()
+                .inbound
+                .poll_read(cx.waker(), &shared.credit_task)
+        );
+        if item.is_none() {
             this.shared = None;
         }
-        Poll::Ready(data.map(Bytes::from))
+        Poll::Ready(item.map(|result| result.map(Bytes::from)))
     }
 }
 
@@ -225,7 +226,7 @@ impl Drop for RammuxStream {
         if let Some(shared) = self.shared.take()
             && let Some(mut state) = shared.try_lock()
         {
-            state.inbound.close_reading(&shared.updates);
+            state.inbound.close_reading(&shared.credit_task);
         }
     }
 }

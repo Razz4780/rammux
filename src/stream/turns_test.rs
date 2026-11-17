@@ -1,4 +1,4 @@
-//! Tests of the sending rules and the turn queue, with several streams in one selector.
+//! Tests of the sending rules and the turn queue, with several streams in one data selector.
 //!
 //! The streams have the base window of 16 bytes and frames of 8 bytes.
 //! The loop time is 1 s, so the estimates have the time constant of 1 s and the allowances cover 2 s (the paused clock does not move
@@ -6,17 +6,13 @@
 
 use std::{
     num::{NonZeroU16, NonZeroU32},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    task::{Context, Poll},
+    sync::Arc,
     time::Duration,
 };
 
 use async_selector::selector::Selector;
 use bytes::Bytes;
-use futures::{FutureExt, SinkExt, StreamExt, task::ArcWake};
+use futures::{FutureExt, SinkExt, StreamExt};
 use tokio::time::Instant;
 
 use crate::{
@@ -24,8 +20,11 @@ use crate::{
     buffer::Data,
     config::RammuxConfig,
     flow::{Advance, Srtt},
-    stream::{ConnFlow, RammuxDuplex, StreamRef, handle::StreamHandle, updates::StreamUpdates},
-    wire::header::ControlFlags,
+    stream::{
+        ConnFlow, RammuxDuplex, RxFlow, StreamRef,
+        handle::StreamHandle,
+        test_support::{Selectors, fins},
+    },
 };
 
 const CONFIG: RammuxConfig = RammuxConfig {
@@ -38,21 +37,12 @@ const CONFIG: RammuxConfig = RammuxConfig {
     remote_recv_pool: 8,
     advance_grant: 0.0,
     advance_budget: 0.0,
-    ping_bytes: NonZeroU32::new(32).unwrap(),
     ping_interval: Duration::from_secs(1),
     inbound_frame_timeout: Duration::from_secs(2),
 };
 
 /// The loop time is 1 s.
 const SRTT: f64 = 1.0;
-
-struct Woken(AtomicBool);
-
-impl ArcWake for Woken {
-    fn wake_by_ref(arc_self: &Arc<Self>) {
-        arc_self.0.store(true, Ordering::SeqCst);
-    }
-}
 
 struct Strm {
     n: u16,
@@ -63,17 +53,17 @@ struct Strm {
 }
 
 struct Bed {
-    selector: Selector<StreamUpdates, ConnFlow>,
+    selectors: Selectors,
     streams: Vec<Strm>,
 }
 
 impl Bed {
     /// Creates a bed where the peer's pool is `tx_pool` bytes.
     fn new(tx_pool: u32) -> Self {
-        let mut flow = ConnFlow::new(1 << 20, tx_pool);
+        let mut flow = ConnFlow::new(tx_pool);
         flow.srtt = Srtt::of(Duration::from_secs(1));
         Self {
-            selector: Selector::new(flow),
+            selectors: Selectors::new(RxFlow::new(1 << 20), flow),
             streams: Vec::new(),
         }
     }
@@ -91,8 +81,9 @@ impl Bed {
 
     fn add_with_id(&mut self, id: StreamId) -> usize {
         let n = u16::try_from(self.streams.len()).unwrap();
-        let (handle, updates, duplex) = crate::stream::new(id, true, &CONFIG);
-        self.selector.push(updates);
+        let (handle, credit, data, duplex) = crate::stream::new(id, true, &CONFIG);
+        self.selectors.credit.push(credit);
+        self.selectors.data.push(data);
         self.streams.push(Strm {
             n,
             id,
@@ -104,7 +95,7 @@ impl Bed {
     }
 
     fn flow(&self) -> &ConnFlow {
-        self.selector.strategy()
+        self.selectors.data.strategy()
     }
 
     /// Gives the stream an allowance of `bytes`, as if the peer's reader had just read that much.
@@ -131,37 +122,29 @@ impl Bed {
                 NonZeroU32::new(credit),
                 Data::default(),
                 fins(false, false),
-                self.selector.strategy_mut(),
+                self.selectors.data.strategy_mut(),
+                self.selectors.credit.strategy_mut(),
             )
             .unwrap();
     }
 
-    /// Polls until the selector has nothing more, and nobody woke it up.
+    /// Polls until the selectors have nothing more, and nobody woke them up, credit first like the connection.
     /// Returns the (stream, data length) of the updates.
     fn drain(&mut self) -> Vec<(usize, usize)> {
-        let flag = Arc::new(Woken(AtomicBool::new(false)));
-        let waker = futures::task::waker(flag.clone());
-        let mut cx = Context::from_waker(&waker);
         let mut out = Vec::new();
-        loop {
-            flag.0.store(false, Ordering::SeqCst);
-            match self.selector.poll_next_unpin(&mut cx) {
-                Poll::Ready(Some((update, _))) => {
-                    let n = self
-                        .streams
-                        .iter()
-                        .rfind(|s| s.id == update.id)
-                        .map(|s| usize::from(s.n))
-                        .unwrap();
-                    if !update.data.is_empty() {
-                        out.push((n, update.data.len()));
-                    }
-                },
-                Poll::Ready(None) => break,
-                Poll::Pending if flag.0.load(Ordering::SeqCst) => {},
-                Poll::Pending => break,
+        let Self {
+            selectors, streams, ..
+        } = self;
+        selectors.drain(|update, _| {
+            let n = streams
+                .iter()
+                .rfind(|s| s.id == update.id)
+                .map(|s| usize::from(s.n))
+                .unwrap();
+            if !update.data.is_empty() {
+                out.push((n, update.data.len()));
             }
-        }
+        });
         out
     }
 
@@ -377,7 +360,8 @@ async fn a_queued_stream_that_closes_leaves_the_queue() {
             None,
             Data::default(),
             fins(false, true),
-            bed.selector.strategy_mut(),
+            bed.selectors.data.strategy_mut(),
+            bed.selectors.credit.strategy_mut(),
         )
         .unwrap();
     bed.drain();
@@ -409,7 +393,8 @@ async fn fin_read_returns_the_pool_and_wakes_the_queue() {
             None,
             Data::default(),
             fins(false, true),
-            bed.selector.strategy_mut(),
+            bed.selectors.data.strategy_mut(),
+            bed.selectors.credit.strategy_mut(),
         )
         .unwrap();
     assert_eq!(bed.flow().tx_pool.used(), 0);
@@ -428,7 +413,8 @@ async fn credit_larger_than_the_data_in_flight_is_a_violation() {
             NonZeroU32::new(9),
             Data::default(),
             fins(false, false),
-            bed.selector.strategy_mut(),
+            bed.selectors.data.strategy_mut(),
+            bed.selectors.credit.strategy_mut(),
         )
         .unwrap_err();
 }
@@ -486,7 +472,8 @@ async fn a_reused_stream_id_does_not_confuse_the_queue() {
             None,
             Data::default(),
             fins(true, true),
-            bed.selector.strategy_mut(),
+            bed.selectors.data.strategy_mut(),
+            bed.selectors.credit.strategy_mut(),
         )
         .unwrap();
     bed.drain();
@@ -510,12 +497,12 @@ async fn a_base_window_smaller_than_a_frame_works() {
         remote_recv_window: NonZeroU32::new(5).unwrap(),
         ..CONFIG
     };
-    let mut flow = ConnFlow::new(1 << 20, 0);
+    let mut flow = ConnFlow::new(0);
     flow.srtt = Srtt::of(Duration::from_secs(1));
     let mut selector = Selector::new(flow);
-    let (handle, updates, mut duplex) =
+    let (handle, _credit, data, mut duplex) =
         crate::stream::new(StreamId::from_be_bytes([0, 0]), true, &config);
-    selector.push(updates);
+    selector.push(data);
     duplex
         .feed(Bytes::from(vec![1; 20]))
         .now_or_never()
@@ -530,18 +517,11 @@ async fn a_base_window_smaller_than_a_frame_works() {
             Data::default(),
             fins(false, false),
             selector.strategy_mut(),
+            &mut RxFlow::new(1 << 20),
         )
         .unwrap();
     let (update, _) = selector.next().await.unwrap();
     assert_eq!(update.data.len(), 5);
-}
-
-fn fins(fin_write: bool, fin_read: bool) -> ControlFlags {
-    ControlFlags {
-        syn: false,
-        fin_read,
-        fin_write,
-    }
 }
 
 // The advance. The pool is 64 bytes, a stream draws 16 at most per episode (g = 1/4)
@@ -553,7 +533,7 @@ impl Bed {
     /// Creates a bed with the advance of `grant` and `budget` fractions of the pool.
     fn with_advance(grant: f32, budget: f32) -> Self {
         let mut bed = Self::new(POOL);
-        bed.selector.strategy_mut().advance = Advance::new(POOL, grant, budget);
+        bed.selectors.data.strategy_mut().advance = Advance::new(POOL, grant, budget);
         bed
     }
 
@@ -577,7 +557,8 @@ impl Bed {
                 None,
                 Data::default(),
                 fins(false, true),
-                self.selector.strategy_mut(),
+                self.selectors.data.strategy_mut(),
+                self.selectors.credit.strategy_mut(),
             )
             .unwrap();
     }
@@ -771,7 +752,8 @@ async fn a_reused_stream_id_starts_without_the_advance_of_the_old_stream() {
             None,
             Data::default(),
             fins(true, true),
-            bed.selector.strategy_mut(),
+            bed.selectors.data.strategy_mut(),
+            bed.selectors.credit.strategy_mut(),
         )
         .unwrap();
     bed.drain();

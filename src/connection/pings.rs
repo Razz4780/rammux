@@ -7,9 +7,16 @@ use std::{
 };
 
 use futures::FutureExt;
-use tokio::time::Sleep;
+use tokio::time::{Instant, Sleep};
 
 use crate::wire::header::Pong;
+
+/// The shortest wait between `PING`s while there is no round trip sample: the wait after the first `PING`.
+/// Every later one doubles it.
+pub const PING_BACKOFF_START: Duration = Duration::from_millis(10);
+
+/// The shortest wait between `PING`s that ride on data, however small the round trip time is.
+pub const PING_GAP_MIN: Duration = Duration::from_millis(1);
 
 /// Our side of the `PING`/`PONG` exchange: the `PING`s we send and the `PONG`s we owe.
 ///
@@ -30,9 +37,9 @@ pub struct Pings {
 
 impl Pings {
     /// Creates the exchange of a new connection. The first `PING` is due immediately.
-    pub fn new(interval: Duration, ping_bytes: u32) -> Self {
+    pub fn new(interval: Duration) -> Self {
         Self {
-            schedule: PingSchedule::new(interval, ping_bytes),
+            schedule: PingSchedule::new(interval),
             owed_pong: None,
         }
     }
@@ -45,19 +52,23 @@ impl Pings {
     /// Returns what the next outgoing frame carries of the exchange: the `PONG` we owe,
     /// and whether it carries a `PING`.
     ///
-    /// Taking a `PING` records that it is sent.
-    pub fn take_frame_part(&mut self, cx: &mut Context<'_>) -> (Option<Pong>, bool) {
+    /// `carries_flow` says whether the frame carries `DATA` or `WINDOW`, and `srtt` is the smoothed
+    /// round trip time, if there is a sample. Taking a `PING` records that it is sent at `now`.
+    pub fn take_frame_part(
+        &mut self,
+        cx: &mut Context<'_>,
+        now: Instant,
+        srtt: Option<Duration>,
+        carries_flow: bool,
+    ) -> (Option<Pong>, bool) {
         let pong = self.owed_pong.take();
-        let ping = self.schedule.poll_due(cx).is_ready();
+        // The interval is polled even when the piggyback rule decides, so that the wake-up is always armed.
+        let on_interval = self.schedule.poll_due(cx).is_ready();
+        let ping = on_interval || (carries_flow && self.schedule.piggyback_due(now, srtt));
         if ping {
-            self.schedule.sent();
+            self.schedule.sent(now);
         }
         (pong, ping)
-    }
-
-    /// Records that `DATA` is being sent.
-    pub fn data_sent(&mut self, len: usize) {
-        self.schedule.data_sent(len);
     }
 
     /// Returns the `PONG` we owe.
@@ -69,27 +80,27 @@ impl Pings {
 
 /// Decides when to send `PING`s.
 ///
-/// A `PING` is due after every `ping_bytes` of `DATA` written, and after every `interval`.
-/// The state of the exchange is not tracked, see `PROTOCOL.md`.
+/// A `PING` is due every `interval`. A frame that carries `DATA` or `WINDOW` may also carry one, if
+/// enough time has passed since the last `PING`. The state of the exchange is not tracked, see `PROTOCOL.md`.
 pub struct PingSchedule {
-    /// Elapses when the next `PING` is due, no matter how much data is written.
+    /// Elapses when the next `PING` is due, no matter what is written.
     sleep: Pin<Box<Sleep>>,
     /// Time between `PING`s.
     interval: Duration,
-    /// How many bytes of data trigger a `PING`.
-    ping_bytes: u32,
-    /// Bytes of `DATA` written since the last `PING`.
-    unpinged_bytes: u32,
+    /// When the last `PING` was sent, if any.
+    last: Option<Instant>,
+    /// How many `PING`s were sent. Saturates.
+    sent: u32,
 }
 
 impl PingSchedule {
     /// Creates a new schedule. The first `PING` is due immediately.
-    pub fn new(interval: Duration, ping_bytes: u32) -> Self {
+    pub fn new(interval: Duration) -> Self {
         Self {
             sleep: Box::pin(tokio::time::sleep(Duration::ZERO)),
             interval,
-            ping_bytes,
-            unpinged_bytes: 0,
+            last: None,
+            sent: 0,
         }
     }
 
@@ -97,45 +108,68 @@ impl PingSchedule {
     ///
     /// When this returns [`Poll::Ready`], the caller must send the `PING` and call [`Self::sent`].
     pub fn poll_due(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if self.unpinged_bytes >= self.ping_bytes {
-            return Poll::Ready(());
-        }
         self.sleep.poll_unpin(cx)
     }
 
-    /// Records that a `PING` is being sent.
-    pub fn sent(&mut self) {
-        self.unpinged_bytes = 0;
-        self.sleep.as_mut().reset(crate::deadline(self.interval));
+    /// Returns whether a frame that carries `DATA` or `WINDOW` may carry a `PING` at `now`.
+    ///
+    /// The wait since the last `PING` is an eighth of the round trip time, so the `PING`s cost a bounded
+    /// share of the frames, and are still dense enough to follow the round trip time. With no sample
+    /// yet, the wait doubles with every `PING`, starting at [`PING_BACKOFF_START`].
+    pub fn piggyback_due(&self, now: Instant, srtt: Option<Duration>) -> bool {
+        let Some(last) = self.last else {
+            return true;
+        };
+        let gap = match srtt {
+            Some(srtt) => (srtt / 8).max(PING_GAP_MIN),
+            None => {
+                let doublings = self.sent.saturating_sub(1).min(31);
+                PING_BACKOFF_START.saturating_mul(1 << doublings)
+            },
+        };
+        now.saturating_duration_since(last) >= gap
     }
 
-    /// Records that `DATA` is being sent.
-    pub fn data_sent(&mut self, len: usize) {
-        let len = u32::try_from(len).unwrap_or(u32::MAX);
-        self.unpinged_bytes = self.unpinged_bytes.saturating_add(len);
+    /// Records that a `PING` is being sent at `now`. It restarts the interval and the gap.
+    pub fn sent(&mut self, now: Instant) {
+        self.last = Some(now);
+        self.sent = self.sent.saturating_add(1);
+        self.sleep.as_mut().reset(crate::deadline(self.interval));
     }
 }
 
 #[cfg(test)]
 mod test {
-    use std::time::Duration;
-
-    use std::task::{Context, Waker};
+    use std::{
+        task::{Context, Waker},
+        time::Duration,
+    };
 
     use futures::future::poll_fn;
     use tokio::time::Instant;
 
-    use crate::connection::pings::PingSchedule;
+    use crate::connection::pings::{PingSchedule, Pings};
 
-    fn is_due(schedule: &mut PingSchedule) -> bool {
-        schedule
-            .poll_due(&mut Context::from_waker(Waker::noop()))
-            .is_ready()
+    /// Asks for the `PING` of a frame at the current time.
+    fn ping(pings: &mut Pings, srtt: Option<Duration>, carries_flow: bool) -> bool {
+        pings
+            .take_frame_part(
+                &mut Context::from_waker(Waker::noop()),
+                Instant::now(),
+                srtt,
+                carries_flow,
+            )
+            .1
+    }
+
+    /// Sends a `PING` on a flow frame, which must be allowed.
+    fn first_ping(pings: &mut Pings) {
+        assert!(ping(pings, None, true));
     }
 
     #[tokio::test(start_paused = true)]
     async fn pings_on_interval() {
-        let mut schedule = PingSchedule::new(Duration::from_secs(5), 1000);
+        let mut schedule = PingSchedule::new(Duration::from_secs(5));
         let now = Instant::now();
         for ready_at in [
             now,
@@ -144,37 +178,93 @@ mod test {
         ] {
             poll_fn(|cx| schedule.poll_due(cx)).await;
             assert_eq!(Instant::now(), ready_at);
-            schedule.sent();
+            schedule.sent(Instant::now());
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn pings_on_bytes() {
-        let mut schedule = PingSchedule::new(Duration::from_secs(5), 1000);
-        poll_fn(|cx| schedule.poll_due(cx)).await;
-        schedule.sent();
+    async fn the_first_flow_frame_carries_a_ping() {
+        // The piggyback rule alone, without the interval, which is due at once too.
+        let schedule = PingSchedule::new(Duration::from_secs(5));
+        assert!(schedule.piggyback_due(Instant::now(), None));
+        assert!(schedule.piggyback_due(Instant::now(), Some(Duration::from_millis(80))));
 
-        let now = Instant::now();
-        schedule.data_sent(999);
-        assert!(!is_due(&mut schedule));
-        schedule.data_sent(1);
-        poll_fn(|cx| schedule.poll_due(cx)).await;
-        assert_eq!(Instant::now(), now);
-        schedule.sent();
-        assert!(!is_due(&mut schedule), "the bytes start over");
-
-        // Sending a ping postpones the next one on the clock.
-        poll_fn(|cx| schedule.poll_due(cx)).await;
-        assert_eq!(Instant::now(), now + Duration::from_secs(5));
+        let mut pings = Pings::new(Duration::from_secs(5));
+        assert!(ping(&mut pings, None, true));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_byte_count_saturates() {
-        let mut schedule = PingSchedule::new(Duration::from_secs(5), u32::MAX);
-        poll_fn(|cx| schedule.poll_due(cx)).await;
-        schedule.sent();
-        schedule.data_sent(usize::MAX);
-        schedule.data_sent(1);
-        assert!(is_due(&mut schedule));
+    async fn frames_without_flow_do_not_piggyback() {
+        let mut pings = Pings::new(Duration::from_secs(2 * 3600));
+        first_ping(&mut pings);
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert!(!ping(&mut pings, None, false));
+        assert!(ping(&mut pings, None, true));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_gap_backs_off_before_the_first_sample() {
+        let mut pings = Pings::new(Duration::from_secs(3600));
+        first_ping(&mut pings);
+        for gap_ms in [10, 20, 40] {
+            tokio::time::advance(Duration::from_millis(gap_ms - 1)).await;
+            assert!(!ping(&mut pings, None, true), "{gap_ms} ms");
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert!(ping(&mut pings, None, true), "{gap_ms} ms");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_backoff_saturates() {
+        let interval = Duration::from_secs(5);
+        let mut pings = Pings::new(interval);
+        for _ in 0..200 {
+            assert!(ping(&mut pings, None, false));
+            tokio::time::advance(interval).await;
+        }
+        assert!(ping(&mut pings, None, false), "the interval still fires");
+        // The gap after 200 `PING`s is evaluated here, and it is long.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!ping(&mut pings, None, true));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sample_replaces_the_backoff() {
+        let mut pings = Pings::new(Duration::from_secs(3600));
+        first_ping(&mut pings);
+        for gap_ms in [10, 20] {
+            tokio::time::advance(Duration::from_millis(gap_ms)).await;
+            assert!(ping(&mut pings, None, true));
+        }
+        let srtt = Some(Duration::from_millis(80));
+        tokio::time::advance(Duration::from_millis(9)).await;
+        assert!(!ping(&mut pings, srtt, true));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(ping(&mut pings, srtt, true));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_gap_has_a_floor() {
+        let mut pings = Pings::new(Duration::from_secs(3600));
+        first_ping(&mut pings);
+        let srtt = Some(Duration::from_micros(80));
+        tokio::time::advance(Duration::from_micros(999)).await;
+        assert!(!ping(&mut pings, srtt, true));
+        tokio::time::advance(Duration::from_micros(1)).await;
+        assert!(ping(&mut pings, srtt, true));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_piggyback_ping_postpones_the_interval() {
+        let mut pings = Pings::new(Duration::from_secs(5));
+        let start = Instant::now();
+        first_ping(&mut pings);
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(ping(&mut pings, None, true));
+        tokio::time::advance(Duration::from_millis(4999)).await;
+        assert!(!ping(&mut pings, None, false), "+7.999 s");
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(ping(&mut pings, None, false), "+8 s");
+        assert_eq!(Instant::now(), start + Duration::from_secs(8));
     }
 }

@@ -101,7 +101,7 @@ struct PeerConfig {
     ///
     /// Final config will use the smaller value between this (we don't want to violate peer's resource limits)
     /// and [`RammuxConfig::max_outbound_streams`] (we don't want to violate local resource limits).
-    pub max_inbound_streams: u32,
+    pub max_inbound_streams: u16,
     /// Size of the base receive window of every stream we grant.
     pub recv_window: u32,
     /// Size of the pool of receive window that all streams we receive share.
@@ -109,15 +109,15 @@ struct PeerConfig {
 }
 
 impl PeerConfig {
-    const LEN: usize = 15;
+    const LEN: usize = 13;
 
     fn encode(&self) -> [u8; Self::LEN] {
         let mut result = [0_u8; Self::LEN];
         result[0] = self.version;
         result[1..3].copy_from_slice(&self.frame_limit.get().to_be_bytes());
-        result[3..7].copy_from_slice(&self.max_inbound_streams.to_be_bytes());
-        result[7..11].copy_from_slice(&self.recv_window.to_be_bytes());
-        result[11..15].copy_from_slice(&self.recv_pool.to_be_bytes());
+        result[3..5].copy_from_slice(&self.max_inbound_streams.to_be_bytes());
+        result[5..9].copy_from_slice(&self.recv_window.to_be_bytes());
+        result[9..13].copy_from_slice(&self.recv_pool.to_be_bytes());
         result
     }
 
@@ -125,9 +125,9 @@ impl PeerConfig {
         let version = buffer[0];
         let frame_limit = u16::from_be_bytes([buffer[1], buffer[2]]);
         let frame_limit = NonZeroU16::new(frame_limit).expect("received non-positive frame limit");
-        let max_inbound_streams = u32::from_be_bytes(buffer[3..7].try_into().unwrap());
-        let recv_window = u32::from_be_bytes(buffer[7..11].try_into().unwrap());
-        let recv_pool = u32::from_be_bytes(buffer[11..15].try_into().unwrap());
+        let max_inbound_streams = u16::from_be_bytes([buffer[3], buffer[4]]);
+        let recv_window = u32::from_be_bytes(buffer[5..9].try_into().unwrap());
+        let recv_pool = u32::from_be_bytes(buffer[9..13].try_into().unwrap());
         Self {
             version,
             frame_limit,

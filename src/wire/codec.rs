@@ -299,7 +299,10 @@ mod tests {
     use bytes::Bytes;
     use futures::{FutureExt, SinkExt, StreamExt};
     use rstest::rstest;
-    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+    use tokio::{
+        io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
+        time::Instant,
+    };
 
     use crate::{
         StreamId,
@@ -347,6 +350,9 @@ mod tests {
         vectored: bool,
         refuse: Arc<Mutex<bool>>,
         max_accept: usize,
+        /// Refuses every write that follows an accepted one, so that each poll writes once.
+        one_write_per_poll: bool,
+        accepted: bool,
     }
 
     impl MockIo {
@@ -358,12 +364,17 @@ mod tests {
                 vectored,
                 refuse: refuse.clone(),
                 max_accept: usize::MAX,
+                one_write_per_poll: false,
+                accepted: false,
             };
             (io, writes, refuse)
         }
 
         fn write(&mut self, cx: &mut Context<'_>, bufs: &[&[u8]]) -> Poll<io::Result<usize>> {
-            if std::mem::take(&mut *self.refuse.lock().unwrap()) {
+            let refuse = std::mem::take(&mut *self.refuse.lock().unwrap())
+                || (self.one_write_per_poll && self.accepted);
+            self.accepted = !refuse;
+            if refuse {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
@@ -469,6 +480,7 @@ mod tests {
                             syn: true,
                             fin_read: true,
                             fin_write: true,
+                            abort: true,
                         },
                         5,
                         b"eleven byte",
@@ -491,27 +503,41 @@ mod tests {
             },
             async {
                 for sent in frames() {
-                    let DecodedFrame::Frame(received) = codec_2.next().await.unwrap().unwrap()
-                    else {
-                        assert!(sent.term);
-                        continue;
-                    };
-                    assert_eq!(received.header.ping.is_some(), sent.ping);
-                    assert_eq!(received.header.pong, sent.pong);
-                    match sent.stream {
-                        None => assert!(received.header.stream.is_none()),
-                        Some(sent) => {
-                            let stream = received.header.stream.unwrap();
-                            assert_eq!(stream.id, sent.id);
-                            assert_eq!(stream.flags, sent.flags);
-                            assert_eq!(stream.credit.map_or(0, NonZeroU32::get), sent.credit);
-                            assert_eq!(received.data.as_ref(), sent.data.as_ref());
-                        },
-                    }
+                    let received = codec_2.next().await.unwrap().unwrap();
+                    assert_same(&sent, &received);
                 }
                 assert!(codec_2.next().await.is_none());
             },
         );
+    }
+
+    /// Checks that the received frame is the sent one (except for `t_ping`, which the encoder sets).
+    fn assert_same(sent: &OutFrame, received: &DecodedFrame) {
+        let DecodedFrame::Frame(received) = received else {
+            assert!(sent.term, "unexpected TERM instead of {sent:?}");
+            return;
+        };
+        assert!(!sent.term, "expected TERM, got {received:?}");
+        assert_eq!(received.header.ping.is_some(), sent.ping);
+        assert_eq!(received.header.pong, sent.pong);
+        match &sent.stream {
+            None => assert!(received.header.stream.is_none()),
+            Some(sent) => {
+                let stream = received.header.stream.unwrap();
+                assert_eq!(stream.id, sent.id);
+                assert_eq!(stream.flags, sent.flags);
+                assert_eq!(stream.credit.map_or(0, NonZeroU32::get), sent.credit);
+                assert_eq!(received.data.as_ref(), sent.data.as_ref());
+            },
+        }
+    }
+
+    /// Checks that the received frames are the sent ones, in order.
+    fn assert_all_same(sent: &[OutFrame], received: &[DecodedFrame]) {
+        assert_eq!(sent.len(), received.len());
+        for (sent, received) in sent.iter().zip(received) {
+            assert_same(sent, received);
+        }
     }
 
     /// Feeds raw bytes to a codec and returns the first result.
@@ -523,8 +549,9 @@ mod tests {
     }
 
     #[rstest]
-    #[case::reserved_bits(&[0x02, 0x10, 0, 1, 0, 1, b'a'])]
-    #[case::reserved_bit_0x0100(&[0x01, 0x10, 0, 1, 0, 1, b'a'])]
+    #[case::reserved_bits(&[0x04, 0x10, 0, 1, 0, 1, b'a'])]
+    #[case::reserved_bit_0x0200(&[0x02, 0x10, 0, 1, 0, 1, b'a'])]
+    #[case::abort_without_fin_write(&[0x01, 0x10, 0, 1, 0, 1, b'a'])]
     #[case::high_reserved_bits(&[0x80, 0x10, 0, 1, 0, 1, b'a'])]
     #[case::no_flags(&[0x00, 0x00])]
     #[case::term_and_ping(&[0x00, 0xA0, 0, 0, 0, 1])]
@@ -695,5 +722,121 @@ mod tests {
         send.await.unwrap();
         let bytes = writes.lock().unwrap().concat();
         assert_eq!(t_ping_of(&bytes), 10);
+    }
+
+    fn window(id: u16) -> OutFrame {
+        stream_frame(id, ControlFlags::default(), 1000 + u32::from(id), b"")
+    }
+
+    fn ping() -> OutFrame {
+        OutFrame {
+            ping: true,
+            ..Default::default()
+        }
+    }
+
+    /// Returns the `t_ping`s of the given frames.
+    fn pings_of(frames: &[DecodedFrame]) -> Vec<u32> {
+        frames
+            .iter()
+            .filter_map(|frame| match frame {
+                DecodedFrame::Frame(frame) => frame.header.ping,
+                DecodedFrame::Terminate => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_ping_carries_the_time_of_the_write_that_takes_its_first_byte() {
+        let (mut io, writes, _) = MockIo::new(true);
+        io.max_accept = 4;
+        io.one_write_per_poll = true;
+        let mut codec = codec(io);
+        let clock = codec.clock();
+        tokio::time::advance(Duration::from_millis(1)).await;
+
+        // 8 bytes of `WINDOW`, 6 of `PING`, then the `DATA` with a `PING`.
+        let sent = || {
+            vec![
+                window(1),
+                ping(),
+                OutFrame {
+                    ping: true,
+                    ..stream_frame(2, ControlFlags::default(), 0, b"payload")
+                },
+            ]
+        };
+        let mut send = Box::pin(async {
+            for frame in sent() {
+                codec.feed(frame).await.unwrap();
+            }
+            codec.flush().await.unwrap();
+        });
+        // 4 bytes per write, 100 us apart.
+        let mut writes_at = Vec::new();
+        loop {
+            writes_at.push(Instant::now());
+            if send.as_mut().now_or_never().is_some() {
+                break;
+            }
+            tokio::time::advance(Duration::from_micros(100)).await;
+        }
+
+        let bytes = writes.lock().unwrap().concat();
+        let frames = decode_all(&bytes).await;
+        assert_all_same(&sent(), &frames);
+        // Each frame waits for the one before. The `PING` is first tried after the second write, which ends
+        // the `WINDOW`, and the third write takes its first bytes. The `DATA` is first tried after the fourth,
+        // which ends the `PING`, and the fifth takes its first bytes.
+        assert_eq!(
+            pings_of(&frames),
+            [clock.micros(writes_at[2]), clock.micros(writes_at[4])]
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn partial_writes_keep_the_frames_intact(#[values(true, false)] vectored: bool) {
+        let sent = || {
+            vec![
+                window(1),
+                ping(),
+                OutFrame {
+                    ping: true,
+                    ..stream_frame(2, syn(), 0, b"hello")
+                },
+                OutFrame {
+                    pong: Some(Pong { t_echo: 5 }),
+                    ..Default::default()
+                },
+                stream_frame(
+                    3,
+                    ControlFlags {
+                        fin_write: true,
+                        ..Default::default()
+                    },
+                    0,
+                    b"",
+                ),
+                OutFrame {
+                    ping: true,
+                    ..window(4)
+                },
+                stream_frame(5, ControlFlags::default(), 7, b"eleven byte"),
+                window(6),
+                OutFrame::terminate(),
+            ]
+        };
+        let (mut io, writes, _) = MockIo::new(vectored);
+        io.max_accept = 1;
+        let mut codec = codec(io);
+        for frame in sent() {
+            codec.feed(frame).await.unwrap();
+        }
+        codec.flush().await.unwrap();
+
+        let writes = writes.lock().unwrap().clone();
+        assert!(writes.iter().all(|write| write.len() == 1));
+        assert_all_same(&sent(), &decode_all(&writes.concat()).await);
     }
 }

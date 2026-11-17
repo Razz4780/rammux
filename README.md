@@ -24,7 +24,7 @@ receiver cannot see what the sender has waiting. Depending on the implementation
 
 In rammux the *sender* decides, for every frame, which stream may use the memory that the receiver offers.
 Streams get equal shares, a latecomer catches up within a few round trips, and a stream whose reader is slow or
-stalled leaves the bandwidth to the others. The cost is about 5% more packets on connections that carry data
+stalled leaves the bandwidth to the others. The cost is some more small packets on connections that carry data
 in one direction only.
 
 [TRANSIT_CONTROL.md](TRANSIT_CONTROL.md) explains how it works, with measurements against hyper and yamux.
@@ -33,7 +33,7 @@ in one direction only.
 
 ```toml
 [dependencies]
-rammux = "1"
+rammux = "0.1"
 bytes = "1"
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }
@@ -47,6 +47,7 @@ use futures::{SinkExt, StreamExt};
 use rammux::{
     config::{RammuxConfig, RammuxRole},
     connection::{RammuxConnection, RammuxProgress},
+    stream::StreamError,
 };
 
 #[tokio::main]
@@ -62,8 +63,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             match server.progress().await? {
                 RammuxProgress::Inbound(stream) => {
+                    // Writes back what it reads, and closes its sink when the client closes its own.
                     let (sink, stream) = stream.into_split();
-                    tokio::spawn(stream.map(Ok).forward(sink));
+                    tokio::spawn(stream.forward(sink));
                 },
                 // Completes the downgrade, and returns the transport.
                 RammuxProgress::Downgraded(downgraded) => break downgraded.await,
@@ -72,13 +74,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // A stream is a `Sink` and a `Stream` of `Bytes`. It can move to another task.
+    // A stream is a `Sink` of `Bytes` and a `Stream` of `Result<Bytes, StreamError>`.
+    // It can move to another task.
     let mut stream = client
         .try_start_outbound()?
         .expect("the stream limit is not reached");
     let mut echo = tokio::spawn(async move {
         stream.send(Bytes::from_static(b"hello")).await?;
-        Ok::<_, std::io::Error>(stream.next().await)
+        // Only closing the sink ends the stream cleanly. The server's reader ends, and so does the echo.
+        stream.close().await?;
+        let mut reply = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            reply.extend_from_slice(&chunk?);
+        }
+        Ok::<_, StreamError>(reply)
     });
 
     // Nothing runs in the background: streams make progress only while the connection is polled.
@@ -88,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             progress = client.progress() => { progress?; },
         }
     };
-    assert_eq!(reply.as_deref(), Some(&b"hello"[..]));
+    assert_eq!(reply, b"hello");
 
     // End the session, and take the transports back.
     let _client_io = client.downgrade()?.await?;
@@ -116,11 +125,20 @@ Either peer starts a stream with `RammuxConnection::try_start_outbound`, up to t
 A stream is a `RammuxDuplex`:
 
 - a `futures::Sink<bytes::Bytes>` for writing,
-- a `futures::Stream<Item = bytes::Bytes>` for reading.
+- a `futures::Stream<Item = Result<bytes::Bytes, StreamError>>` for reading.
 
-It can move to another task, and `into_split` separates the two halves. The directions close independently:
-closing or dropping the sink ends the stream for the peer's reader, and dropping the reader tells the peer's
-writer to stop. Flushing the sink waits until the connection has taken the data, not until the peer has read it.
+It can move to another task, and `into_split` separates the two halves. Flushing the sink waits until the
+connection has taken the data, not until the peer has read it.
+
+The directions close independently, and the reader learns how the writer on the other side ended:
+
+- Closing the sink is the only clean end. The peer's reader gets the data, and then `None`.
+- Dropping the sink without closing it aborts the stream. The data that the connection has not taken yet is
+  discarded, and the peer's reader gets the data that arrived, then `StreamError::PeerAborted`, then `None`.
+- Dropping the reader tells the peer's writer to stop: its sink fails with `StreamError::PeerStoppedReading`.
+- When the connection ends, so do the streams that are still open. Their readers get the data that arrived,
+  then `StreamError::ConnectionFailed`, `ConnectionDowngraded` or `ConnectionDropped`, and their sinks fail
+  with the same error.
 
 ### Configuration
 
@@ -141,7 +159,7 @@ Every stream may have `local_recv_window` bytes waiting to be read (64 KiB by de
 connection share `local_recv_pool` bytes on top of that (4 MiB by default). The memory that a connection uses
 for received data is bounded by these two.
 
-The pool is also what limits the speed of the connection and the queue it builds: about pne BDP is enough for full speed, and a smaller pool keeps interactive streams more responsive
+The pool is also what limits the speed of the connection and the queue it builds: about one BDP is enough for full speed, and a smaller pool keeps interactive streams more responsive
 next to bulk transfers. See [TRANSIT_CONTROL.md](TRANSIT_CONTROL.md#choosing-the-settings).
 
 ### Keepalive
@@ -156,8 +174,13 @@ rammux never closes the transport. `RammuxConnection::downgrade` ends the sessio
 and returns the transport, ready for whatever comes next. The peer learns about it from
 `RammuxProgress::Downgraded`, and gets its transport back the same way.
 
-A downgrade ends all streams, so finish them first: data that the connection has not sent yet is lost.
-Dropping the connection instead ends everything abruptly, and the peer sees an error.
+A downgrade ends the streams that are still open, on both sides, with `StreamError::ConnectionDowngraded`.
+The side that calls `downgrade` loses only the data that its connection has not sent yet: a stream whose sink
+completed its close before the call ends cleanly for the peer's reader. What the peer sent and this side had not
+received at the call is not delivered, even from sinks that the peer closed. So close your sinks and read your
+streams to the end before you call `downgrade`. Dropping the connection instead ends everything abruptly: its
+streams end with `StreamError::ConnectionDropped`, and the peer's connection fails with an error, which ends
+the peer's streams with `StreamError::ConnectionFailed`.
 
 ## Requirements
 
@@ -182,4 +205,5 @@ The [examples directory](https://github.com/Razz4780/rammux/tree/main/examples) 
 - [PROTOCOL.md](PROTOCOL.md): the wire protocol
 - [TRANSIT_CONTROL.md](TRANSIT_CONTROL.md): how streams share the connection, compared with HTTP/2 and yamux
 
-A new major version of the crate may change the wire protocol: both peers must run the same major version.
+While the crate is at 0.x, a new minor version may change the wire protocol: both peers must run the same
+minor version, such as 0.1.

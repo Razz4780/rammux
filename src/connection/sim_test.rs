@@ -47,7 +47,12 @@ struct DirState {
     /// Bytes waiting to be serialized: (finish, len).
     queue: VecDeque<(Instant, usize)>,
     reader: Option<Waker>,
+    /// Writes of fewer than [`SHORT_WRITE`] bytes: the ones that carry no data.
+    short_writes: u64,
 }
+
+/// Writes shorter than this carry only control frames.
+const SHORT_WRITE: usize = 100;
 
 impl Dir {
     fn new(mbit: f64, delay: Duration) -> Arc<Self> {
@@ -70,6 +75,11 @@ impl Dir {
             inner.queue.pop_front();
         }
         inner.queue.iter().map(|(_, len)| len).sum()
+    }
+
+    /// Writes of fewer than [`SHORT_WRITE`] bytes so far.
+    fn short_writes(&self) -> u64 {
+        self.inner.lock().unwrap().short_writes
     }
 }
 
@@ -107,6 +117,9 @@ impl AsyncWrite for End {
         let finish = start + Duration::from_secs_f64(buf.len() as f64 / dir.rate);
         inner.free_at = Some(finish);
         inner.queue.push_back((finish, buf.len()));
+        if buf.len() < SHORT_WRITE {
+            inner.short_writes += 1;
+        }
         inner
             .wire
             .push_back((finish + dir.delay, Bytes::copy_from_slice(buf)));
@@ -189,21 +202,24 @@ async fn drive(
 
 struct Rig {
     open: mpsc::UnboundedSender<Open>,
+    server_open: mpsc::UnboundedSender<Open>,
     client_stats: Arc<Mutex<RammuxStats>>,
     forward: Arc<Dir>,
-    /// Bytes read by the server, per stream, in the order of opening.
+    backward: Arc<Dir>,
+    /// Bytes read by the receiver, per stream, in the order of opening.
     read: Vec<Arc<AtomicU64>>,
     server_streams: mpsc::UnboundedReceiver<RammuxDuplex>,
+    client_streams: mpsc::UnboundedReceiver<RammuxDuplex>,
 }
 
 impl Rig {
     fn new(mbit: f64, rtt: Duration, config: RammuxConfig) -> Self {
-        let (client_io, server_io, forward, _backward) = link(mbit, rtt / 2);
+        let (client_io, server_io, forward, backward) = link(mbit, rtt / 2);
         let client = RammuxConnection::new(RammuxRole::Client, client_io, config.clone()).unwrap();
         let server = RammuxConnection::new(RammuxRole::Server, server_io, config).unwrap();
         let (open, open_rx) = mpsc::unbounded_channel();
-        let (_server_open, server_open_rx) = mpsc::unbounded_channel();
-        let (client_in, _client_in_rx) = mpsc::unbounded_channel();
+        let (server_open, server_open_rx) = mpsc::unbounded_channel();
+        let (client_in, client_streams) = mpsc::unbounded_channel();
         let (server_in, server_streams) = mpsc::unbounded_channel();
         let client_stats = Arc::new(Mutex::new(RammuxStats::default()));
         tokio::spawn(drive(client, open_rx, client_in, client_stats.clone()));
@@ -213,14 +229,15 @@ impl Rig {
             server_in,
             Arc::new(Mutex::new(RammuxStats::default())),
         ));
-        std::mem::forget(_server_open);
-        std::mem::forget(_client_in_rx);
         Self {
             open,
+            server_open,
             client_stats,
             forward,
+            backward,
             read: Vec::new(),
             server_streams,
+            client_streams,
         }
     }
 
@@ -245,7 +262,8 @@ impl Rig {
         let read = counter.clone();
         tokio::spawn(async move {
             let (_sink, mut stream) = server_stream.into_split();
-            while let Some(data) = stream.next().await {
+            // The writer never closes: the stream ends with the connection.
+            while let Some(Ok(data)) = stream.next().await {
                 read.fetch_add(data.len() as u64, Ordering::Relaxed);
             }
         });
@@ -278,11 +296,36 @@ impl Rig {
         self.read.push(counter.clone());
         tokio::spawn(async move {
             let (_sink, mut stream) = server_stream.into_split();
-            while let Some(data) = stream.next().await {
+            // The writer never closes: the stream ends with the connection.
+            while let Some(Ok(data)) = stream.next().await {
                 counter.fetch_add(data.len() as u64, Ordering::Relaxed);
                 if stall_at.is_some_and(|at| Instant::now() >= at) {
                     std::future::pending::<()>().await;
                 }
+            }
+        });
+    }
+
+    /// Starts a bulk download: the server writes as fast as it can, the client reads.
+    async fn bulk_download(&mut self) {
+        let (tx, rx) = oneshot::channel();
+        self.server_open.send(tx).unwrap();
+        let stream = rx.await.unwrap();
+        let (mut sink, _stream) = stream.into_split();
+        tokio::spawn(async move {
+            let chunk = Bytes::from(vec![5_u8; 64 * 1024]);
+            while sink.send(chunk.clone()).await.is_ok() {}
+            drop(_stream);
+        });
+
+        let client_stream = self.client_streams.recv().await.unwrap();
+        let counter = Arc::new(AtomicU64::new(0));
+        self.read.push(counter.clone());
+        tokio::spawn(async move {
+            let (_sink, mut stream) = client_stream.into_split();
+            // The writer never closes: the stream ends with the connection.
+            while let Some(Ok(data)) = stream.next().await {
+                counter.fetch_add(data.len() as u64, Ordering::Relaxed);
             }
         });
     }
@@ -431,7 +474,7 @@ async fn talk(stream: RammuxDuplex, bytes: usize) -> usize {
     });
     let mut read = 0;
     while let Some(data) = stream.next().await {
-        read += data.len();
+        read += data.unwrap().len();
     }
     writer.await.unwrap();
     read
@@ -640,4 +683,73 @@ async fn a_new_stream_starts_within_the_grant_with_the_advance() {
     for pair in per_loop.windows(2).take(3) {
         assert!(pair[1] >= 1.8 * pair[0], "{per_loop:?}");
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_download_keeps_its_share_next_to_many_uploads() {
+    // The client sends the data of the uploads and the window updates of the download on the same link.
+    // This link buffers without limit, so the queue builds up in the link and not in the muxer, and the
+    // order in which the muxer writes its frames hardly matters here: measured 11.0 Mbit/s for the download
+    // both when window updates and data shared one round robin, and since window updates go first.
+    // The download is limited by its loop, which includes the queue of the uploads.
+    let mut rig = Rig::new(MBIT, RTT, config());
+    let uploads = 16;
+    for _ in 0..uploads {
+        rig.bulk(None).await;
+    }
+    rig.bulk_download().await;
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let before = (0..=uploads).map(|s| rig.bytes(s)).collect::<Vec<_>>();
+    let window = Duration::from_secs(10);
+    tokio::time::sleep(window).await;
+    let mbit = |s: usize| (rig.bytes(s) - before[s]) as f64 * 8.0 / 1e6 / window.as_secs_f64();
+    let up = (0..uploads).map(mbit).sum::<f64>();
+    let down = mbit(uploads);
+    assert!(up > 0.95 * MBIT, "{up} Mbit/s");
+    assert!(down > 10.0, "{down} Mbit/s");
+}
+
+/// The link of the tests of credit: 100 Mbit/s, and 25 ms each way.
+const FAST_MBIT: f64 = 100.0;
+
+/// The size of the pool moves where the burst ends between two steps of credit: with some, the last step
+/// happens to take the last byte, with others it leaves less than `T_c` uncredited. That is less than the base
+/// window, so nothing stays borrowed from the pool.
+#[rstest::rstest]
+#[case::pool_of_512_kib(512 * 1024)]
+#[case::pool_of_1_mib(1024 * 1024)]
+#[case::pool_of_2_mib(2 * 1024 * 1024)]
+#[case::pool_of_4_mib(4 * 1024 * 1024)]
+#[case::pool_of_6_mib(6 * 1024 * 1024)]
+#[tokio::test(start_paused = true)]
+async fn a_burst_ends_with_nothing_borrowed(#[case] pool: u32) {
+    let mut config = config();
+    config.local_recv_pool = pool;
+    config.remote_recv_pool = pool;
+    let mut rig = Rig::new(FAST_MBIT, RTT, config);
+    rig.burst(8 * 1024 * 1024).await;
+    // The stream stays open, and nobody reads or writes on it any more.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let stats = rig.stats();
+    assert_eq!(stats.pool_tx_used, 0, "{stats:?}");
+    assert_eq!(stats.advance_held, 0, "{stats:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_way_bulk_needs_few_control_writes() {
+    let mut rig = Rig::new(FAST_MBIT, RTT, config());
+    rig.bulk(None).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let (bytes, writes) = (rig.bytes(0), rig.backward.short_writes());
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let mb = (rig.bytes(0) - bytes) as f64 / 1e6;
+    let per_mb = (rig.backward.short_writes() - writes) as f64 / mb;
+    // Everything the receiver writes is control: `WINDOW`, `PING` and `PONG`. A `WINDOW` goes for every `T_c`
+    // of 16 KiB, about 61 per MB. The `PING`s and the `PONG`s add few writes of their own: the schedule sends
+    // a `PING` at most every eighth of a round trip, on a `WINDOW` when one goes, and a `PONG` rides on the
+    // next frame.
+    // Measured: 65.6 per MB.
+    assert!(per_mb < 72.0, "{per_mb} control writes per MB");
 }

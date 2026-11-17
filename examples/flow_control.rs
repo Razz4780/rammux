@@ -27,26 +27,37 @@ async fn main() {
 async fn run_client(mut rammux: RammuxConnection<DuplexStream>) {
     let role = rammux.role();
 
+    let mut writers = Vec::new();
     for _ in 0..2 {
         let mut stream = rammux
             .try_start_outbound()
             .expect("connection should not fail")
             .expect("config allows for at least two outbound streams");
         println!("[{role}] Started stream {}", stream.id());
-        tokio::spawn(async move {
+        writers.push(tokio::spawn(async move {
+            let mut sent = 0;
             loop {
-                if stream.send(DATA.clone()).await.is_ok() {
-                    println!(
-                        "[{role}] Sent and flushed {} bytes in stream {}",
-                        DATA.len(),
-                        stream.id(),
-                    );
-                } else {
-                    println!("[{role}] Stream {} was closed.", stream.id());
-                    break;
+                match stream.send(DATA.clone()).await {
+                    Ok(()) => {
+                        sent += DATA.len();
+                        println!(
+                            "[{role}] Sent and flushed {} bytes in stream {}",
+                            DATA.len(),
+                            stream.id(),
+                        );
+                    },
+                    // The server never reads the first stream, so its sends stop once it has as much in flight
+                    // as flow control allows, while the second one keeps going. The downgrade ends both.
+                    Err(error) => {
+                        println!(
+                            "[{role}] Stream {} ended after {sent} bytes: {error}.",
+                            stream.id()
+                        );
+                        break;
+                    },
                 }
             }
-        });
+        }));
     }
 
     let downgraded = loop {
@@ -66,16 +77,22 @@ async fn run_client(mut rammux: RammuxConnection<DuplexStream>) {
         .await
         .expect("connection should not fail");
     println!("[{role}] Downgrade finished.");
+
+    for writer in writers {
+        writer.await.expect("writer should not panic");
+    }
 }
 
 /// Accepts two streams. Does not read from the first stream, but reads slowly from the second stream.
 /// Second stream remains functional even though the first stream is blocked.
 ///
-/// Downgrades the connection 10 seconds after accepting both streams.
+/// Downgrades the connection 5 seconds after accepting both streams.
 async fn run_server(mut rammux: RammuxConnection<DuplexStream>) {
     let role = rammux.role();
 
     let mut missing_streams = 2_usize;
+    // Kept until the end without being read, so that its sender stays blocked.
+    let mut blocked = None;
 
     loop {
         let progress = rammux.progress().await.expect("connection should not fail");
@@ -94,30 +111,34 @@ async fn run_server(mut rammux: RammuxConnection<DuplexStream>) {
                             stream.id()
                         );
                         while let Some(chunk) = stream.next().await {
-                            println!(
-                                "[{role}] Read {} bytes from stream {}.",
-                                chunk.len(),
-                                stream.id()
-                            );
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            match chunk {
+                                Ok(chunk) => println!(
+                                    "[{role}] Read {} bytes from stream {}.",
+                                    chunk.len(),
+                                    stream.id()
+                                ),
+                                // The client never closes the stream: the downgrade ends it.
+                                Err(error) => {
+                                    println!("[{role}] Stream {} ended: {error}.", stream.id());
+                                },
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
                     });
                     break;
                 } else {
-                    tokio::spawn(async move {
-                        println!(
-                            "[{role}] Accepted new stream {}, not reading the data.",
-                            stream.id()
-                        );
-                        let _ = stream;
-                    });
+                    println!(
+                        "[{role}] Accepted new stream {}, not reading the data.",
+                        stream.id()
+                    );
+                    blocked = Some(stream);
                 }
             },
             RammuxProgress::Empty => {},
         }
     }
 
-    let mut sleep = Box::pin(tokio::time::sleep(Duration::from_secs(10)));
+    let mut sleep = Box::pin(tokio::time::sleep(Duration::from_secs(5)));
     loop {
         tokio::select! {
             _ = &mut sleep => break,
@@ -132,6 +153,9 @@ async fn run_server(mut rammux: RammuxConnection<DuplexStream>) {
         }
     }
 
+    if let Some(stream) = &blocked {
+        println!("[{role}] Stream {} was never read.", stream.id());
+    }
     println!("[{role}] Starting downgrade.");
     rammux
         .downgrade()

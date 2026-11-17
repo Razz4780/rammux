@@ -36,12 +36,15 @@ async fn run_client(mut rammux: RammuxConnection<DuplexStream>) {
         stream
             .feed(DATA.clone())
             .await
-            .expect("unexpected end of stream");
-        // `close` here flushes the sink.
+            .expect("the server does not stop reading");
+        // `close` flushes the sink, and ends the stream cleanly.
         // When it completes, we can be sure that `RammuxConnection`
-        // sends the data, even if we immediately start the downgrade.
-        stream.close().await.expect("unexpected end of stream");
-        println!("[{role}] Sent and flushed all data.");
+        // sends the data and the end of the stream, even if we immediately start the downgrade.
+        stream
+            .close()
+            .await
+            .expect("the server does not stop reading");
+        println!("[{role}] Sent all data, and closed the stream.");
     });
 
     loop {
@@ -93,11 +96,12 @@ async fn run_server(mut rammux: RammuxConnection<DuplexStream>) {
 
     let reader_task = tokio::spawn(async move {
         let mut received = 0;
-        while received < DATA.len() {
-            let chunk = stream.next().await.expect("unexpected end of stream");
-            received += chunk.len();
+        // The client closed the stream before the downgrade, so the stream ends cleanly, with `None`.
+        while let Some(chunk) = stream.next().await {
+            received += chunk.expect("the client closed the stream").len();
         }
-        println!("[{role}] Received all data.");
+        assert_eq!(received, DATA.len());
+        println!("[{role}] Received all data, and the end of the stream.");
     });
 
     let downgraded = loop {

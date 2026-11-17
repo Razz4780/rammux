@@ -72,7 +72,7 @@ pub enum ErrorKind {
         id: StreamId,
         /// Message describing the protocol violation.
         #[source]
-        error: StreamError,
+        error: StreamViolation,
     },
     /// rammux connection was downgraded and is no longer valid.
     #[error("connection already downgraded")]
@@ -97,11 +97,55 @@ impl From<io::ErrorKind> for ErrorKind {
 /// rammux protocol violations that can occur within a specific stream.
 #[derive(Error, Debug)]
 #[error("{0}")]
-pub struct StreamError(pub &'static str);
+pub struct StreamViolation(pub &'static str);
 
-impl From<&'static str> for StreamError {
-    fn from(value: &'static str) -> Self {
-        Self(value)
+/// Why a stream ended, if it did not end cleanly, or why its [`RammuxSink`] cannot take data.
+///
+/// The [`RammuxStream`] of a stream yields it after the data that arrived, and then the end of the stream.
+/// The [`RammuxSink`] returns it from every call, once its direction ended.
+///
+/// [`RammuxSink`]: crate::stream::RammuxSink
+/// [`RammuxStream`]: crate::stream::RammuxStream
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum StreamError {
+    /// The peer dropped its sink without closing it. The data that arrived before was delivered.
+    #[error("the peer stopped writing without closing the stream")]
+    PeerAborted,
+    /// The peer dropped its reader. Nothing more can be written to the stream.
+    #[error("the peer stopped reading the stream")]
+    PeerStoppedReading,
+    /// The connection failed: [`RammuxConnection::poll_progress`](crate::connection::RammuxConnection::poll_progress)
+    /// returned an error.
+    #[error("the connection failed")]
+    ConnectionFailed,
+    /// The connection was downgraded, by this side or by the peer.
+    #[error("the connection was downgraded")]
+    ConnectionDowngraded,
+    /// The [`RammuxConnection`](crate::connection::RammuxConnection) was dropped.
+    #[error("the connection was dropped")]
+    ConnectionDropped,
+    /// The sink was closed. Flushing and closing it again succeed, writing to it fails.
+    #[error("the sink is closed")]
+    SinkClosed,
+    /// [`Sink::start_send`](futures::Sink::start_send) was called before
+    /// [`Sink::poll_ready`](futures::Sink::poll_ready) returned [`Poll::Ready`](std::task::Poll::Ready).
+    /// The data was not taken, and the sink can still be used.
+    #[error("the sink is not ready")]
+    SinkNotReady,
+}
+
+impl From<StreamError> for io::Error {
+    fn from(value: StreamError) -> Self {
+        let kind = match value {
+            StreamError::PeerAborted => io::ErrorKind::ConnectionReset,
+            StreamError::PeerStoppedReading | StreamError::SinkClosed => io::ErrorKind::BrokenPipe,
+            StreamError::ConnectionFailed
+            | StreamError::ConnectionDowngraded
+            | StreamError::ConnectionDropped => io::ErrorKind::ConnectionAborted,
+            StreamError::SinkNotReady => io::ErrorKind::Other,
+        };
+        Self::new(kind, value)
     }
 }
 

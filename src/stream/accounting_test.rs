@@ -3,17 +3,11 @@
 use std::{
     collections::VecDeque,
     num::{NonZeroU16, NonZeroU32},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    task::{Context, Poll},
     time::Duration,
 };
 
-use async_selector::selector::Selector;
 use bytes::Bytes;
-use futures::{FutureExt, SinkExt, StreamExt, task::ArcWake};
+use futures::{FutureExt, SinkExt, StreamExt};
 use tokio::time::Instant;
 
 use crate::{
@@ -21,8 +15,11 @@ use crate::{
     buffer::Data,
     config::RammuxConfig,
     flow::Srtt,
-    stream::{ConnFlow, RammuxDuplex, handle::StreamHandle, updates::StreamUpdates},
-    wire::header::ControlFlags,
+    stream::{
+        ConnFlow, RammuxDuplex, RxFlow,
+        handle::StreamHandle,
+        test_support::{Selectors, fins},
+    },
 };
 
 const POOL: u32 = 40;
@@ -39,18 +36,9 @@ const CONFIG: RammuxConfig = RammuxConfig {
     remote_recv_pool: POOL,
     advance_grant: 0.0,
     advance_budget: 0.0,
-    ping_bytes: NonZeroU32::new(32).unwrap(),
     ping_interval: Duration::from_secs(1),
     inbound_frame_timeout: Duration::from_secs(2),
 };
-
-struct Woken(AtomicBool);
-
-impl ArcWake for Woken {
-    fn wake_by_ref(arc_self: &Arc<Self>) {
-        arc_self.0.store(true, Ordering::SeqCst);
-    }
-}
 
 /// A frame in flight.
 struct InFlight {
@@ -64,7 +52,7 @@ struct InFlight {
 
 /// One end of the link: streams with both directions.
 struct End {
-    selector: Selector<StreamUpdates, ConnFlow>,
+    selectors: Selectors,
     handles: Vec<StreamHandle>,
     duplexes: Vec<RammuxDuplex>,
     ids: Vec<StreamId>,
@@ -73,10 +61,11 @@ struct End {
 
 impl End {
     fn new(initiator: bool) -> Self {
-        let mut flow = ConnFlow::new(POOL, POOL);
-        flow.srtt = Srtt::of(Duration::from_millis(100));
+        let srtt = Srtt::of(Duration::from_millis(100));
+        let mut tx = ConnFlow::new(POOL);
+        tx.srtt = srtt;
         let mut end = Self {
-            selector: Selector::new(flow),
+            selectors: Selectors::new(RxFlow::new(POOL), tx),
             handles: Vec::new(),
             duplexes: Vec::new(),
             ids: Vec::new(),
@@ -84,8 +73,9 @@ impl End {
         };
         for n in 0..STREAMS {
             let id = StreamId::from_be_bytes((u16::try_from(n).unwrap() * 2).to_be_bytes());
-            let (handle, updates, duplex) = crate::stream::new(id, initiator, &CONFIG);
-            end.selector.push(updates);
+            let (handle, credit, data, duplex) = crate::stream::new(id, initiator, &CONFIG);
+            end.selectors.credit.push(credit);
+            end.selectors.data.push(data);
             end.handles.push(handle);
             end.duplexes.push(duplex);
             end.ids.push(id);
@@ -93,30 +83,25 @@ impl End {
         end
     }
 
-    /// Collects the frames the streams want to send.
+    /// Collects the frames the streams want to send, credit first, like the connection does.
     fn flush(&mut self, delay: Duration) {
-        let flag = Arc::new(Woken(AtomicBool::new(false)));
-        let waker = futures::task::waker(flag.clone());
-        let mut cx = Context::from_waker(&waker);
-        loop {
-            flag.0.store(false, Ordering::SeqCst);
-            match self.selector.poll_next_unpin(&mut cx) {
-                Poll::Ready(Some((update, _))) => {
-                    let stream = self.ids.iter().position(|id| *id == update.id).unwrap();
-                    self.outgoing.push_back(InFlight {
-                        at: Instant::now() + delay,
-                        stream,
-                        credit: update.credit,
-                        data: update.data,
-                        fin_write: update.flags.fin_write,
-                        fin_read: update.flags.fin_read,
-                    });
-                },
-                Poll::Ready(None) => break,
-                Poll::Pending if flag.0.load(Ordering::SeqCst) => {},
-                Poll::Pending => break,
-            }
-        }
+        let Self {
+            selectors,
+            ids,
+            outgoing,
+            ..
+        } = self;
+        selectors.drain(|update, _| {
+            let stream = ids.iter().position(|id| *id == update.id).unwrap();
+            outgoing.push_back(InFlight {
+                at: Instant::now() + delay,
+                stream,
+                credit: update.credit,
+                data: update.data,
+                fin_write: update.flags.fin_write,
+                fin_read: update.flags.fin_read,
+            });
+        });
     }
 
     /// Delivers the frames the peer sent.
@@ -128,7 +113,8 @@ impl End {
                     NonZeroU32::new(f.credit),
                     Data::copy_from_slice(&f.data),
                     fins(f.fin_write, f.fin_read),
-                    self.selector.strategy_mut(),
+                    self.selectors.data.strategy_mut(),
+                    self.selectors.credit.strategy_mut(),
                 )
                 .expect("the peer follows the rules");
         }
@@ -182,7 +168,7 @@ async fn run(seed: u64, steps: usize) -> u64 {
             for _ in 0..rng.next(4) {
                 let s = usize::try_from(rng.next(STREAMS as u64)).unwrap();
                 if let Some(Some(data)) = right.duplexes[s].next().now_or_never() {
-                    read[s] += data.len();
+                    read[s] += data.unwrap().len();
                 }
             }
             left.flush(lag);
@@ -213,10 +199,13 @@ async fn run(seed: u64, steps: usize) -> u64 {
             sum_tx += tx.saturating_sub(u64::from(BASE));
             sum_rx += rx.saturating_sub(u64::from(BASE));
         }
-        let (g_tx, g_rx) = (left.selector.strategy(), right.selector.strategy());
+        let (g_tx, g_rx) = (
+            left.selectors.data.strategy(),
+            right.selectors.credit.strategy(),
+        );
         assert_eq!(g_tx.tx_pool.used(), sum_tx);
-        assert_eq!(g_rx.rx_pool.used(), sum_rx);
-        assert!(g_tx.tx_pool.used() >= g_rx.rx_pool.used());
+        assert_eq!(g_rx.pool.used(), sum_rx);
+        assert!(g_tx.tx_pool.used() >= g_rx.pool.used());
         assert!(g_tx.tx_pool.used() <= u64::from(POOL));
         max_used = max_used.max(g_tx.tx_pool.used());
     }
@@ -236,9 +225,9 @@ async fn run(seed: u64, steps: usize) -> u64 {
         );
         assert_eq!(left.unacked_tx(s), right.unacked_rx(s));
     }
-    assert_eq!(left.selector.strategy().tx_pool.used(), 0);
-    assert_eq!(right.selector.strategy().rx_pool.used(), 0);
-    assert_eq!(left.selector.strategy().turns.len(), 0);
+    assert_eq!(left.selectors.data.strategy().tx_pool.used(), 0);
+    assert_eq!(right.selectors.credit.strategy().pool.used(), 0);
+    assert_eq!(left.selectors.data.strategy().turns.len(), 0);
     max_used
 }
 
@@ -251,12 +240,4 @@ async fn sender_never_counts_less_than_receiver() {
     }
     // The runs do use the pool, up to its size.
     assert_eq!(max_used, u64::from(POOL));
-}
-
-fn fins(fin_write: bool, fin_read: bool) -> ControlFlags {
-    ControlFlags {
-        syn: false,
-        fin_read,
-        fin_write,
-    }
 }

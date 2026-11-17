@@ -5,11 +5,12 @@
 //! names the seed that replays it.
 //!
 //! - A peer that follows the protocol is never rejected, and the connection keeps the protocol too.
+//! - The streams end as the application and the peer ended them: with `ABORT` exactly when a sink was dropped
+//!   before it was closed, and with the reason of the connection when the connection ends.
 //! - A peer that breaks the protocol gets a protocol violation at worst. Nothing it sends makes us panic.
 
 use std::{
-    collections::BTreeMap,
-    io,
+    collections::{BTreeMap, BTreeSet},
     num::{NonZeroU16, NonZeroU32},
     time::Duration,
 };
@@ -28,7 +29,7 @@ use crate::{
         Downgraded, RammuxProgress,
         wire_test::{Rig, raw, rig},
     },
-    stream::{RammuxSink, RammuxStream},
+    stream::{RammuxSink, RammuxStream, StreamError},
     wire::{
         codec::decoder::{DecodedFrame, InboundFrame},
         header::{ControlFlags, Header, Pong, StreamHeader},
@@ -51,7 +52,6 @@ fn config() -> RammuxConfig {
     config.remote_recv_window = NonZeroU32::new(96).unwrap();
     config.local_recv_pool = 512;
     config.remote_recv_pool = 384;
-    config.ping_bytes = NonZeroU32::new(256).unwrap();
     config.inbound_frame_timeout = Duration::from_secs(3600);
     config
 }
@@ -130,6 +130,10 @@ struct Peer {
     last_ping: Option<u32>,
     /// Bytes of `DATA` the connection sent.
     received: u64,
+    /// Streams whose sinks the application dropped before closing them, and whose `FIN_WRITE` must carry `ABORT`.
+    dropped_sinks: BTreeSet<u16>,
+    /// How many `FIN_WRITE`s with `ABORT` the connection sent.
+    aborts: u64,
 }
 
 impl Peer {
@@ -139,6 +143,8 @@ impl Peer {
             streams: BTreeMap::new(),
             last_ping: None,
             received: 0,
+            dropped_sinks: BTreeSet::new(),
+            aborts: 0,
         }
     }
 
@@ -208,6 +214,12 @@ impl Peer {
         if part.flags.fin_write {
             assert!(!stream.conn_fin_write, "duplicate FIN_WRITE");
             stream.conn_fin_write = true;
+            assert_eq!(
+                part.flags.abort,
+                self.dropped_sinks.remove(&id),
+                "ABORT if and only if the sink was dropped before it was closed"
+            );
+            self.aborts += u64::from(part.flags.abort);
         }
         if part.flags.fin_read {
             assert!(!stream.conn_fin_read, "duplicate FIN_READ");
@@ -230,7 +242,7 @@ impl Peer {
             // Start a stream, maybe with data, maybe closing right away.
             0 | 1 => {
                 let started = ids.iter().filter(|id| *id % 2 == 0).count();
-                if started >= crate::safe_cast_usize(self.config.max_inbound_streams) {
+                if started >= usize::from(self.config.max_inbound_streams) {
                     return None;
                 }
                 let id = rng.u16_below(8) * 2;
@@ -249,6 +261,7 @@ impl Peer {
                     syn: true,
                     fin_write: stream.peer_fin_write,
                     fin_read: false,
+                    abort: stream.peer_fin_write && rng.coin(),
                 };
                 self.streams.insert(id, stream);
                 Some(stream_frame(id, flags, 0, len))
@@ -293,6 +306,7 @@ impl Peer {
                 if rng.coin() && !stream.peer_fin_write {
                     stream.peer_fin_write = true;
                     flags.fin_write = true;
+                    flags.abort = rng.coin();
                 }
                 if rng.coin() && !stream.peer_fin_read {
                     stream.peer_fin_read = true;
@@ -333,7 +347,9 @@ fn wild_frame(rng: &mut Rng) -> Vec<u8> {
         syn: rng.below(4) == 0,
         fin_write: rng.below(6) == 0,
         fin_read: rng.below(6) == 0,
+        abort: false,
     };
+    flags.abort = flags.fin_write && rng.coin();
     let credit = if rng.below(3) == 0 { rng.up_to(600) } else { 0 };
     // Sometimes above the frame limit.
     let len = if rng.coin() { rng.up_to(70) } else { 0 };
@@ -371,6 +387,8 @@ struct Session {
     app: Vec<(Option<RammuxSink>, Option<RammuxStream>)>,
     /// Bytes of data the application read.
     read: u64,
+    /// How many streams the application read to [`StreamError::PeerAborted`].
+    peer_aborts: u64,
 }
 
 impl Session {
@@ -382,6 +400,7 @@ impl Session {
             peer: Peer::new(config),
             app: Vec::new(),
             read: 0,
+            peer_aborts: 0,
         }
     }
 
@@ -422,7 +441,7 @@ impl Session {
     /// The application does something with the connection or with one of its streams.
     async fn app_step(&mut self) {
         let at = usize::try_from(self.rng.below(self.app.len().max(1) as u64)).unwrap();
-        match self.rng.below(16) {
+        match self.rng.below(17) {
             0 | 1 => {
                 if let Some(stream) = self.rig.conn.try_start_outbound().unwrap() {
                     let (sink, stream) = stream.into_split();
@@ -437,7 +456,7 @@ impl Session {
                     let len = usize::try_from(self.rng.up_to(200)).unwrap();
                     let data = Bytes::from(vec![0xDA; len]);
                     if let Some(Err(error)) = sink.feed(data).now_or_never() {
-                        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+                        assert_eq!(error, StreamError::PeerStoppedReading);
                         *sink_slot = None;
                     }
                 }
@@ -451,10 +470,15 @@ impl Session {
                 {
                     loop {
                         match stream.next().now_or_never() {
-                            Some(Some(data)) if everything => self.read += data.len() as u64,
-                            Some(Some(data)) => {
+                            Some(Some(Ok(data))) if everything => self.read += data.len() as u64,
+                            Some(Some(Ok(data))) => {
                                 self.read += data.len() as u64;
                                 break;
+                            },
+                            Some(Some(Err(error))) => {
+                                // The connection is alive, so only the peer can end the stream so.
+                                assert_eq!(error, StreamError::PeerAborted);
+                                self.peer_aborts += 1;
                             },
                             Some(None) => {
                                 *stream_slot = None;
@@ -481,6 +505,20 @@ impl Session {
                 }
             },
 
+            14 => {
+                // Drop the sink without closing it.
+                if let Some((sink_slot, _)) = self.app.get_mut(at)
+                    && let Some(mut sink) = sink_slot.take()
+                {
+                    // Unless the peer stopped reading, writing is still open: the connection aborts it.
+                    let flushed = sink.flush().now_or_never();
+                    if flushed != Some(Err(StreamError::PeerStoppedReading)) {
+                        let id = u16::from_be_bytes(sink.id().to_be_bytes());
+                        self.peer.dropped_sinks.insert(id);
+                    }
+                }
+            },
+
             _ => {
                 let millis = self.rng.below(50);
                 tokio::time::advance(Duration::from_millis(millis)).await;
@@ -502,18 +540,22 @@ impl Session {
     }
 
     /// Drops the connection, if it is still there, and checks that its streams end:
-    /// reading reaches the end, and writing fails.
-    fn streams_end(self) {
+    /// reading reaches the end, and writing fails. A stream that the peer did not end ends with
+    /// the `reason` that the connection ended for.
+    fn streams_end(self, reason: StreamError) {
         let Self { rig, mut app, .. } = self;
         drop(rig);
         for (sink, stream) in &mut app {
             if let Some(stream) = stream {
-                while stream
-                    .next()
-                    .now_or_never()
-                    .expect("reading does not hang")
-                    .is_some()
-                {}
+                while let Some(item) = stream.next().now_or_never().expect("reading does not hang")
+                {
+                    if let Err(error) = item {
+                        assert!(
+                            [StreamError::PeerAborted, reason].contains(&error),
+                            "{error}"
+                        );
+                    }
+                }
             }
             if let Some(sink) = sink {
                 let error = sink
@@ -521,7 +563,10 @@ impl Session {
                     .now_or_never()
                     .expect("writing does not hang")
                     .expect_err("writing fails");
-                assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+                assert!(
+                    [StreamError::PeerStoppedReading, reason].contains(&error),
+                    "{error}"
+                );
             }
         }
     }
@@ -529,7 +574,7 @@ impl Session {
 
 #[tokio::test(start_paused = true)]
 async fn a_peer_that_follows_the_protocol_is_never_rejected() {
-    let (mut read, mut received) = (0, 0);
+    let (mut read, mut received, mut aborts, mut peer_aborts) = (0, 0, 0, 0);
     for seed in 0..SEEDS {
         let mut session = Session::new(seed);
         for step in 0..STEPS {
@@ -544,6 +589,10 @@ async fn a_peer_that_follows_the_protocol_is_never_rejected() {
                 Err(error) => panic!("seed {seed}, step {step}: {error}"),
             }
             assert!(!session.read_frames(true), "seed {seed}: unexpected TERM");
+            assert!(
+                session.peer.dropped_sinks.is_empty(),
+                "seed {seed}, step {step}: a dropped sink did not abort"
+            );
             session.check_stats();
         }
 
@@ -565,11 +614,15 @@ async fn a_peer_that_follows_the_protocol_is_never_rejected() {
 
         read += session.read;
         received += session.peer.received;
-        session.streams_end();
+        aborts += session.peer.aborts;
+        peer_aborts += session.peer_aborts;
+        session.streams_end(StreamError::ConnectionDowngraded);
     }
-    // The sessions did move data, both ways.
+    // The sessions did move data, both ways, and streams were aborted, both ways.
     assert!(read > SEEDS * 256, "{read}");
     assert!(received > SEEDS * 512, "{received}");
+    assert!(aborts > SEEDS, "{aborts}");
+    assert!(peer_aborts > SEEDS, "{peer_aborts}");
 }
 
 #[tokio::test(start_paused = true)]
@@ -577,6 +630,7 @@ async fn a_peer_that_breaks_the_protocol_gets_an_error_and_never_a_panic() {
     let mut rejected = 0;
     for seed in 0..SEEDS {
         let mut session = Session::new(seed);
+        let mut reason = StreamError::ConnectionDropped;
         // The peer behaves for a while, so that the frame that does not belong meets a session in progress.
         let behaves_for = session.rng.below(STEPS / 2);
         for step in 0..STEPS {
@@ -603,13 +657,14 @@ async fn a_peer_that_breaks_the_protocol_gets_an_error_and_never_a_panic() {
                     let error = session.rig.conn.progress().await.unwrap_err();
                     assert!(error.is_user(), "seed {seed}: {error}");
                     rejected += 1;
+                    reason = StreamError::ConnectionFailed;
                     break;
                 },
             }
             session.read_frames(behaves);
             session.check_stats();
         }
-        session.streams_end();
+        session.streams_end(reason);
     }
     // Most wild peers are caught. One that is not sent nothing illegal, or frames we still wait to complete.
     assert!(rejected > SEEDS * 3 / 4, "{rejected}");
@@ -619,6 +674,7 @@ async fn a_peer_that_breaks_the_protocol_gets_an_error_and_never_a_panic() {
 async fn garbage_gets_an_error_and_never_a_panic() {
     for seed in 0..SEEDS * 10 {
         let mut session = Session::new(seed);
+        let mut reason = StreamError::ConnectionDropped;
         for _ in 0..50 {
             // Mostly zeroes in the high bits, or every frame would fail on its reserved flags.
             let garbage: Vec<u8> = (0..session.rng.up_to(40))
@@ -635,14 +691,18 @@ async fn garbage_gets_an_error_and_never_a_panic() {
             match session.drive() {
                 Ok(None) => session.check_stats(),
                 // The garbage happened to be `TERM`.
-                Ok(Some(..)) => break,
+                Ok(Some(..)) => {
+                    reason = StreamError::ConnectionDowngraded;
+                    break;
+                },
                 Err(error) => {
                     assert!(error.is_protocol_violation(), "seed {seed}: {error}");
+                    reason = StreamError::ConnectionFailed;
                     break;
                 },
             }
             session.read_frames(false);
         }
-        session.streams_end();
+        session.streams_end(reason);
     }
 }

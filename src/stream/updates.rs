@@ -1,4 +1,4 @@
-//! The task that yields what a stream has to send.
+//! The tasks that yield what a stream has to send: one per direction.
 
 use std::{
     ops::ControlFlow,
@@ -15,28 +15,99 @@ use tokio::time::Instant;
 
 use crate::{
     StreamId,
-    stream::{ConnFlow, FinState, StreamRef, outbound::Ctx},
+    stream::{
+        ConnFlow, FinState, RxFlow, StreamRef,
+        outbound::{Ctx, FinWrite},
+    },
     wire::{codec::encoder::OutStream, header::ControlFlags},
 };
 
-/// Yields the stream parts of the frames that a stream has to send.
+/// Yields the `WINDOW` and `FIN_READ` of a stream: what its receiving direction has to send.
 ///
-/// The connection polls it in a selector, with the [`ConnFlow`] as the strategy.
-/// It is done once the stream sent both `FIN_READ` and `FIN_WRITE`.
-pub(crate) struct StreamUpdates {
+/// The connection polls it in a selector, with the [`RxFlow`] as the strategy.
+/// It is done once the stream sent `FIN_READ`. The [`FinState`] it yields is that of the whole stream.
+pub(crate) struct CreditUpdates {
     id: StreamId,
-    /// Whether the next update carries `SYN`.
-    syn: bool,
     stream: StreamRef,
 }
 
-impl StreamUpdates {
-    pub(super) fn new(id: StreamId, syn: bool, stream: StreamRef) -> Self {
-        Self { id, syn, stream }
+impl CreditUpdates {
+    pub(super) fn new(id: StreamId, stream: StreamRef) -> Self {
+        Self { id, stream }
     }
 }
 
-impl Task<ConnFlow> for StreamUpdates {
+impl Task<RxFlow> for CreditUpdates {
+    type Cont = (StreamUpdate, FinState);
+    type Break = (StreamUpdate, FinState);
+    type Output = (StreamUpdate, FinState);
+
+    fn poll_progress(
+        self: Pin<&mut Self>,
+        flow: &mut RxFlow,
+        cx: &mut Context<'_>,
+    ) -> Poll<ControlFlow<Self::Break, Self::Cont>> {
+        let this = self.get_mut();
+        let mut state = this.stream.lock();
+
+        let Poll::Ready((credit, fin_read)) = state.inbound.poll_update(&mut flow.pool) else {
+            // Every change that makes the direction ready wakes it while holding the lock.
+            this.stream.credit_task.register(cx.waker());
+            return Poll::Pending;
+        };
+        let update = StreamUpdate {
+            id: this.id,
+            credit,
+            data: Bytes::new(),
+            flags: ControlFlags {
+                syn: std::mem::take(&mut state.syn_pending),
+                fin_read,
+                fin_write: false,
+                abort: false,
+            },
+        };
+        let fin_state = state.fin_state();
+        Poll::Ready(if fin_read {
+            // Nothing more will be credited.
+            ControlFlow::Break((update, fin_state))
+        } else {
+            ControlFlow::Continue((update, fin_state))
+        })
+    }
+
+    fn transform_cont(
+        _: BorrowedMut<'_, Self>,
+        _: &mut RxFlow,
+        value: Self::Cont,
+    ) -> Option<Self::Output> {
+        Some(value)
+    }
+
+    fn transform_break(
+        _: Removed<Self>,
+        _: &mut RxFlow,
+        value: Self::Break,
+    ) -> Option<Self::Output> {
+        Some(value)
+    }
+}
+
+/// Yields the `DATA` and `FIN_WRITE` of a stream: what its sending direction has to send.
+///
+/// The connection polls it in a selector, with the [`ConnFlow`] as the strategy.
+/// It is done once the stream sent `FIN_WRITE`. The [`FinState`] it yields is that of the whole stream.
+pub(crate) struct DataUpdates {
+    id: StreamId,
+    stream: StreamRef,
+}
+
+impl DataUpdates {
+    pub(super) fn new(id: StreamId, stream: StreamRef) -> Self {
+        Self { id, stream }
+    }
+}
+
+impl Task<ConnFlow> for DataUpdates {
     type Cont = (StreamUpdate, FinState);
     type Break = (StreamUpdate, FinState);
     type Output = (StreamUpdate, FinState);
@@ -49,43 +120,31 @@ impl Task<ConnFlow> for StreamUpdates {
         let this = self.get_mut();
         let mut state = this.stream.lock();
 
-        // Credit and `FIN_READ` never wait for data, or for a turn.
-        let inbound = state.inbound.poll_update(&mut flow.rx_pool);
         let mut ctx = Ctx {
             flow,
             me: &this.stream,
             now: Instant::now(),
         };
-        let outbound = state.outbound.poll_update(&mut ctx);
-        if inbound.is_pending() && outbound.is_pending() {
-            // Every change that makes the stream ready wakes it while holding the lock,
+        let Poll::Ready((data, fin_write)) = state.outbound.poll_update(&mut ctx) else {
+            // Every change that makes the direction ready wakes it while holding the lock,
             // or happens in the connection task that is polling it now.
-            this.stream.updates.register(cx.waker());
+            this.stream.data_task.register(cx.waker());
             return Poll::Pending;
-        }
-        let fin_state = state.fin_state();
-        drop(state);
-
-        let (credit, fin_read) = match inbound {
-            Poll::Ready(update) => update,
-            Poll::Pending => (0, false),
-        };
-        let (data, fin_write) = match outbound {
-            Poll::Ready(update) => update,
-            Poll::Pending => (Bytes::new(), false),
         };
         let update = StreamUpdate {
             id: this.id,
-            credit,
+            credit: 0,
             data,
             flags: ControlFlags {
-                syn: std::mem::take(&mut this.syn),
-                fin_read,
-                fin_write,
+                syn: std::mem::take(&mut state.syn_pending),
+                fin_read: false,
+                fin_write: fin_write.is_some(),
+                abort: fin_write == Some(FinWrite::Abort),
             },
         };
-        Poll::Ready(if fin_state.sent {
-            // Both `FIN_*`s are sent, nothing more will come.
+        let fin_state = state.fin_state();
+        Poll::Ready(if fin_write.is_some() {
+            // Nothing more will be sent.
             ControlFlow::Break((update, fin_state))
         } else {
             ControlFlow::Continue((update, fin_state))
@@ -105,7 +164,7 @@ impl Task<ConnFlow> for StreamUpdates {
         flow: &mut ConnFlow,
         value: Self::Break,
     ) -> Option<Self::Output> {
-        // A closed stream waits for nothing, and nobody waits for it.
+        // A closed direction waits for nothing, and nobody waits for it.
         flow.pass_turn(&removed.stream);
         Some(value)
     }

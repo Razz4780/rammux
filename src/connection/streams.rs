@@ -3,6 +3,7 @@
 use std::{
     collections::{HashMap, hash_map::Entry},
     task::{Context, Poll},
+    time::Duration,
 };
 
 use async_selector::selector::Selector;
@@ -13,20 +14,22 @@ use crate::{
     StreamId,
     buffer::Data,
     config::{RammuxConfig, RammuxRole},
-    error::{ErrorKind, StreamError},
+    error::{ErrorKind, StreamError, StreamViolation},
+    flow::Srtt,
     stream::{
-        self, ConnFlow, RammuxDuplex,
+        self, ConnFlow, FinState, RammuxDuplex, RxFlow,
         handle::StreamHandle,
-        updates::{StreamUpdate, StreamUpdates},
+        updates::{CreditUpdates, DataUpdates, StreamUpdate},
     },
     wire::header::StreamHeader,
 };
 
 /// The streams of a connection: the handles that take the inbound frames, the tasks that yield
-/// the outbound ones, and the [`ConnFlow`] they share.
+/// the outbound ones, and the [`RxFlow`] and [`ConnFlow`] they share.
 ///
 /// A stream is forgotten once it is closed on both sides. Its ID can then be reused.
-/// All streams are [aborted](StreamHandle::abort) when this struct is dropped.
+/// The streams that are left are [aborted](StreamHandle::abort) when the connection ends:
+/// with [`Self::end`], or with [`StreamError::ConnectionDropped`] when this struct is dropped.
 pub struct Streams {
     role: RammuxRole,
     config: RammuxConfig,
@@ -36,31 +39,44 @@ pub struct Streams {
     outbound: Slab<StreamHandle>,
     /// Streams that the peer started.
     inbound: HashMap<StreamId, StreamHandle>,
-    /// Polls the [`StreamUpdates`] of all streams, with the [`ConnFlow`] as the strategy.
-    updates: Selector<StreamUpdates, ConnFlow>,
+    /// Polls the [`CreditUpdates`] of all streams, with the [`RxFlow`] as the strategy.
+    credit: Selector<CreditUpdates, RxFlow>,
+    /// Polls the [`DataUpdates`] of all streams, with the [`ConnFlow`] as the strategy.
+    data: Selector<DataUpdates, ConnFlow>,
 }
 
 impl Streams {
     pub fn new(role: RammuxRole, config: RammuxConfig) -> Self {
-        let flow =
-            ConnFlow::new(config.local_recv_pool, config.remote_recv_pool).with_advance(&config);
+        let tx = ConnFlow::new(config.remote_recv_pool).with_advance(&config);
+        let rx = RxFlow::new(config.local_recv_pool);
         Self {
             role,
             config,
             outbound: Slab::new(),
             inbound: HashMap::new(),
-            updates: Selector::new(flow),
+            credit: Selector::new(rx),
+            data: Selector::new(tx),
         }
     }
 
-    /// Returns the state shared by the streams.
-    pub fn flow(&self) -> &ConnFlow {
-        self.updates.strategy()
+    /// Returns the state shared by the sending directions of the streams.
+    pub fn tx_flow(&self) -> &ConnFlow {
+        self.data.strategy()
     }
 
-    /// Returns the state shared by the streams.
-    pub fn flow_mut(&mut self) -> &mut ConnFlow {
-        self.updates.strategy_mut()
+    /// Returns the state shared by the receiving directions of the streams.
+    pub fn rx_flow(&self) -> &RxFlow {
+        self.credit.strategy()
+    }
+
+    /// Returns the smoothed round trip time of the connection.
+    pub fn srtt(&self) -> Srtt {
+        self.tx_flow().srtt
+    }
+
+    /// Folds a round trip sample into the smoothed round trip time.
+    pub fn observe_rtt(&mut self, rtt: Duration) {
+        self.data.strategy_mut().srtt.observe(rtt);
     }
 
     /// Returns the number of streams that the peer started.
@@ -75,12 +91,13 @@ impl Streams {
 
     /// Starts a new stream, unless the configured limit or the IDs are exhausted.
     pub fn open_outbound(&mut self) -> Option<RammuxDuplex> {
-        if self.outbound.len() >= crate::safe_cast_usize(self.config.max_outbound_streams) {
+        if self.outbound.len() >= usize::from(self.config.max_outbound_streams) {
             return None;
         }
         let id = StreamId::from_slab_idx(self.outbound.vacant_key(), self.role)?;
-        let (handle, updates, duplex) = stream::new(id, true, &self.config);
-        self.updates.push(updates);
+        let (handle, credit, data, duplex) = stream::new(id, true, &self.config);
+        self.credit.push(credit);
+        self.data.push(data);
         self.outbound.insert(handle);
         Some(duplex)
     }
@@ -96,7 +113,7 @@ impl Streams {
         let id = header.id;
         let violation = |error: &'static str| ErrorKind::Stream {
             id,
-            error: StreamError(error),
+            error: StreamViolation(error),
         };
 
         let (handle, new_stream) = if id.initiated_by() == self.role {
@@ -118,13 +135,14 @@ impl Streams {
                 },
                 Entry::Occupied(entry) => (&*entry.into_mut(), None),
                 Entry::Vacant(entry) if header.flags.syn => {
-                    if inbound_count >= crate::safe_cast_usize(self.config.max_inbound_streams) {
+                    if inbound_count >= usize::from(self.config.max_inbound_streams) {
                         return Err(violation(
                             "started a new stream without respecting the configured limit",
                         ));
                     }
-                    let (handle, updates, duplex) = stream::new(id, false, &self.config);
-                    self.updates.push(updates);
+                    let (handle, credit, data, duplex) = stream::new(id, false, &self.config);
+                    self.credit.push(credit);
+                    self.data.push(data);
                     (&*entry.insert(handle), Some(duplex))
                 },
                 Entry::Vacant(..) => return Err(violation("sent a frame for an unknown stream")),
@@ -136,7 +154,8 @@ impl Streams {
                 header.credit,
                 data,
                 header.flags,
-                self.updates.strategy_mut(),
+                self.data.strategy_mut(),
+                self.credit.strategy_mut(),
             )
             .map_err(|error| ErrorKind::Stream { id, error })?;
         if fin_state.is_dead() {
@@ -145,15 +164,42 @@ impl Streams {
         Ok(new_stream)
     }
 
-    /// Polls for the stream part of the next frame to send.
-    pub fn poll_update(&mut self, cx: &mut Context<'_>) -> Poll<StreamUpdate> {
-        let Poll::Ready(Some((update, fin_state))) = self.updates.poll_next_unpin(cx) else {
+    /// Polls for the stream part of the next frame that carries `WINDOW` or `FIN_READ`.
+    pub fn poll_credit(&mut self, cx: &mut Context<'_>) -> Poll<StreamUpdate> {
+        let polled = self.credit.poll_next_unpin(cx);
+        self.take_update(polled)
+    }
+
+    /// Polls for the stream part of the next frame that carries `DATA` or `FIN_WRITE`.
+    pub fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<StreamUpdate> {
+        let polled = self.data.poll_next_unpin(cx);
+        self.take_update(polled)
+    }
+
+    /// Takes an update that a selector yielded, and forgets its stream if the update closes it.
+    ///
+    /// A selector without tasks yields [`None`]: there is nothing to send.
+    fn take_update(
+        &mut self,
+        polled: Poll<Option<(StreamUpdate, FinState)>>,
+    ) -> Poll<StreamUpdate> {
+        let Poll::Ready(Some((update, fin_state))) = polled else {
             return Poll::Pending;
         };
         if fin_state.is_dead() {
             self.remove(update.id);
         }
         Poll::Ready(update)
+    }
+
+    /// Aborts all streams, because the connection is gone. Their applications get the `reason`.
+    pub fn end(&mut self, reason: StreamError) {
+        for handle in self.outbound.drain() {
+            handle.abort(reason);
+        }
+        for (_, handle) in self.inbound.drain() {
+            handle.abort(reason);
+        }
     }
 
     fn remove(&mut self, id: StreamId) {
@@ -167,11 +213,99 @@ impl Streams {
 
 impl Drop for Streams {
     fn drop(&mut self) {
-        for handle in self.outbound.drain() {
-            handle.abort();
+        self.end(StreamError::ConnectionDropped);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::{
+        num::NonZeroU16,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    use futures::StreamExt;
+
+    use crate::{
+        StreamId,
+        buffer::Data,
+        config::{RammuxConfig, RammuxRole},
+        connection::streams::Streams,
+        flow,
+        stream::test_support::Flag,
+        wire::header::{ControlFlags, StreamHeader},
+    };
+
+    /// Credit goes back in steps of exactly `T_c`, whatever the pace of the reader, and whether or not the
+    /// connection measured its round trip. The read that completes a step wakes the credit task, and no other
+    /// read does.
+    #[rstest::rstest]
+    #[case::slow_reader_without_a_sample(Duration::from_millis(100), None)]
+    #[case::slow_reader_with_a_sample(Duration::from_millis(100), Some(Duration::from_millis(80)))]
+    #[case::fast_reader_without_a_sample(Duration::from_millis(1), None)]
+    #[case::fast_reader_with_a_sample(Duration::from_millis(1), Some(Duration::from_millis(80)))]
+    #[tokio::test(start_paused = true)]
+    async fn credit_goes_back_in_steps_of_t_c(
+        #[case] pace: Duration,
+        #[case] rtt: Option<Duration>,
+    ) {
+        let config = RammuxConfig::new();
+        let t_c = flow::credit_threshold(config.local_recv_window.get());
+        let mut streams = Streams::new(RammuxRole::Server, config);
+        if let Some(rtt) = rtt {
+            streams.observe_rtt(rtt);
         }
-        for (_, handle) in self.inbound.drain() {
-            handle.abort();
+        let woken = Arc::new(Flag(AtomicBool::new(false)));
+        let waker = futures::task::waker(woken.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        let id = StreamId::from_slab_idx(0, RammuxRole::Client).unwrap();
+        let chunk = 8 * 1024;
+        let mut stream = None;
+        let mut consumed = 0;
+        let mut credited = 0;
+        // The peer sends 8 KiB at the given pace, and the application reads it at once.
+        for _ in 0..500 {
+            tokio::time::advance(pace).await;
+            let header = StreamHeader {
+                id,
+                flags: ControlFlags {
+                    syn: stream.is_none(),
+                    ..Default::default()
+                },
+                credit: None,
+                data_len: NonZeroU16::new(u16::try_from(chunk).unwrap()),
+            };
+            if let Some(new) = streams
+                .receive(header, Data::copy_from_slice(&vec![0; chunk]))
+                .unwrap()
+            {
+                stream = Some(new);
+            }
+            woken.0.store(false, Ordering::SeqCst);
+            let read = stream.as_mut().unwrap().poll_next_unpin(&mut cx);
+            assert!(matches!(read, Poll::Ready(Some(Ok(..)))));
+            consumed += chunk as u64;
+
+            let due = consumed - credited >= t_c;
+            if credited > 0 {
+                // The task registered its waker when it last had nothing to send.
+                assert_eq!(woken.0.load(Ordering::SeqCst), due);
+            }
+            match streams.poll_credit(&mut cx) {
+                Poll::Ready(update) => {
+                    assert!(due);
+                    assert_eq!(u64::from(update.credit), t_c);
+                    credited += t_c;
+                },
+                Poll::Pending => assert!(!due),
+            }
         }
+        assert_eq!(credited, consumed / t_c * t_c);
     }
 }

@@ -28,6 +28,8 @@ mod pings;
 #[cfg(test)]
 mod sim_test;
 mod state;
+#[cfg(test)]
+mod stream_end_test;
 mod streams;
 #[cfg(test)]
 mod wire_test;
@@ -52,10 +54,26 @@ const INBOUND_BATCH: usize = 16;
 /// future. The peer may do it first: [`progress`](Self::progress) then returns
 /// [`RammuxProgress::Downgraded`], and the connection cannot be used any more.
 ///
+/// A downgrade, started by either side, ends the streams that are still open with
+/// [`StreamError::ConnectionDowngraded`], on both sides: their readers get the data that arrived and then
+/// the error, and their sinks return the error.
+///
+/// The side that calls `downgrade` loses only the data that its connection has not sent yet: a stream whose
+/// sink completed its close before the call ends cleanly for the peer's reader. What the peer sent and this
+/// side had not received at the call is not delivered, even from sinks that the peer closed. So close your
+/// sinks and read your streams to the end before you call `downgrade`.
+///
+/// An error of [`poll_progress`](Self::poll_progress) ends the streams in the same way,
+/// with [`StreamError::ConnectionFailed`].
+///
 /// # Drop
 ///
-/// Dropping the connection ends all of its streams at once, and the peer is not told.
-/// Use [`downgrade`](Self::downgrade) for an orderly end.
+/// Dropping the connection ends all of its streams at once, with [`StreamError::ConnectionDropped`],
+/// and the peer is not told. Use [`downgrade`](Self::downgrade) for an orderly end.
+///
+/// [`StreamError::ConnectionDowngraded`]: crate::stream::StreamError::ConnectionDowngraded
+/// [`StreamError::ConnectionFailed`]: crate::stream::StreamError::ConnectionFailed
+/// [`StreamError::ConnectionDropped`]: crate::stream::StreamError::ConnectionDropped
 pub struct RammuxConnection<IO> {
     state: ConnState<IO>,
     role: RammuxRole,
@@ -124,7 +142,8 @@ where
 
     /// Drives the connection, and returns when there is something to report: see [`RammuxProgress`].
     ///
-    /// An error is final. The connection cannot be used after it, and all of its streams end.
+    /// An error is final. The connection cannot be used after it, and all of its streams end with
+    /// [`StreamError::ConnectionFailed`](crate::stream::StreamError::ConnectionFailed).
     pub fn poll_progress(
         &mut self,
         cx: &mut Context<'_>,
@@ -134,7 +153,7 @@ where
         if let Err(error) = &result
             && !error.is_misuse()
         {
-            self.state = ConnState::Poisoned;
+            self.state.poison();
         }
         Poll::Ready(result.map_err(From::from))
     }
@@ -158,6 +177,8 @@ where
 
     /// Starts the downgrade procedure of this connection.
     ///
+    /// The streams that are still open end with
+    /// [`StreamError::ConnectionDowngraded`](crate::stream::StreamError::ConnectionDowngraded).
     /// See [`Downgraded`] doc for more info.
     pub fn downgrade(mut self) -> Result<Downgraded<IO>, RammuxError> {
         self.state.downgrade(false).map_err(From::from)
@@ -213,9 +234,9 @@ impl<IO> fmt::Debug for RammuxProgress<IO> {
 #[non_exhaustive]
 pub struct RammuxStats {
     /// How many streams started by the peer are open.
-    pub inbound_streams: u32,
+    pub inbound_streams: u16,
     /// How many streams started by this side are open.
-    pub outbound_streams: u32,
+    pub outbound_streams: u16,
     /// Smoothed round trip time of the connection, measured with `PING`s.
     ///
     /// It includes the time that data waits in queues on the way, in both directions.
@@ -365,7 +386,7 @@ mod test {
             async {
                 let mut read = 0;
                 while let Some(chunk) = stream.next().await {
-                    read += chunk.len();
+                    read += chunk.unwrap().len();
                 }
                 assert_eq!(read, data);
             },
