@@ -27,7 +27,7 @@ use crate::{
     config::{RammuxConfig, RammuxRole},
     connection::{
         Downgraded, RammuxProgress,
-        wire_test::{Rig, raw, rig},
+        test::wire::{Rig, raw, rig},
     },
     stream::{RammuxSink, RammuxStream, StreamError},
     wire::{
