@@ -7,10 +7,8 @@
 //!
 //! - [`RammuxConnection`](connection::RammuxConnection) owns the transport and runs the protocol.
 //!   Nothing happens in the background: your code polls it, and all streams stall when it does not.
-//! - [`RammuxDuplex`](stream::RammuxDuplex) is one stream: a [`Sink`](futures::Sink) of
-//!   [`Bytes`](bytes::Bytes), and a [`Stream`](futures::Stream) of `Result<Bytes, StreamError>`.
-//!   Only closing the sink ends a stream cleanly. Otherwise the reader on the other side gets
-//!   a [`StreamError`](stream::StreamError) that says why the stream ended.
+//! - [`RammuxDuplex`](stream::RammuxDuplex) is one stream: a [`Sink`](futures::Sink)/[`Stream`](futures::Stream) of
+//!   [`Bytes`](bytes::Bytes). Can be split into independent halves.
 //! - [`RammuxConfig`](config::RammuxConfig) holds the settings, which the two peers have to agree on.
 //! - When the peers are done, [`downgrade`](connection::RammuxConnection::downgrade) ends the session
 //!   and gives the transport back.
@@ -31,6 +29,7 @@
 //! // Any reliable byte stream can be the transport, for example a `TcpStream`.
 //! let (client_io, server_io) = tokio::io::duplex(4096);
 //! // The peers take opposite roles, and their configs must be compatible. The defaults are.
+//! // rammux has no in-band handshake, thus some config changes must be negotiated beforehand.
 //! let mut client = RammuxConnection::new(RammuxRole::Client, client_io, RammuxConfig::new());
 //! let mut server = RammuxConnection::new(RammuxRole::Server, server_io, RammuxConfig::new());
 //!
@@ -45,7 +44,12 @@
 //!             },
 //!             // Completes the downgrade, and returns the transport.
 //!             RammuxProgress::Downgraded(downgraded) => break downgraded.await,
-//!             RammuxProgress::Empty => {},
+//!             RammuxProgress::Empty => {
+//!                 // Our example transport is an in-memory duplex,
+//!                 // so it might always be ready, and never force yielding.
+//!                 // rammux reliably returns control to the caller.
+//!                 tokio::task::coop::consume_budget().await;
+//!             },
 //!         }
 //!     }
 //! });
@@ -56,8 +60,7 @@
 //!     .try_start_outbound()?
 //!     .expect("the stream limit is not reached");
 //! let mut echo = tokio::spawn(async move {
-//!     stream.send(Bytes::from_static(b"hello")).await?;
-//!     // Only closing the sink ends the stream cleanly. The server's reader ends, and so does the echo.
+//!     stream.feed(Bytes::from_static(b"hello")).await?;
 //!     stream.close().await?;
 //!     let mut reply = Vec::new();
 //!     while let Some(chunk) = stream.next().await {
@@ -66,7 +69,8 @@
 //!     Ok::<_, StreamError>(reply)
 //! });
 //!
-//! // Nothing runs in the background: streams make progress only while the connection is polled.
+//! // Nothing implicitly runs in the background:
+//! // streams make progress only while the connection is polled.
 //! let reply = loop {
 //!     tokio::select! {
 //!         reply = &mut echo => break reply??,
@@ -86,20 +90,24 @@
 //!
 //! - Create the connection within a Tokio runtime that has the time driver enabled.
 //!   [`RammuxConnection::new`](connection::RammuxConnection::new) panics otherwise.
-//! - Set `TCP_NODELAY` if the transport is a TCP socket. rammux sends small control frames,
-//!   and Nagle's algorithm would hold them back.
+//!
+//! # Advisories
+//!
+//! - Set `TCP_NODELAY` if the transport is a TCP socket. Like any multiplexer, rammux sends
+//!   small control frames. Nagle's algorithm would hold them back.
+//! - Set `TCP_NOTSENT_LOWAT` if the transport is a TCP socket (Linux/macOS). Like any multiplexer,
+//!   rammux cannot provide low latency of interactive streams if the conditions allow for building
+//!   a queue on the link.
 //! - If the transport has no vectored writes, wrap it in a `tokio::io::BufWriter`,
 //!   so that the header and the payload of a frame leave together.
+//! - If the transport does not buffer reads, wrap it in a `tokio::io::BufReader`
+//!   to avoid unnecessary overhead.
 //!
 //! # Configuration
 //!
 //! rammux has no handshake. The peers take opposite [`RammuxRole`](config::RammuxRole)s, and
 //! their [`RammuxConfig`](config::RammuxConfig)s have to match: the docs of the config say which
-//! settings, and how. Two default configs match each other.
-//!
-//! If the peers cannot know each other's settings in advance, they exchange them over the transport
-//! before they start rammux, as in
-//! [examples/negotiation.rs](https://github.com/Razz4780/rammux/blob/main/examples/negotiation.rs).
+//! settings, and how. Two default configs always match each other.
 //!
 //! # More
 //!

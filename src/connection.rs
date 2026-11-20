@@ -151,7 +151,7 @@ where
     ///
     /// # Cancellation safety
     ///
-    /// This method is cancel safe. Cancelling it will not disrupt the connection in any way.
+    /// This method is cancel safe.
     pub async fn progress(&mut self) -> Result<RammuxProgress<IO>, RammuxError> {
         futures::future::poll_fn(|cx| self.poll_progress(cx)).await
     }
@@ -200,11 +200,12 @@ pub enum RammuxProgress<IO> {
     ///
     /// See [`Downgraded`] doc for more info.
     Downgraded(Downgraded<IO>),
-    /// A new inbound stream was started by the other side.
+    /// A new stream was started by the other side.
     Inbound(RammuxDuplex),
     /// Some progress was made, but nothing meaningful to report.
     ///
-    /// This variant exists only to make [`RammuxConnection::poll_progress`] reliably return control to the caller.
+    /// This variant exists only to make [`RammuxConnection::poll_progress`]
+    /// reliably return control to the caller.
     Empty,
 }
 

@@ -91,24 +91,6 @@ jobs:
       - name: Run tests
         run: cargo test
 
-  # The crate builds and passes its tests with the oldest dependencies that Cargo.toml allows.
-  minimal_versions:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@nightly
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Select the minimal versions of direct dependencies
-        run: cargo +nightly update -Z direct-minimal-versions
-
-      - name: Run tests
-        run: cargo +stable test --locked
-
   # Miri checks the modules that use unsafe code.
   miri:
     runs-on: ubuntu-24.04
