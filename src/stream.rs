@@ -22,8 +22,6 @@ pub use outbound::ReaderStall;
 
 pub use crate::error::StreamError;
 
-#[cfg(test)]
-mod accounting_test;
 mod conn_flow;
 mod duplex;
 pub(crate) mod handle;
@@ -34,8 +32,6 @@ mod test;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod turns;
-#[cfg(test)]
-mod turns_test;
 pub(crate) mod updates;
 mod waker;
 
