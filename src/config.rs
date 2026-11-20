@@ -451,6 +451,9 @@ mod test {
         let error = RammuxConfig::default()
             .with_inbound_frame_timeout(Duration::ZERO)
             .unwrap_err();
-        assert!(error.to_string().contains("inbound_frame_timeout"), "{error}");
+        assert!(
+            error.to_string().contains("inbound_frame_timeout"),
+            "{error}"
+        );
     }
 }
