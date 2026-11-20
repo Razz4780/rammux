@@ -101,21 +101,18 @@ impl From<io::ErrorKind> for ErrorKind {
 #[error("{0}")]
 pub struct StreamViolation(pub &'static str);
 
-/// Why a stream ended, if it did not end cleanly, or why its [`RammuxSink`] cannot take data.
-///
-/// The [`RammuxStream`] of a stream yields it after the data that arrived (after the data that was read,
-/// for [`Self::PeerReset`]), and then the end of the stream.
-/// The [`RammuxSink`] returns it from every call, once its direction ended.
-///
-/// [`RammuxSink`]: crate::stream::RammuxSink
-/// [`RammuxStream`]: crate::stream::RammuxStream
+/// Why a stream ended, if it did not end cleanly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum StreamError {
-    /// The peer dropped its sink without closing it. The data that arrived before was delivered.
-    #[error("the peer stopped writing without closing the stream")]
+    /// The peer closed its sink with [`SinkClose::Abort`](crate::stream::SinkClose::Abort).
+    ///
+    /// The data that arrived before was delivered.
+    #[error("the peer aborted the stream")]
     PeerAborted,
-    /// The peer reset the stream. The data that was not read before the reset arrived was discarded.
+    /// The peer reset the stream.
+    ///
+    /// The data that was not read before the reset arrived was discarded.
     #[error("the peer reset the stream")]
     PeerReset,
     /// The peer dropped its reader. Nothing more can be written to the stream.
@@ -136,6 +133,7 @@ pub enum StreamError {
     SinkClosed,
     /// [`Sink::start_send`](futures::Sink::start_send) was called before
     /// [`Sink::poll_ready`](futures::Sink::poll_ready) returned [`Poll::Ready`](std::task::Poll::Ready).
+    ///
     /// The data was not taken, and the sink can still be used.
     #[error("the sink is not ready")]
     SinkNotReady,

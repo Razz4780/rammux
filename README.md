@@ -132,12 +132,14 @@ connection has taken the data, not until the peer has read it.
 
 The directions close independently, and the reader learns how the writer on the other side ended:
 
-- Closing the sink is the only clean end. The peer's reader gets the data, and then `None`.
-- Dropping the sink without closing it aborts the stream. The data that the connection has not taken yet is
-  discarded, and the peer's reader gets the data that arrived, then `StreamError::PeerAborted`, then `None`.
-- `reset()` gives up on the stream, for example when the peer's reader stalls and its unread data holds
-  buffers that other streams need. The data that the peer's reader has not got yet is discarded: it gets
-  `StreamError::PeerReset`, then `None`, and the peer's buffers are free for other streams.
+- Closing the sink and dropping it both close writing, in the way that `on_close(SinkClose)` set:
+  - `SinkClose::Clean`, the default: the peer's reader gets the data, and then `None`.
+  - `SinkClose::Abort`: the data that the connection has not taken yet is discarded, and the peer's reader
+    gets the data that arrived, then `StreamError::PeerAborted`, then `None`.
+  - `SinkClose::Reset` gives up on the stream, for example when the peer's reader stalls and its unread data
+    holds buffers that other streams need. The data that the peer's reader has not got yet is discarded:
+    it gets `StreamError::PeerReset`, then `None`, and the peer's buffers are free for other streams.
+    A clean close that waits for a stalled reader can still turn into a reset.
 - `reader_stall()` tells the writer how many bytes of the stream are in flight, and when the peer's reader
   last released some. A write that does not complete does not tell that.
 - Dropping the reader tells the peer's writer to stop: its sink fails with `StreamError::PeerStoppedReading`.

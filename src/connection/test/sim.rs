@@ -27,7 +27,7 @@ use tokio::{
 use crate::{
     config::{RammuxConfig, RammuxRole},
     connection::{RammuxConnection, RammuxProgress, RammuxStats},
-    stream::{RammuxDuplex, ReaderStall},
+    stream::{RammuxDuplex, ReaderStall, SinkClose},
 };
 
 /// One direction of the link.
@@ -310,7 +310,8 @@ impl Rig {
             match reset_at {
                 Some(at) => {
                     let _ = tokio::time::timeout_at(at, writing).await;
-                    sink.reset();
+                    sink.on_close(SinkClose::Reset);
+                    drop(sink);
                 },
                 None => writing.await,
             }

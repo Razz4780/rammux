@@ -21,7 +21,7 @@ use crate::{
     StreamId,
     config::{RammuxConfig, RammuxRole},
     connection::{RammuxConnection, RammuxProgress, active::CREDIT_BURST},
-    stream::RammuxDuplex,
+    stream::{RammuxDuplex, SinkClose},
     wire::{
         codec::{
             RammuxCodec,
@@ -944,7 +944,7 @@ async fn a_stream_announces_itself_once() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_sink_dropped_before_close_sends_abort() {
+async fn a_sink_dropped_with_abort_sends_abort() {
     let abort = ControlFlags {
         fin_write: true,
         abort: true,
@@ -957,6 +957,7 @@ async fn a_sink_dropped_before_close_sends_abort() {
         .now_or_never()
         .unwrap()
         .unwrap();
+    sink.on_close(SinkClose::Abort);
     drop(sink);
     // The connection did not take the data before the drop: it is discarded.
     assert_eq!(
@@ -1007,7 +1008,8 @@ async fn a_reset_sink_sends_reset() {
         .unwrap()
         .unwrap();
     // The connection did not take the second write before the reset: it is discarded.
-    sink.reset();
+    sink.on_close(SinkClose::Reset);
+    drop(sink);
     assert_eq!(stream_frames(&rig.frames()), [(0, 0, 0, reset)]);
 }
 

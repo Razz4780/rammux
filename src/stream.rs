@@ -17,7 +17,7 @@ use crate::{
 };
 
 pub(crate) use conn_flow::{ConnFlow, RxFlow};
-pub use duplex::{RammuxDuplex, RammuxSink, RammuxStream};
+pub use duplex::{RammuxDuplex, RammuxSink, RammuxStream, SinkClose};
 pub use outbound::ReaderStall;
 
 pub use crate::error::StreamError;
