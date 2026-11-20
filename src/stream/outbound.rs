@@ -112,19 +112,6 @@ impl WriteEnd {
     }
 }
 
-/// What the writer of a stream knows about the progress of its reader, see
-/// [`RammuxSink::reader_stall`](super::RammuxSink::reader_stall).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct ReaderStall {
-    /// How many bytes of the stream are in flight: sent, and not released by the peer's reader yet.
-    /// They count against the buffers of the peer, wherever they are.
-    pub unacked: u64,
-    /// When the peer last released bytes of the stream: when its last window update arrived.
-    /// [`None`] if none has arrived yet.
-    pub last_window_update: Option<Instant>,
-}
-
 /// The `FIN_WRITE` of a sending direction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FinWrite {
@@ -148,7 +135,7 @@ impl OutboundTraffic {
                 frame_limit: u64::from(frame_limit.get()),
                 loan: Loan::default(),
                 rate: RateEstimate::new(Instant::now()),
-                last_window_update: None,
+                last_ack: None,
             },
         }
     }
@@ -252,12 +239,23 @@ impl OutboundTraffic {
         };
     }
 
-    /// Returns what this side knows about the progress of the peer's reader.
-    pub fn reader_stall(&self) -> ReaderStall {
-        ReaderStall {
-            unacked: self.ledger.window.unacked(),
-            last_window_update: self.ledger.last_window_update,
+    /// Returns the bytes sent and not acked by the peer.
+    pub fn unacked(&self) -> u64 {
+        self.ledger.window.unacked()
+    }
+
+    /// Returns the bytes written by the application and not sent yet.
+    pub fn unsent(&self) -> u64 {
+        match &self.state {
+            OutboundState::Open { ready_data, .. }
+            | OutboundState::HalfClosed { ready_data, .. } => ready_data.len() as u64,
+            OutboundState::Closed { .. } => 0,
         }
+    }
+
+    /// Returns when the peer last acked bytes, if it did.
+    pub fn last_ack(&self) -> Option<Instant> {
+        self.ledger.last_ack
     }
 
     // The connection side.
@@ -342,7 +340,7 @@ impl OutboundTraffic {
             .ok_or(StreamViolation("returned more credit than was in flight"))?;
 
         let freed = self.ledger.window.set(&mut ctx.flow.tx_pool, unacked);
-        self.ledger.last_window_update = Some(ctx.now);
+        self.ledger.last_ack = Some(ctx.now);
         // The credit pays back the advance first.
         self.ledger
             .loan
@@ -424,11 +422,6 @@ impl OutboundTraffic {
         }
     }
 
-    #[cfg(test)]
-    pub fn unacked(&self) -> u64 {
-        self.ledger.window.unacked()
-    }
-
     /// Returns the advance the stream drew and has not repaid.
     #[cfg(test)]
     pub fn advance(&self) -> u64 {
@@ -457,7 +450,7 @@ struct Ledger {
     /// The rate at which the reader of the peer proved to read, `R_s`.
     rate: RateEstimate,
     /// When the peer last returned credit, if it did.
-    last_window_update: Option<Instant>,
+    last_ack: Option<Instant>,
 }
 
 impl Ledger {

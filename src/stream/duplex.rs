@@ -10,7 +10,7 @@ use futures::{Sink, SinkExt, Stream, StreamExt};
 use crate::{
     StreamId,
     error::StreamError,
-    stream::{ReaderStall, StreamRef},
+    stream::{StreamRef, StreamStats},
 };
 
 /// Bidirectional virtual data stream created within a rammux connection.
@@ -31,10 +31,7 @@ impl RammuxDuplex {
                 shared: shared.clone(),
                 on_close: SinkClose::default(),
             },
-            stream: RammuxStream {
-                id,
-                shared: Some(shared),
-            },
+            stream: RammuxStream { id, shared },
         }
     }
 
@@ -48,9 +45,13 @@ impl RammuxDuplex {
         (self.sink, self.stream)
     }
 
-    /// Tells how the peer's reader is getting on, see [`RammuxSink::reader_stall`].
-    pub fn reader_stall(&self) -> ReaderStall {
-        self.sink.reader_stall()
+    /// Returns where the bytes of the stream are, see [`StreamStats`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if another user of the stream panicked while holding its lock.
+    pub fn stats(&self) -> StreamStats {
+        self.sink.stats()
     }
 
     /// Sets how the sink closes writing, see [`RammuxSink::on_close`].
@@ -155,38 +156,13 @@ impl RammuxSink {
         self.id
     }
 
-    /// Tells how the peer's reader is getting on: how many bytes of the stream are in flight, and when
-    /// the peer last released some. With it, the application can decide that the reader is stalled,
-    /// and close the sink with [`SinkClose::Reset`].
-    ///
-    /// These are the two facts that this side has, and they do not make a verdict:
-    /// - [`ReaderStall::unacked`] counts the bytes that are still on their way, too. The peer releases
-    ///   bytes in steps of up to 32 KiB (at most half of its receive window for a stream), so a count
-    ///   below that can stay for good while the reader keeps up.
-    /// - On a slow connection, or on one that many streams share, a stream whose reader keeps up also
-    ///   goes for long between two window updates. A limit has to allow for the connection.
-    ///
-    /// Once the peer stopped reading, nothing is in flight. Once the connection is gone, both facts stay
-    /// as they were. The time is a [`tokio::time::Instant`].
-    ///
-    /// ```
-    /// # use std::time::Duration;
-    /// # use rammux::stream::{RammuxSink, SinkClose};
-    /// # fn give_up(mut sink: RammuxSink) {
-    /// let stall = sink.reader_stall();
-    /// let waited = stall.last_window_update.map(|at| at.elapsed());
-    /// if stall.unacked >= 1024 * 1024 && waited.is_some_and(|waited| waited > Duration::from_secs(30)) {
-    ///     sink.on_close(SinkClose::Reset);
-    ///     drop(sink);
-    /// }
-    /// # }
-    /// ```
+    /// Returns where the bytes of the stream are, see [`StreamStats`].
     ///
     /// # Panics
     ///
     /// Panics if another user of the stream panicked while holding its lock.
-    pub fn reader_stall(&self) -> ReaderStall {
-        self.shared.lock().outbound.reader_stall()
+    pub fn stats(&self) -> StreamStats {
+        self.shared.lock().stats()
     }
 
     /// Sets how the sink closes writing, in [`Sink::poll_close`] and when it is dropped.
@@ -260,8 +236,7 @@ impl Drop for RammuxSink {
 /// side fails with [`StreamError::PeerStoppedReading`].
 pub struct RammuxStream {
     id: StreamId,
-    /// [`None`] once reading is closed.
-    shared: Option<StreamRef>,
+    shared: StreamRef,
 }
 
 impl RammuxStream {
@@ -269,13 +244,21 @@ impl RammuxStream {
     pub fn id(&self) -> StreamId {
         self.id
     }
+
+    /// Returns where the bytes of the stream are, see [`StreamStats`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if another user of the stream panicked while holding its lock.
+    pub fn stats(&self) -> StreamStats {
+        self.shared.lock().stats()
+    }
 }
 
 impl fmt::Debug for RammuxStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RammuxStream")
             .field("id", &self.id)
-            .field("closed", &self.shared.is_none())
             .finish_non_exhaustive()
     }
 }
@@ -284,29 +267,21 @@ impl Stream for RammuxStream {
     type Item = Result<Bytes, StreamError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        let Some(shared) = &this.shared else {
-            return Poll::Ready(None);
-        };
+        let shared = &self.shared;
         let item = std::task::ready!(
             shared
                 .lock()
                 .inbound
                 .poll_read(cx.waker(), &shared.credit_task)
         );
-        if item.is_none() {
-            this.shared = None;
-        }
         Poll::Ready(item.map(|result| result.map(Bytes::from)))
     }
 }
 
 impl Drop for RammuxStream {
     fn drop(&mut self) {
-        if let Some(shared) = self.shared.take()
-            && let Some(mut state) = shared.try_lock()
-        {
-            state.inbound.close_reading(&shared.credit_task);
+        if let Some(mut state) = self.shared.try_lock() {
+            state.inbound.close_reading(&self.shared.credit_task);
         }
     }
 }

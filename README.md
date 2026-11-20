@@ -140,8 +140,9 @@ The directions close independently, and the reader learns how the writer on the 
     holds buffers that other streams need. The data that the peer's reader has not got yet is discarded:
     it gets `StreamError::PeerReset`, then `None`, and the peer's buffers are free for other streams.
     A clean close that waits for a stalled reader can still turn into a reset.
-- `reader_stall()` tells the writer how many bytes of the stream are in flight, and when the peer's reader
-  last released some. A write that does not complete does not tell that.
+- `stats()` tells where the bytes of the stream are: sent and not acked by the peer's reader yet, written
+  and not sent yet, received and not read yet. It also tells when the peer last acked some. A write that
+  does not complete does not tell that a reader stalled, the unacked bytes and the time of the last ack do.
 - Dropping the reader tells the peer's writer to stop: its sink fails with `StreamError::PeerStoppedReading`.
 - When the connection ends, so do the streams that are still open. Their readers get the data that arrived,
   then `StreamError::ConnectionFailed`, `ConnectionDowngraded` or `ConnectionDropped`, and their sinks fail

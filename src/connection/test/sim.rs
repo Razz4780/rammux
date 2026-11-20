@@ -27,7 +27,7 @@ use tokio::{
 use crate::{
     config::{RammuxConfig, RammuxRole},
     connection::{RammuxConnection, RammuxProgress, RammuxStats},
-    stream::{RammuxDuplex, ReaderStall, SinkClose},
+    stream::{RammuxDuplex, SinkClose, StreamStats},
 };
 
 /// One direction of the link.
@@ -203,8 +203,8 @@ async fn drive(
 /// What the writer of a stream saw of its reader, see [`Rig::bulk_watched`].
 #[derive(Default)]
 struct Watch {
-    /// The last answer of `reader_stall`.
-    last: Option<ReaderStall>,
+    /// The last answer of `stats`.
+    last: Option<StreamStats>,
     /// The longest time it saw since the last window update, while a window or more was in flight.
     longest_wait: Duration,
 }
@@ -336,10 +336,10 @@ impl Rig {
                 if matches!(sent, Ok(Err(..))) {
                     break;
                 }
-                let stall = sink.reader_stall();
+                let stall = sink.stats();
                 let mut seen = seen.lock().unwrap();
                 seen.last = Some(stall);
-                if let Some(updated) = stall.last_window_update
+                if let Some(updated) = stall.last_ack
                     && stall.unacked >= WINDOW
                 {
                     seen.longest_wait = seen.longest_wait.max(updated.elapsed());
@@ -511,7 +511,7 @@ async fn the_writer_sees_that_its_reader_stalled() {
     // The stalled stream holds more than its window, and the last window update is as old as the stall.
     let stall = stalled.lock().unwrap().last.unwrap();
     assert!(stall.unacked > WINDOW, "{stall:?}");
-    let since_update = stall.last_window_update.unwrap().elapsed();
+    let since_update = stall.last_ack.unwrap().elapsed();
     let slack = Duration::from_millis(200);
     assert!(
         since_update > waited - slack && since_update < waited + slack,
@@ -520,12 +520,12 @@ async fn the_writer_sees_that_its_reader_stalled() {
 
     // The window updates of the healthy stream keep coming.
     let healthy = healthy.lock().unwrap();
-    let since_update = healthy.last.unwrap().last_window_update.unwrap().elapsed();
+    let since_update = healthy.last.unwrap().last_ack.unwrap().elapsed();
     assert!(since_update < slack, "{since_update:?}");
     assert!(healthy.longest_wait < slack, "{:?}", healthy.longest_wait);
 }
 
-/// The caveat of `RammuxSink::reader_stall`: the time since the last window update is long on a slow
+/// The caveat of `RammuxSink::stats`: the time since the last window update is long on a slow
 /// connection too, with readers that keep up.
 #[tokio::test(start_paused = true)]
 async fn window_updates_are_rare_on_a_slow_link() {

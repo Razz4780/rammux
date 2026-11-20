@@ -292,6 +292,18 @@ impl InboundTraffic {
         }
     }
 
+    /// Returns the bytes received and not read by the application yet.
+    pub fn unread(&self) -> u64 {
+        match &self.state {
+            // The bytes received and not credited back, but those read already.
+            InboundState::Open { .. } | InboundState::HalfClosed { .. } => {
+                self.window.unacked() - self.credit
+            },
+            // Discarded, or read.
+            InboundState::Closed { .. } => 0,
+        }
+    }
+
     #[cfg(test)]
     pub fn unacked(&self) -> u64 {
         self.window.unacked()

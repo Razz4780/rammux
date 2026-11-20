@@ -630,7 +630,7 @@ impl Session {
         let window = u64::from(self.peer.config.remote_recv_window.get());
         let mut full = 0;
         for sink in self.app.iter().filter_map(|(sink, _)| sink.as_ref()) {
-            let stall = sink.reader_stall();
+            let stall = sink.stats();
             // A stream that the peer stopped reading holds nothing, and its ID may be in use again.
             if stall.unacked == 0 {
                 continue;
