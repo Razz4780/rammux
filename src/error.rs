@@ -14,15 +14,18 @@ pub struct RammuxError(#[from] pub(crate) ErrorKind);
 impl RammuxError {
     /// Returns whether this error originates from misuse of this crate.
     pub fn is_user(&self) -> bool {
-        self.0.is_misuse()
+        match &self.0 {
+            ErrorKind::AlreadyDowngraded | ErrorKind::Poisoned | ErrorKind::Config(..) => true,
+            ErrorKind::Decode(..) | ErrorKind::Io(..) | ErrorKind::Stream { .. } => false,
+        }
     }
 
-    /// Returns whether this error originates from an IO failure in the supplied transport.
+    /// Returns whether this error originates from an IO failure in the underlying transport.
     pub fn is_io(&self) -> bool {
         matches!(&self.0, ErrorKind::Io(..))
     }
 
-    /// If this error originates from an IO failure in the supplied transport, returns a reference to the source error.
+    /// If this error originates from an IO failure in the underlying transport, returns a reference to the source error.
     pub fn as_io(&self) -> Option<&io::Error> {
         if let ErrorKind::Io(error) = &self.0 {
             Some(error)
@@ -31,7 +34,7 @@ impl RammuxError {
         }
     }
 
-    /// If this error originates from an IO failure in the supplied transport, returns the source error.
+    /// If this error originates from an IO failure in the underlying transport, returns the source error.
     pub fn into_io(self) -> Result<io::Error, Self> {
         match self.0 {
             ErrorKind::Io(error) => Ok(error),
@@ -43,7 +46,10 @@ impl RammuxError {
     pub fn is_protocol_violation(&self) -> bool {
         match &self.0 {
             ErrorKind::Decode(..) | ErrorKind::Stream { .. } => true,
-            ErrorKind::Io(..) | ErrorKind::AlreadyDowngraded | ErrorKind::Poisoned => false,
+            ErrorKind::Io(..)
+            | ErrorKind::AlreadyDowngraded
+            | ErrorKind::Poisoned
+            | ErrorKind::Config(..) => false,
         }
     }
 }
@@ -79,13 +85,9 @@ pub enum ErrorKind {
     AlreadyDowngraded,
     #[error("connection poisoned")]
     Poisoned,
-}
-
-impl ErrorKind {
-    /// Returns whether the connection was used after it stopped working.
-    pub fn is_misuse(&self) -> bool {
-        matches!(self, Self::AlreadyDowngraded | Self::Poisoned)
-    }
+    /// A [`RammuxConfig`](crate::config::RammuxConfig) setting was rejected.
+    #[error("invalid config: {0}")]
+    Config(String),
 }
 
 impl From<io::ErrorKind> for ErrorKind {

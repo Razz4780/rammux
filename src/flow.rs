@@ -117,7 +117,7 @@ pub struct Advance {
 impl Advance {
     /// Creates an unused advance of `grant` and `budget` fractions of a pool of `pool` bytes, rounded down.
     ///
-    /// The fractions are what [`RammuxConfig::validate`](crate::config::RammuxConfig::validate) accepts.
+    /// The fractions are what [`RammuxConfig`](crate::config::RammuxConfig) accepts.
     pub fn new(pool: u32, grant: f32, budget: f32) -> Self {
         let bytes = |fraction: f32| {
             // Within 0..=pool for a valid fraction, and the cast saturates for an invalid one.

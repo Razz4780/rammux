@@ -37,8 +37,8 @@ impl ConnFlow {
     pub fn with_advance(mut self, config: &RammuxConfig) -> Self {
         self.advance = Advance::new(
             config.remote_recv_pool,
-            config.advance_grant,
-            config.advance_budget,
+            config.stream_advance_grant,
+            config.conn_advance_grant,
         );
         self
     }

@@ -45,7 +45,7 @@ struct Side {
 impl Side {
     fn new(role: RammuxRole, io: DuplexStream) -> Self {
         Self {
-            conn: RammuxConnection::new(role, io, config()).unwrap(),
+            conn: RammuxConnection::new(role, io, config()),
             inbound: Vec::new(),
         }
     }
@@ -741,8 +741,8 @@ async fn streams_end_cleanly_with_the_applications_on_other_threads() {
     config.local_recv_pool = 64 * 1024;
     config.remote_recv_pool = 64 * 1024;
     let (io_a, io_b) = tokio::io::duplex(64 * 1024);
-    let mut a = RammuxConnection::new(RammuxRole::Client, io_a, config.clone()).unwrap();
-    let mut b = RammuxConnection::new(RammuxRole::Server, io_b, config).unwrap();
+    let mut a = RammuxConnection::new(RammuxRole::Client, io_a, config.clone());
+    let mut b = RammuxConnection::new(RammuxRole::Server, io_b, config);
 
     let mut talks = Vec::new();
     for seed in 0..STREAMS {

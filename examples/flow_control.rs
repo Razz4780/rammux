@@ -16,10 +16,8 @@ const DATA: Bytes = Bytes::from_static(&[37; 64 * 1024]);
 #[tokio::main]
 async fn main() {
     let (io_1, io_2) = tokio::io::duplex(4096);
-    let client = RammuxConnection::new(RammuxRole::Client, io_1, RammuxConfig::new())
-        .expect("config is valid");
-    let server = RammuxConnection::new(RammuxRole::Server, io_2, RammuxConfig::new())
-        .expect("config is valid");
+    let client = RammuxConnection::new(RammuxRole::Client, io_1, RammuxConfig::new());
+    let server = RammuxConnection::new(RammuxRole::Server, io_2, RammuxConfig::new());
     tokio::join!(run_client(client), run_server(server));
 }
 
