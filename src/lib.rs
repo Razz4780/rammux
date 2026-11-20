@@ -31,8 +31,8 @@
 //! // Any reliable byte stream can be the transport, for example a `TcpStream`.
 //! let (client_io, server_io) = tokio::io::duplex(4096);
 //! // The peers take opposite roles, and their configs must be compatible. The defaults are.
-//! let mut client = RammuxConnection::new(RammuxRole::Client, client_io, RammuxConfig::new())?;
-//! let mut server = RammuxConnection::new(RammuxRole::Server, server_io, RammuxConfig::new())?;
+//! let mut client = RammuxConnection::new(RammuxRole::Client, client_io, RammuxConfig::new());
+//! let mut server = RammuxConnection::new(RammuxRole::Server, server_io, RammuxConfig::new());
 //!
 //! // The server echoes every stream, until the client ends the session.
 //! let server = tokio::spawn(async move {

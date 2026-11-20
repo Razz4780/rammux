@@ -50,7 +50,7 @@ Nothing of this is on the wire. The peer sees only `DATA` that stays within its 
 | `borrowed` | `max(0, unacked - B)`: what a stream uses of the pool. The sum over the streams, `U`, never exceeds `P`. |
 | `srtt` | Smoothed round trip time, measured with `PING` and `PONG`. |
 | `T_c` | `max(1, min(32 KiB, B / 2))`: the step in which the receiver returns credit. |
-| `g`, `G` | The advance: what one stream may take, and all streams together (`advance_grant`, `advance_budget`). |
+| `g`, `G` | The advance: what one stream may take, and all streams together (`stream_advance_grant`, `conn_advance_grant`). |
 
 ### Within the base window
 
@@ -180,6 +180,7 @@ TCP makes them, for every multiplexer.
   A smaller pool means less latency for interactive streams and less memory. Any size works, zero included.
 - **The base window** (`local_recv_window`, and the peer's `remote_recv_window`). Every stream gets it, whatever
   the others do, and the memory for it is reserved for every open stream. Keep it small.
-- **The advance** (`advance_grant`, `advance_budget`). Fractions of the pool, a quarter each by default.
-  A larger grant makes bursts and latecomers faster. The budget is what readers that never read can pin.
+- **The advance** (`stream_advance_grant`, `conn_advance_grant`). Fractions of the pool, a quarter each by default.
+  A larger `stream_advance_grant` makes bursts and latecomers faster. `conn_advance_grant` is what readers that
+  never read can pin.
   Set both to 0 to turn the advance off.

@@ -51,8 +51,8 @@ async fn two_sides(#[values(1, 16, 64)] streams: u32) {
     config.ping_interval = Duration::from_millis(25);
     config.max_inbound_streams = 16;
     config.max_outbound_streams = 16;
-    let conn_1 = RammuxConnection::new(RammuxRole::Client, io_1, config.clone()).unwrap();
-    let conn_2 = RammuxConnection::new(RammuxRole::Server, io_2, config.clone()).unwrap();
+    let conn_1 = RammuxConnection::new(RammuxRole::Client, io_1, config.clone());
+    let conn_2 = RammuxConnection::new(RammuxRole::Server, io_2, config.clone());
     tokio::join!(
         run_rammux(conn_1, streams, 32 * 1024).then(verify_io_clean),
         run_rammux(conn_2, streams, 32 * 1024).then(verify_io_clean),

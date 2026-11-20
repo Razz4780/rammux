@@ -49,7 +49,7 @@ pub(super) fn rig(role: RammuxRole, config: RammuxConfig) -> Rig {
     let (io_1, io_2) = tokio::io::duplex(1 << 20);
     let (read, write) = tokio::io::split(io_2);
     Rig {
-        conn: RammuxConnection::new(role, io_1, config.clone()).unwrap(),
+        conn: RammuxConnection::new(role, io_1, config.clone()),
         peer_in: RammuxCodec::new(read, config.frame_limit, Duration::from_secs(3600)),
         peer_out: write,
     }
@@ -586,8 +586,7 @@ async fn a_flood_of_pings_is_read_without_a_stall_and_answered_with_the_latest()
     // back, but the connection must keep reading, and hold at most one answer.
     let (read, mut peer_out) = tokio::io::duplex(1 << 20);
     let (write, mut peer_in) = tokio::io::duplex(1024);
-    let mut conn =
-        RammuxConnection::new(RammuxRole::Server, Pipes { read, write }, config()).unwrap();
+    let mut conn = RammuxConnection::new(RammuxRole::Server, Pipes { read, write }, config());
     let owed = |conn: &RammuxConnection<Pipes>| conn.state.active().unwrap().owed_pong();
     let ping = |t_ping| {
         raw(
@@ -646,8 +645,7 @@ async fn a_blocked_writer_keeps_reading_and_owes_one_pong() {
     // The transport does not drain: not even the first frame fits into the pipe back.
     let (read, mut peer_out) = tokio::io::duplex(1 << 20);
     let (write, mut peer_in) = tokio::io::duplex(4);
-    let mut conn =
-        RammuxConnection::new(RammuxRole::Server, Pipes { read, write }, config()).unwrap();
+    let mut conn = RammuxConnection::new(RammuxRole::Server, Pipes { read, write }, config());
     let owed = |conn: &RammuxConnection<Pipes>| conn.state.active().unwrap().owed_pong();
 
     // The first PING rides along with the frame that the writer then gets stuck on.
@@ -780,8 +778,7 @@ async fn a_window_update_does_not_wait_behind_the_data_of_other_streams() {
     let (write, mut peer_in) = tokio::io::duplex(64);
     let mut small_window = config();
     small_window.local_recv_window = NonZeroU32::new(512).unwrap();
-    let mut conn =
-        RammuxConnection::new(RammuxRole::Client, Pipes { read, write }, small_window).unwrap();
+    let mut conn = RammuxConnection::new(RammuxRole::Client, Pipes { read, write }, small_window);
 
     // Four streams have four frames of data each, and the transport fills up.
     let mut uploads = Vec::new();

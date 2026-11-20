@@ -224,8 +224,8 @@ struct Rig {
 impl Rig {
     fn new(mbit: f64, rtt: Duration, config: RammuxConfig) -> Self {
         let (client_io, server_io, forward, backward) = link(mbit, rtt / 2);
-        let client = RammuxConnection::new(RammuxRole::Client, client_io, config.clone()).unwrap();
-        let server = RammuxConnection::new(RammuxRole::Server, server_io, config).unwrap();
+        let client = RammuxConnection::new(RammuxRole::Client, client_io, config.clone());
+        let server = RammuxConnection::new(RammuxRole::Server, server_io, config);
         let (open, open_rx) = mpsc::unbounded_channel();
         let (server_open, server_open_rx) = mpsc::unbounded_channel();
         let (client_in, client_streams) = mpsc::unbounded_channel();
@@ -634,7 +634,7 @@ async fn streams_in_both_directions_complete_with_tiny_windows_and_no_pool(
         (RammuxRole::Client, client_io),
         (RammuxRole::Server, server_io),
     ] {
-        let conn = RammuxConnection::new(role, io, config.clone()).unwrap();
+        let conn = RammuxConnection::new(role, io, config.clone());
         let (open, open_rx) = mpsc::unbounded_channel();
         let (inbound, mut inbound_rx) = mpsc::unbounded_channel();
         let stats = Arc::new(Mutex::new(RammuxStats::default()));
@@ -687,15 +687,15 @@ async fn the_shares_of_streams_follow_the_size_of_their_writes() {
 
 /// No advance: the sender follows only the proven rate.
 fn without_advance(mut config: RammuxConfig) -> RammuxConfig {
-    config.advance_grant = 0.0;
-    config.advance_budget = 0.0;
+    config.stream_advance_grant = 0.0;
+    config.conn_advance_grant = 0.0;
     config
 }
 
 /// The advance of the sim tests: `g` = 1/16 and `G` = 1/4 of the pool.
 fn with_advance(mut config: RammuxConfig) -> RammuxConfig {
-    config.advance_grant = 1.0 / 16.0;
-    config.advance_budget = 0.25;
+    config.stream_advance_grant = 1.0 / 16.0;
+    config.conn_advance_grant = 0.25;
     config
 }
 

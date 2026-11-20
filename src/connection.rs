@@ -9,7 +9,7 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{
-    config::{ConfigError, RammuxConfig, RammuxRole},
+    config::{RammuxConfig, RammuxRole},
     connection::{
         active::{Active, Received},
         state::ConnState,
@@ -80,20 +80,18 @@ where
 {
     /// Creates a new rammux connection with clean state.
     ///
-    /// Fails if the config is not valid, see [`RammuxConfig::validate`].
-    ///
     /// # Panics
     ///
     /// Panics if called outside of a Tokio runtime, or in a runtime without the time driver
     /// (`enable_time` or `enable_all` on the runtime builder). The connection uses Tokio timers
     /// for the `PING`s and the inbound frame timeout.
-    pub fn new(role: RammuxRole, io: IO, config: RammuxConfig) -> Result<Self, ConfigError> {
-        config.validate()?;
-        Ok(Self {
+    pub fn new(role: RammuxRole, io: IO, config: RammuxConfig) -> Self {
+        debug_assert!(config.validate().is_ok(), "{:?}", config.validate());
+        Self {
             state: ConnState::Active(Active::new(io, role, &config)),
             config,
             role,
-        })
+        }
     }
 
     /// Returns the config of this connection.
@@ -143,10 +141,7 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<RammuxProgress<IO>, RammuxError>> {
         let result = std::task::ready!(self.poll_progress_inner(cx));
-        // A failure of the connection is final. A misuse leaves the connection as it is.
-        if let Err(error) = &result
-            && !error.is_misuse()
-        {
+        if result.is_err() {
             self.state.poison();
         }
         Poll::Ready(result.map_err(From::from))
@@ -238,21 +233,21 @@ pub struct RammuxStats {
     pub srtt: Option<Duration>,
     /// Bytes of the peer's receive pool that our streams use.
     ///
-    /// At most [`remote_recv_pool`](crate::config::RammuxConfig::remote_recv_pool).
+    /// At most [`remote_recv_pool`](RammuxConfig::with_remote_recv_pool).
     pub pool_tx_used: u64,
     /// Bytes of our receive pool that the peer's streams use.
     ///
-    /// At most [`local_recv_pool`](crate::config::RammuxConfig::local_recv_pool).
+    /// At most [`local_recv_pool`](RammuxConfig::with_local_recv_pool).
     pub pool_rx_used: u64,
     /// How many of our streams wait for their turn to use the peer's pool.
     ///
     /// Streams wait when they have more to send than the pool has room for.
     pub turn_queue_len: u32,
     /// Bytes of the peer's pool that our streams hold as an advance, see
-    /// [`advance_grant`](crate::config::RammuxConfig::advance_grant).
+    /// [`stream_advance_grant`](RammuxConfig::with_stream_advance_grant).
     ///
     /// An advance is paid back as the peer's application reads. A value that stays high means that
     /// some streams are not being read. At most
-    /// [`advance_budget`](crate::config::RammuxConfig::advance_budget) of the pool.
+    /// [`conn_advance_grant`](RammuxConfig::with_conn_advance_grant) of the pool.
     pub advance_held: u64,
 }

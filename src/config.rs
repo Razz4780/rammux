@@ -1,4 +1,4 @@
-//! rammux connection configuration.
+//! Settings of a rammux connection.
 
 use std::{
     fmt,
@@ -6,17 +6,17 @@ use std::{
     time::Duration,
 };
 
-use thiserror::Error;
+use crate::error::{ErrorKind, RammuxError};
 
-/// Role in a rammux connection.
+/// The role of a peer in a rammux connection.
 ///
-/// The two peers of a connection take opposite roles. The role only decides which
-/// [`StreamId`](crate::StreamId)s a peer gives to the streams it starts.
+/// The two peers must take opposite roles. The role only decides which [`StreamId`](crate::StreamId)s
+/// can be used when starting a new stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RammuxRole {
-    /// Can initiate streams with even IDs.
+    /// Starts streams with even IDs.
     Client,
-    /// Can initiate streams with odd IDs.
+    /// Starts streams with odd IDs.
     Server,
 }
 
@@ -29,111 +29,61 @@ impl fmt::Display for RammuxRole {
     }
 }
 
-/// Configuration for a [`RammuxConnection`](crate::connection::RammuxConnection).
+/// Settings of a [`RammuxConnection`](crate::connection::RammuxConnection).
 ///
-/// [`RammuxConfig::new`] returns the defaults. The fields are public: change the ones you need.
+/// Start from the defaults and change what you need:
+///
+/// ```
+/// # use std::num::NonZeroU16;
+/// # use rammux::config::RammuxConfig;
+/// # fn main() -> Result<(), rammux::RammuxError> {
+/// let config = RammuxConfig::default()
+///     .with_frame_limit(NonZeroU16::new(8 * 1024).unwrap())
+///     .with_stream_advance_grant(0.1)?
+///     .with_remote_recv_pool(1024 * 1024);
+/// assert_eq!(config.remote_recv_pool(), 1024 * 1024);
+/// # Ok(())
+/// # }
+/// ```
 ///
 /// # Settings that the peers have to agree on
 ///
-/// rammux has no handshake, so each peer must know the settings of the other before the connection starts.
-/// A connection whose peers do not agree fails, or loses throughput.
+/// rammux has no handshake. Each peer must know **some** of the other's settings before the connection starts.
+/// Those settings are protocol-level limits. If the configured limits don't match,
+/// [`RammuxConnection`](crate::connection::RammuxConnection) might breach them at runtime, triggering
+/// a protocol violation error on any side.
 ///
-/// | This side | The peer |
-/// | --- | --- |
-/// | [`frame_limit`](Self::frame_limit) | the same `frame_limit` |
-/// | [`max_outbound_streams`](Self::max_outbound_streams) | at most its `max_inbound_streams` |
-/// | [`max_inbound_streams`](Self::max_inbound_streams) | at least its `max_outbound_streams` |
-/// | [`local_recv_window`](Self::local_recv_window) | its `remote_recv_window` |
-/// | [`remote_recv_window`](Self::remote_recv_window) | its `local_recv_window` |
-/// | [`local_recv_pool`](Self::local_recv_pool) | its `remote_recv_pool` |
-/// | [`remote_recv_pool`](Self::remote_recv_pool) | its `local_recv_pool` |
+/// * [`frame_limit`](Self::with_frame_limit) must be the same on both sides
+/// * [`max_outbound_streams`](Self::with_max_outbound_streams) must be less or equal to
+///   [`max_inbound_streams`](Self::with_max_inbound_streams) of the other side
+/// * [`local_recv_window`](Self::with_local_recv_window) must be the same as
+///   [`remote_recv_window`](Self::with_remote_recv_window) of the other side
+/// * [`local_recv_pool`](Self::with_local_recv_pool) must be the same as
+///   [`remote_recv_pool`](Self::with_remote_recv_pool) of the other side
 ///
-/// Two default configs match each other. All other settings are local: each side chooses them freely.
+/// The other settings are local knobs.
+///
+/// Two default configs always match.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct RammuxConfig {
-    /// The most data that is sent in one frame, in bytes. Larger writes are split.
-    ///
-    /// Default: 16 KiB. Must be the same on both sides.
-    pub frame_limit: NonZeroU16,
-    /// How many streams started by the peer can be open at a time.
-    ///
-    /// The connection fails if the peer starts more.
-    ///
-    /// Default: 128. At most [`MAX_STREAMS_PER_SIDE`], and not less than the peer's
-    /// [`max_outbound_streams`](Self::max_outbound_streams).
-    pub max_inbound_streams: u16,
-    /// How many streams started by this side can be open at a time.
-    ///
-    /// At the limit, [`try_start_outbound`](crate::connection::RammuxConnection::try_start_outbound)
-    /// returns [`None`] until a stream is closed by both sides.
-    ///
-    /// Default: 128. At most [`MAX_STREAMS_PER_SIDE`], and not more than the peer's
-    /// [`max_inbound_streams`](Self::max_inbound_streams).
-    pub max_outbound_streams: u16,
-    /// Receive window of every stream, in bytes.
-    ///
-    /// This much data of a stream can wait for the application to read it, whatever the other streams do.
-    /// Streams that need more share [`local_recv_pool`](Self::local_recv_pool). The memory that the connection
-    /// uses for received data is at most `streams * local_recv_window + local_recv_pool`.
-    ///
-    /// Default: 64 KiB. Must be the peer's [`remote_recv_window`](Self::remote_recv_window).
-    pub local_recv_window: NonZeroU32,
-    /// The peer's [`local_recv_window`](Self::local_recv_window).
-    ///
-    /// Default: 64 KiB.
-    pub remote_recv_window: NonZeroU32,
-    /// Receive memory that all streams share on top of their windows, in bytes.
-    ///
-    /// The pool is what lets busy streams go fast, and it is what limits the queue that the connection builds.
-    /// A connection carries at most about `(streams * window + pool) / round trip time`, and delays an interactive
-    /// stream by up to `(streams * window + pool) / bandwidth`. A pool of about the bandwidth times the round
-    /// trip time is enough for full speed. Any size works, 0 included.
-    ///
-    /// Default: 4 MiB. Must be the peer's [`remote_recv_pool`](Self::remote_recv_pool).
-    pub local_recv_pool: u32,
-    /// The peer's [`local_recv_pool`](Self::local_recv_pool).
-    ///
-    /// Default: 4 MiB.
-    pub remote_recv_pool: u32,
-    /// How much of the peer's pool a new or idle stream may use at once, as a fraction of
-    /// [`remote_recv_pool`](Self::remote_recv_pool).
-    ///
-    /// A stream normally earns its part of the pool: it starts with the peer's window, and may send more as
-    /// the peer's application proves to read, about twice as much every round trip. The advance lets a stream
-    /// that starts, or resumes after a pause, send a burst of the window plus this grant right away.
-    ///
-    /// A larger grant means faster bursts, and more that a stream whose reader never reads can hold on to.
-    /// See [`advance_budget`](Self::advance_budget) for the limit on that.
-    ///
-    /// Default: 0.25. From 0 to `advance_budget`. With 0, there is no advance. This setting is local.
-    pub advance_grant: f32,
-    /// How much of the peer's pool all streams together may hold as an advance, as a fraction of
-    /// [`remote_recv_pool`](Self::remote_recv_pool).
-    ///
-    /// This is the most that streams whose readers never read can take away from the others, on top of their
-    /// windows. Once it is used up, new streams start without an advance.
-    ///
-    /// Default: 0.25. From [`advance_grant`](Self::advance_grant) to 1. This setting is local.
-    pub advance_budget: f32,
-    /// A `PING` is sent at least this often, which keeps an idle connection alive.
-    ///
-    /// Default: 5 s. Not zero, and shorter than [`inbound_frame_timeout`](Self::inbound_frame_timeout).
-    /// This setting is local.
-    pub ping_interval: Duration,
-    /// The connection fails when nothing arrives from the peer for this long.
-    ///
-    /// The peer answers `PING`s, so a connection that is idle and healthy does not time out.
-    ///
-    /// Default: 10 s. This setting is local.
-    pub inbound_frame_timeout: Duration,
+    pub(crate) frame_limit: NonZeroU16,
+    pub(crate) max_inbound_streams: u16,
+    pub(crate) max_outbound_streams: u16,
+    pub(crate) local_recv_window: NonZeroU32,
+    pub(crate) remote_recv_window: NonZeroU32,
+    pub(crate) local_recv_pool: u32,
+    pub(crate) remote_recv_pool: u32,
+    pub(crate) stream_advance_grant: f32,
+    pub(crate) conn_advance_grant: f32,
+    pub(crate) ping_interval: Duration,
+    pub(crate) inbound_frame_timeout: Duration,
 }
 
 impl RammuxConfig {
-    /// Creates a config with the default settings, which the docs of the fields list.
+    /// Creates a config with the default settings, same as [`RammuxConfig::default`].
     ///
-    /// Two default configs match each other. If you change a setting that the peers have to agree on,
-    /// change it on both sides.
+    /// Two default configs match. If you change a setting that the peers have to agree on,
+    /// change it on both sides. See this struct's docs.
     pub const fn new() -> Self {
         Self {
             frame_limit: NonZeroU16::new(16 * 1024).unwrap(),
@@ -143,94 +93,219 @@ impl RammuxConfig {
             remote_recv_window: NonZeroU32::new(64 * 1024).unwrap(),
             local_recv_pool: 4 * 1024 * 1024,
             remote_recv_pool: 4 * 1024 * 1024,
-            advance_grant: 0.25,
-            advance_budget: 0.25,
+            stream_advance_grant: 0.25,
+            conn_advance_grant: 0.25,
             ping_interval: Duration::from_secs(5),
             inbound_frame_timeout: Duration::from_secs(10),
         }
     }
-}
 
-impl RammuxConfig {
-    /// Checks that this config can be used to run a connection.
+    /// Sets the largest allowed frame payload, in bytes.
     ///
-    /// [`RammuxConnection::new`](crate::connection::RammuxConnection::new) calls this.
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.max_inbound_streams > MAX_STREAMS_PER_SIDE {
-            return Err(ConfigError::TooManyStreams {
-                field: "max_inbound_streams",
-                value: self.max_inbound_streams,
-            });
-        }
-        if self.max_outbound_streams > MAX_STREAMS_PER_SIDE {
-            return Err(ConfigError::TooManyStreams {
-                field: "max_outbound_streams",
-                value: self.max_outbound_streams,
-            });
-        }
-        for (field, value) in [
-            ("advance_grant", self.advance_grant),
-            ("advance_budget", self.advance_budget),
-        ] {
-            if !(0.0..=1.0).contains(&value) {
-                return Err(ConfigError::AdvanceNotAFraction { field });
-            }
-        }
-        if self.advance_grant > self.advance_budget {
-            return Err(ConfigError::AdvanceGrantAboveBudget);
-        }
-        if self.ping_interval.is_zero() {
-            return Err(ConfigError::ZeroPingInterval);
-        }
-        if self.ping_interval >= self.inbound_frame_timeout {
-            return Err(ConfigError::PingIntervalTooLong {
-                ping_interval: self.ping_interval,
-                inbound_frame_timeout: self.inbound_frame_timeout,
-            });
+    /// Larger writes are split into several frames.
+    ///
+    /// Default: 16 KiB. Must be the same on both sides.
+    pub const fn with_frame_limit(mut self, frame_limit: NonZeroU16) -> Self {
+        self.frame_limit = frame_limit;
+        self
+    }
+
+    /// Sets how many streams the peer can have open at once.
+    ///
+    /// If the peer opens more, the connection fails.
+    ///
+    /// Default: 128. At most [`MAX_STREAMS_PER_SIDE`]. Must be at least the peer's
+    /// [`max_outbound_streams`](Self::with_max_outbound_streams).
+    pub fn with_max_inbound_streams(mut self, streams: u16) -> Result<Self, RammuxError> {
+        self.max_inbound_streams = check_streams("max_inbound_streams", streams)?;
+        Ok(self)
+    }
+
+    /// Sets how many streams this side can have open at once.
+    ///
+    /// At the limit, [`try_start_outbound`](crate::connection::RammuxConnection::try_start_outbound)
+    /// returns [`None`]. It works again once both sides have closed one of the streams.
+    ///
+    /// Default: 128. At most [`MAX_STREAMS_PER_SIDE`]. Must be at most the peer's
+    /// [`max_inbound_streams`](Self::with_max_inbound_streams).
+    pub fn with_max_outbound_streams(mut self, streams: u16) -> Result<Self, RammuxError> {
+        self.max_outbound_streams = check_streams("max_outbound_streams", streams)?;
+        Ok(self)
+    }
+
+    /// Sets the receive window of each stream, in bytes.
+    ///
+    /// Every stream can always have this much data waiting to be read, no matter what the other streams do.
+    /// To go faster, streams also borrow from the shared [`local_recv_pool`](Self::with_local_recv_pool).
+    ///
+    /// Received data takes at most `streams * local_recv_window + local_recv_pool` bytes of memory.
+    ///
+    /// Default: 64 KiB. Must equal the peer's [`remote_recv_window`](Self::with_remote_recv_window).
+    pub const fn with_local_recv_window(mut self, window: NonZeroU32) -> Self {
+        self.local_recv_window = window;
+        self
+    }
+
+    /// Sets the peer's receive window, in bytes.
+    ///
+    /// Default: 64 KiB. Must equal the peer's [`local_recv_window`](Self::with_local_recv_window).
+    pub const fn with_remote_recv_window(mut self, window: NonZeroU32) -> Self {
+        self.remote_recv_window = window;
+        self
+    }
+
+    /// Sets the receive pool that all streams share, in bytes.
+    ///
+    /// The pool is extra memory on top of the windows. Busy streams borrow from it to go faster than
+    /// [`local_recv_window`](Self::with_local_recv_window) alone allows.
+    ///
+    /// The connection carries at most about `(streams * window + pool) / RTT`. For full speed, make the pool
+    /// about the bandwidth times the RTT. Any size works, 0 included.
+    ///
+    /// Default: 4 MiB. Must equal the peer's [`remote_recv_pool`](Self::with_remote_recv_pool).
+    pub const fn with_local_recv_pool(mut self, pool: u32) -> Self {
+        self.local_recv_pool = pool;
+        self
+    }
+
+    /// Sets the peer's receive pool, in bytes.
+    ///
+    /// Default: 4 MiB. Must equal the peer's [`local_recv_pool`](Self::with_local_recv_pool).
+    pub const fn with_remote_recv_pool(mut self, pool: u32) -> Self {
+        self.remote_recv_pool = pool;
+        self
+    }
+
+    /// Sets how much of the peer's pool a stream can borrow right away, as a fraction of
+    /// [`remote_recv_pool`](Self::with_remote_recv_pool).
+    ///
+    /// A stream normally earns its share of the pool. It starts with just its window. As the peer's
+    /// application reads, the stream may borrow more, growing about 2x every round trip.
+    ///
+    /// The advance skips this wait. A new stream, or one that resumes after a pause, can borrow this much
+    /// right from the start. A bigger advance gives faster bursts. But if nobody reads the stream, the borrowed
+    /// memory stays stuck until the stream is closed. Stuck share of the pool limits the throughput available
+    /// to other streams.
+    ///
+    /// Default: 0.25. From 0 to 1, and 0 turns the advance off. If you set it above
+    /// [`conn_advance_grant`](Self::with_conn_advance_grant), that setting goes up to match.
+    /// Local setting.
+    pub fn with_stream_advance_grant(mut self, grant: f32) -> Result<Self, RammuxError> {
+        self.stream_advance_grant = check_fraction("stream_advance_grant", grant)?;
+        self.conn_advance_grant = self.conn_advance_grant.max(grant);
+        Ok(self)
+    }
+
+    /// Sets how much of the peer's pool all streams together can hold as advances, as a fraction of
+    /// [`remote_recv_pool`](Self::with_remote_recv_pool).
+    ///
+    /// This caps how much memory can get stuck in streams that nobody reads. Once the cap is reached,
+    /// new streams start without an advance.
+    ///
+    /// Default: 0.25. From 0 to 1. If you set it below
+    /// [`stream_advance_grant`](Self::with_stream_advance_grant), that setting goes down to match.
+    /// Local setting.
+    pub fn with_conn_advance_grant(mut self, grant: f32) -> Result<Self, RammuxError> {
+        self.conn_advance_grant = check_fraction("conn_advance_grant", grant)?;
+        self.stream_advance_grant = self.stream_advance_grant.min(grant);
+        Ok(self)
+    }
+
+    /// Sets the longest time between two `PING`s.
+    ///
+    /// The peer answers every `PING`, which keeps an idle connection alive. Keep the interval shorter than
+    /// [`inbound_frame_timeout`](Self::with_inbound_frame_timeout).
+    ///
+    /// Default: 5s. Must not be zero. Local setting.
+    pub fn with_ping_interval(mut self, interval: Duration) -> Result<Self, RammuxError> {
+        self.ping_interval = check_non_zero_duration("ping_interval", interval)?;
+        Ok(self)
+    }
+
+    /// Sets how long the peer can stay silent before the connection fails.
+    ///
+    /// The peer answers `PING`s, so a healthy idle connection does not time out.
+    ///
+    /// Default: 10s. Must not be zero. Local setting.
+    pub fn with_inbound_frame_timeout(mut self, timeout: Duration) -> Result<Self, RammuxError> {
+        self.inbound_frame_timeout = check_non_zero_duration("inbound_frame_timeout", timeout)?;
+        Ok(self)
+    }
+
+    /// See [`with_frame_limit`](Self::with_frame_limit).
+    pub const fn frame_limit(&self) -> NonZeroU16 {
+        self.frame_limit
+    }
+
+    /// See [`with_max_inbound_streams`](Self::with_max_inbound_streams).
+    pub const fn max_inbound_streams(&self) -> u16 {
+        self.max_inbound_streams
+    }
+
+    /// See [`with_max_outbound_streams`](Self::with_max_outbound_streams).
+    pub const fn max_outbound_streams(&self) -> u16 {
+        self.max_outbound_streams
+    }
+
+    /// See [`with_local_recv_window`](Self::with_local_recv_window).
+    pub const fn local_recv_window(&self) -> NonZeroU32 {
+        self.local_recv_window
+    }
+
+    /// See [`with_remote_recv_window`](Self::with_remote_recv_window).
+    pub const fn remote_recv_window(&self) -> NonZeroU32 {
+        self.remote_recv_window
+    }
+
+    /// See [`with_local_recv_pool`](Self::with_local_recv_pool).
+    pub const fn local_recv_pool(&self) -> u32 {
+        self.local_recv_pool
+    }
+
+    /// See [`with_remote_recv_pool`](Self::with_remote_recv_pool).
+    pub const fn remote_recv_pool(&self) -> u32 {
+        self.remote_recv_pool
+    }
+
+    /// See [`with_stream_advance_grant`](Self::with_stream_advance_grant).
+    pub const fn stream_advance_grant(&self) -> f32 {
+        self.stream_advance_grant
+    }
+
+    /// See [`with_conn_advance_grant`](Self::with_conn_advance_grant).
+    pub const fn conn_advance_grant(&self) -> f32 {
+        self.conn_advance_grant
+    }
+
+    /// See [`with_ping_interval`](Self::with_ping_interval).
+    pub const fn ping_interval(&self) -> Duration {
+        self.ping_interval
+    }
+
+    /// See [`with_inbound_frame_timeout`](Self::with_inbound_frame_timeout).
+    pub const fn inbound_frame_timeout(&self) -> Duration {
+        self.inbound_frame_timeout
+    }
+
+    /// Checks the invariants that the setters keep.
+    ///
+    /// The crate's tests set the fields directly, so
+    /// [`RammuxConnection::new`](crate::connection::RammuxConnection::new) asserts this in debug builds.
+    pub(crate) fn validate(&self) -> Result<(), RammuxError> {
+        check_streams("max_inbound_streams", self.max_inbound_streams)?;
+        check_streams("max_outbound_streams", self.max_outbound_streams)?;
+        check_fraction("stream_advance_grant", self.stream_advance_grant)?;
+        check_fraction("conn_advance_grant", self.conn_advance_grant)?;
+        check_non_zero_duration("ping_interval", self.ping_interval)?;
+        check_non_zero_duration("inbound_frame_timeout", self.inbound_frame_timeout)?;
+        if self.stream_advance_grant > self.conn_advance_grant {
+            return Err(config_error(format!(
+                "stream_advance_grant ({}) must not exceed conn_advance_grant ({})",
+                self.stream_advance_grant, self.conn_advance_grant
+            )));
         }
         Ok(())
     }
-}
-
-/// How many streams each side of a connection can have at most.
-///
-/// Stream IDs are 16-bit, the lowest bit tells which side initiated the stream.
-pub const MAX_STREAMS_PER_SIDE: u16 = 1 << 15;
-
-/// Reason why a [`RammuxConfig`] cannot be used.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[non_exhaustive]
-pub enum ConfigError {
-    /// A stream limit exceeds the number of IDs each side has.
-    #[error("{field} is {value}, which exceeds the maximum of {MAX_STREAMS_PER_SIDE}")]
-    TooManyStreams {
-        /// Name of the offending field.
-        field: &'static str,
-        /// Configured value.
-        value: u16,
-    },
-    /// An advance setting is not a number from 0 to 1 (NaN and infinities included).
-    #[error("{field} must be a finite fraction from 0 to 1")]
-    AdvanceNotAFraction {
-        /// Name of the offending field.
-        field: &'static str,
-    },
-    /// `advance_grant` exceeds `advance_budget`.
-    #[error("advance_grant must not exceed advance_budget")]
-    AdvanceGrantAboveBudget,
-    /// `ping_interval` is zero: a `PING` would be due all the time.
-    #[error("ping_interval must not be zero")]
-    ZeroPingInterval,
-    /// `PING`s would not be sent often enough to keep `inbound_frame_timeout` from firing on an idle connection.
-    #[error(
-        "ping_interval ({ping_interval:?}) must be shorter than inbound_frame_timeout ({inbound_frame_timeout:?})"
-    )]
-    PingIntervalTooLong {
-        /// Configured ping interval.
-        ping_interval: Duration,
-        /// Configured timeout.
-        inbound_frame_timeout: Duration,
-    },
 }
 
 impl Default for RammuxConfig {
@@ -239,95 +314,143 @@ impl Default for RammuxConfig {
     }
 }
 
+/// The highest stream limit a side can have.
+///
+/// Stream IDs have 16 bits, and the lowest bit says which side started the stream.
+pub const MAX_STREAMS_PER_SIDE: u16 = 1 << 15;
+
+fn config_error(message: String) -> RammuxError {
+    ErrorKind::Config(message).into()
+}
+
+fn check_streams(setting: &str, streams: u16) -> Result<u16, RammuxError> {
+    if streams > MAX_STREAMS_PER_SIDE {
+        return Err(config_error(format!(
+            "{setting} is {streams}, which exceeds the maximum of {MAX_STREAMS_PER_SIDE}"
+        )));
+    }
+    Ok(streams)
+}
+
+fn check_fraction(setting: &str, value: f32) -> Result<f32, RammuxError> {
+    if !(0.0..=1.0).contains(&value) {
+        return Err(config_error(format!(
+            "{setting} is {value}, which is not a fraction from 0 to 1"
+        )));
+    }
+    Ok(value)
+}
+
+fn check_non_zero_duration(setting: &str, interval: Duration) -> Result<Duration, RammuxError> {
+    if interval.is_zero() {
+        return Err(config_error(format!("{setting} must not be zero")));
+    }
+    Ok(interval)
+}
+
 #[cfg(test)]
 mod test {
     use std::time::Duration;
 
-    use crate::config::{ConfigError, MAX_STREAMS_PER_SIDE, RammuxConfig};
+    use crate::config::{MAX_STREAMS_PER_SIDE, RammuxConfig};
 
     #[test]
     fn default_is_valid() {
-        RammuxConfig::new().validate().unwrap();
+        RammuxConfig::default().validate().unwrap();
     }
 
     #[test]
     fn stream_limits_are_bounded() {
-        let mut config = RammuxConfig::new();
-        config.max_inbound_streams = MAX_STREAMS_PER_SIDE;
-        config.max_outbound_streams = MAX_STREAMS_PER_SIDE;
+        let config = RammuxConfig::default()
+            .with_max_inbound_streams(MAX_STREAMS_PER_SIDE)
+            .unwrap()
+            .with_max_outbound_streams(MAX_STREAMS_PER_SIDE)
+            .unwrap();
         config.validate().unwrap();
 
-        config.max_inbound_streams += 1;
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::TooManyStreams {
-                field: "max_inbound_streams",
-                ..
-            })
-        ));
+        let error = config
+            .clone()
+            .with_max_inbound_streams(MAX_STREAMS_PER_SIDE + 1)
+            .unwrap_err();
+        assert!(error.is_user());
+        assert!(error.to_string().contains("max_inbound_streams"), "{error}");
 
-        config.max_inbound_streams = 1;
-        config.max_outbound_streams += 1;
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::TooManyStreams {
-                field: "max_outbound_streams",
-                ..
-            })
-        ));
+        let error = config
+            .with_max_outbound_streams(MAX_STREAMS_PER_SIDE + 1)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("max_outbound_streams"),
+            "{error}"
+        );
     }
 
     #[test]
-    fn ping_interval_is_shorter_than_timeout() {
-        let mut config = RammuxConfig::new();
-        config.ping_interval = config.inbound_frame_timeout;
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::PingIntervalTooLong { .. })
-        ));
-        config.ping_interval = config.inbound_frame_timeout - Duration::from_millis(1);
+    fn advance_grants_are_fractions_with_stream_up_to_conn() {
+        let config = RammuxConfig::default()
+            .with_stream_advance_grant(1.0 / 16.0)
+            .unwrap()
+            .with_conn_advance_grant(0.25)
+            .unwrap();
         config.validate().unwrap();
-    }
-
-    #[test]
-    fn advance_is_a_pair_of_fractions_with_grant_up_to_budget() {
-        let mut config = RammuxConfig::new();
-        config.advance_grant = 1.0 / 16.0;
-        config.advance_budget = 0.25;
+        let config = config.with_stream_advance_grant(0.25).unwrap();
         config.validate().unwrap();
-        config.advance_grant = 0.25;
-        config.validate().unwrap();
-        config.advance_budget = 1.0;
+        let config = config.with_conn_advance_grant(1.0).unwrap();
         config.validate().unwrap();
 
-        config.advance_grant = 0.5;
-        config.advance_budget = 0.25;
-        assert_eq!(config.validate(), Err(ConfigError::AdvanceGrantAboveBudget));
+        // The stream grant raises the connection grant, and the connection grant lowers the stream grant.
+        let config = config.with_conn_advance_grant(0.25).unwrap();
+        let config = config.with_stream_advance_grant(0.5).unwrap();
+        assert_eq!(
+            (config.stream_advance_grant(), config.conn_advance_grant()),
+            (0.5, 0.5)
+        );
+        config.validate().unwrap();
+        let config = config.with_conn_advance_grant(0.125).unwrap();
+        assert_eq!(
+            (config.stream_advance_grant(), config.conn_advance_grant()),
+            (0.125, 0.125)
+        );
+        config.validate().unwrap();
+        // A setting that does not cross the other leaves it alone.
+        let config = config.with_conn_advance_grant(0.75).unwrap();
+        assert_eq!(
+            (config.stream_advance_grant(), config.conn_advance_grant()),
+            (0.125, 0.75)
+        );
+        let config = config.with_stream_advance_grant(0.0).unwrap();
+        assert_eq!(
+            (config.stream_advance_grant(), config.conn_advance_grant()),
+            (0.0, 0.75)
+        );
 
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.1, 1.1] {
-            let mut config = RammuxConfig::new();
-            config.advance_grant = bad;
-            assert_eq!(
-                config.validate(),
-                Err(ConfigError::AdvanceNotAFraction {
-                    field: "advance_grant"
-                })
+            let error = RammuxConfig::default()
+                .with_stream_advance_grant(bad)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("stream_advance_grant"),
+                "{error}"
             );
-            let mut config = RammuxConfig::new();
-            config.advance_budget = bad;
-            assert_eq!(
-                config.validate(),
-                Err(ConfigError::AdvanceNotAFraction {
-                    field: "advance_budget"
-                })
-            );
+            let error = RammuxConfig::default()
+                .with_conn_advance_grant(bad)
+                .unwrap_err();
+            assert!(error.to_string().contains("conn_advance_grant"), "{error}");
         }
     }
 
     #[test]
     fn ping_interval_is_not_zero() {
-        let mut config = RammuxConfig::new();
-        config.ping_interval = Duration::ZERO;
-        assert_eq!(config.validate(), Err(ConfigError::ZeroPingInterval));
+        let error = RammuxConfig::default()
+            .with_ping_interval(Duration::ZERO)
+            .unwrap_err();
+        assert!(error.to_string().contains("ping_interval"), "{error}");
+    }
+
+    #[test]
+    fn inbound_frame_timeout_is_not_zero() {
+        let error = RammuxConfig::default()
+            .with_inbound_frame_timeout(Duration::ZERO)
+            .unwrap_err();
+        assert!(error.to_string().contains("inbound_frame_timeout"), "{error}");
     }
 }

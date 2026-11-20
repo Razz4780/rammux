@@ -13,17 +13,19 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 async fn main() {
     let (io_1, io_2) = tokio::io::duplex(4096);
 
-    let mut config_1 = RammuxConfig::new();
-    config_1.frame_limit = NonZeroU16::new(512).unwrap();
-    config_1.max_inbound_streams = 8;
-    config_1.local_recv_window = NonZeroU32::new(256 * 1024).unwrap();
-    config_1.local_recv_pool = 8 * 1024 * 1024;
+    let config_1 = RammuxConfig::default()
+        .with_frame_limit(NonZeroU16::new(512).unwrap())
+        .with_max_inbound_streams(8)
+        .expect("stream limit is valid")
+        .with_local_recv_window(NonZeroU32::new(256 * 1024).unwrap())
+        .with_local_recv_pool(8 * 1024 * 1024);
 
-    let mut config_2 = RammuxConfig::new();
-    config_2.frame_limit = NonZeroU16::new(32 * 1024).unwrap();
-    config_2.max_inbound_streams = 256;
-    config_2.local_recv_window = NonZeroU32::new(8 * 1024).unwrap();
-    config_2.local_recv_pool = 1024 * 1024;
+    let config_2 = RammuxConfig::default()
+        .with_frame_limit(NonZeroU16::new(32 * 1024).unwrap())
+        .with_max_inbound_streams(256)
+        .expect("stream limit is valid")
+        .with_local_recv_window(NonZeroU32::new(8 * 1024).unwrap())
+        .with_local_recv_pool(1024 * 1024);
 
     tokio::join!(
         negotiate_rammux(RammuxRole::Client, io_1, config_1),
@@ -32,15 +34,15 @@ async fn main() {
 }
 
 /// Negotiates rammux config and starts the connection.
-async fn negotiate_rammux(role: RammuxRole, mut io: DuplexStream, mut config: RammuxConfig) {
+async fn negotiate_rammux(role: RammuxRole, mut io: DuplexStream, config: RammuxConfig) {
     println!("[{role}] Negotiating with base config: {config:?}");
 
     let peer_config = PeerConfig {
         version: PROTOCOL_VERSION,
-        frame_limit: config.frame_limit,
-        max_inbound_streams: config.max_inbound_streams,
-        recv_window: config.local_recv_window.get(),
-        recv_pool: config.local_recv_pool,
+        frame_limit: config.frame_limit(),
+        max_inbound_streams: config.max_inbound_streams(),
+        recv_window: config.local_recv_window().get(),
+        recv_pool: config.local_recv_pool(),
     };
     io.write_all(&peer_config.encode())
         .await
@@ -59,16 +61,21 @@ async fn negotiate_rammux(role: RammuxRole, mut io: DuplexStream, mut config: Ra
         "the peer speaks another version of the rammux protocol"
     );
 
-    config.frame_limit = config.frame_limit.min(peer_config.frame_limit);
-    config.max_outbound_streams = config
-        .max_outbound_streams
+    let frame_limit = config.frame_limit().min(peer_config.frame_limit);
+    let max_outbound_streams = config
+        .max_outbound_streams()
         .min(peer_config.max_inbound_streams);
-    config.remote_recv_window =
+    let remote_recv_window =
         NonZeroU32::new(peer_config.recv_window).expect("received non-positive window");
-    config.remote_recv_pool = peer_config.recv_pool;
+    let config = config
+        .with_frame_limit(frame_limit)
+        .with_max_outbound_streams(max_outbound_streams)
+        .expect("stream limit is not above our own")
+        .with_remote_recv_window(remote_recv_window)
+        .with_remote_recv_pool(peer_config.recv_pool);
     println!("[{role}] Negotiated final config: {config:?}");
 
-    let rammux = RammuxConnection::new(role, io, config).expect("config is valid");
+    let rammux = RammuxConnection::new(role, io, config);
     // Now we could use the connection.
 
     println!("[{role}] Starting downgrade.");
