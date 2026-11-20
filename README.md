@@ -18,7 +18,7 @@ Commonly used multiplexing protocols (HTTP/2, yamux) let the *receiver* tune how
 - when the reader of a busy stream slows down, the other streams slow down with it; or
 - every stream is capped by a fixed window, however idle the connection is.
 
-In rammux the *sender* decides, for every frame, which stream may use the memory in the receiver's buffers. Streams get equal shares, a latecomer catches up within a few round trips, and a stream with a slow/stalled reader the bandwidth to the others. The cost is some more small packets on connections that carry data in one direction only.
+In rammux the *sender* decides, for every frame, which stream may use the memory in the receiver's buffers. Streams get equal shares, a latecomer catches up within a few round trips, and a stream with a slow/stalled reader yields the bandwidth to the others. The cost is some more small packets on connections that carry data in one direction only.
 
 [TRANSIT_CONTROL.md](TRANSIT_CONTROL.md) explains how it works, with measurements against hyper and yamux.
 

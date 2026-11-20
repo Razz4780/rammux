@@ -140,7 +140,7 @@ impl StreamState {
 /// Statistics of a single rammux stream.
 ///
 /// With [`Self::unacked`] and [`Self::last_ack`], the application can decide that the peer's reader stalls,
-/// and close the sink with [`SinkClose::Reset`]. Not that:
+/// and close the sink with [`SinkClose::Reset`]. Note that:
 /// - [`Self::unacked`] counts the bytes that are still on their way, too.
 /// - The peer acks bytes in steps. A small count does not have to move, ever.
 /// - On a slow connection, or on one that many streams share, a stream whose reader keeps up also goes
