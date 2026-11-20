@@ -1,9 +1,9 @@
 # rammux protocol
 
-This document specifies version 1 of the rammux wire protocol.
+This document specifies version 0.1 of the rammux wire protocol.
 
 rammux multiplexes independent bidirectional byte streams over one reliable, ordered, full-duplex byte
-transport, for example a TCP connection. The transport must not delay small writes: on TCP, set `TCP_NODELAY`.
+transport, for example a TCP connection.
 
 Inspired by [Yamux](https://github.com/hashicorp/yamux).
 
@@ -13,7 +13,7 @@ There is no handshake. Before the first frame is sent, the peers must agree on:
 
 | Parameter | Meaning | Range |
 | --- | --- | --- |
-| version | The version of this protocol: 1. | |
+| version | The version of this protocol: 0.1. | |
 | roles | One peer is the *client*, the other is the *server*. | |
 | `frame_limit` | The largest `DATA` payload, in bytes. The same for both peers. | 1 to 65 535 |
 | stream limit, one per peer | How many streams started by the other peer this peer accepts at a time. | 0 to 32 768 |

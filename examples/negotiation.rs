@@ -91,7 +91,9 @@ async fn negotiate_rammux(role: RammuxRole, mut io: DuplexStream, config: Rammux
 }
 
 /// The version of the rammux protocol (see `PROTOCOL.md`) that this example speaks.
-const PROTOCOL_VERSION: u8 = 1;
+///
+/// Major and minor version: 0.1.
+const PROTOCOL_VERSION: [u8; 2] = [0, 1];
 
 /// Exchanged by peers before starting the rammux connection.
 ///
@@ -99,7 +101,7 @@ const PROTOCOL_VERSION: u8 = 1;
 #[derive(Debug)]
 struct PeerConfig {
     /// Version of the rammux protocol. Must match.
-    pub version: u8,
+    pub version: [u8; 2],
     /// Our desired frame limit.
     ///
     /// Final config will use the smaller value.
@@ -116,25 +118,25 @@ struct PeerConfig {
 }
 
 impl PeerConfig {
-    const LEN: usize = 13;
+    const LEN: usize = 14;
 
     fn encode(&self) -> [u8; Self::LEN] {
         let mut result = [0_u8; Self::LEN];
-        result[0] = self.version;
-        result[1..3].copy_from_slice(&self.frame_limit.get().to_be_bytes());
-        result[3..5].copy_from_slice(&self.max_inbound_streams.to_be_bytes());
-        result[5..9].copy_from_slice(&self.recv_window.to_be_bytes());
-        result[9..13].copy_from_slice(&self.recv_pool.to_be_bytes());
+        result[0..2].copy_from_slice(&self.version);
+        result[2..4].copy_from_slice(&self.frame_limit.get().to_be_bytes());
+        result[4..6].copy_from_slice(&self.max_inbound_streams.to_be_bytes());
+        result[6..10].copy_from_slice(&self.recv_window.to_be_bytes());
+        result[10..14].copy_from_slice(&self.recv_pool.to_be_bytes());
         result
     }
 
     fn decode(buffer: [u8; Self::LEN]) -> Self {
-        let version = buffer[0];
-        let frame_limit = u16::from_be_bytes([buffer[1], buffer[2]]);
+        let version = [buffer[0], buffer[1]];
+        let frame_limit = u16::from_be_bytes([buffer[2], buffer[3]]);
         let frame_limit = NonZeroU16::new(frame_limit).expect("received non-positive frame limit");
-        let max_inbound_streams = u16::from_be_bytes([buffer[3], buffer[4]]);
-        let recv_window = u32::from_be_bytes(buffer[5..9].try_into().unwrap());
-        let recv_pool = u32::from_be_bytes(buffer[9..13].try_into().unwrap());
+        let max_inbound_streams = u16::from_be_bytes([buffer[4], buffer[5]]);
+        let recv_window = u32::from_be_bytes(buffer[6..10].try_into().unwrap());
+        let recv_pool = u32::from_be_bytes(buffer[10..14].try_into().unwrap());
         Self {
             version,
             frame_limit,
