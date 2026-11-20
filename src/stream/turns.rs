@@ -19,6 +19,10 @@ use crate::{
 ///
 /// The queue is intrusive: a stream is linked through the node in its [`StreamShared`],
 /// so joining and leaving are O(1) and never allocate.
+///
+/// A stream joins only the queue of its own connection, the one in the [`ConnFlow`](super::ConnFlow)
+/// that its handles are given. The node of a stream is therefore never in another list,
+/// which is what the unsafe methods of [`PinList`] require.
 #[derive(Default)]
 pub struct Turns {
     queue: PinList<StreamShared>,
@@ -39,14 +43,16 @@ impl Turns {
 
     /// Puts the stream at the back of the queue, unless it is in the queue already.
     pub fn join(&mut self, stream: &StreamRef) {
-        self.queue.push_back(stream);
+        // SAFETY: the stream joins only the queue of its own connection.
+        unsafe { self.queue.push_back(stream) };
     }
 
     /// Takes the stream out of the queue, wherever it is.
     ///
     /// Returns whether the stream was in the queue.
     pub fn leave(&mut self, stream: &StreamRef) -> bool {
-        self.queue.remove(stream)
+        // SAFETY: the stream joins only the queue of its own connection.
+        unsafe { self.queue.remove(stream) }
     }
 
     /// Wakes the [`DataUpdates`](super::updates::DataUpdates) of the stream that is first in line, if any.
@@ -59,7 +65,8 @@ impl Turns {
     /// Returns whether the stream waits in the queue.
     #[cfg(test)]
     pub fn contains(&self, stream: &StreamShared) -> bool {
-        self.queue.contains(stream)
+        // SAFETY: the stream joins only the queue of its own connection.
+        unsafe { self.queue.contains(stream) }
     }
 
     /// Returns the waiting streams, first in line first.
