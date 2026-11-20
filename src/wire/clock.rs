@@ -26,7 +26,9 @@ impl Clock {
     pub fn micros(&self, at: Instant) -> u32 {
         let micros = at.saturating_duration_since(self.epoch).as_micros();
         // Truncation to 32 bits is the point of the wire clock.
-        u32::try_from(micros & u128::from(u32::MAX)).unwrap_or(0)
+        #[allow(clippy::cast_possible_truncation)]
+        let micros = micros as u32;
+        micros
     }
 }
 
