@@ -46,10 +46,6 @@ impl RammuxDuplex {
     }
 
     /// Returns where the bytes of the stream are, see [`StreamStats`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if another user of the stream panicked while holding its lock.
     pub fn stats(&self) -> StreamStats {
         self.sink.stats()
     }
@@ -157,10 +153,6 @@ impl RammuxSink {
     }
 
     /// Returns where the bytes of the stream are, see [`StreamStats`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if another user of the stream panicked while holding its lock.
     pub fn stats(&self) -> StreamStats {
         self.shared.lock().stats()
     }

@@ -12,14 +12,14 @@ long path has to be megabytes large, and the mainstream multiplexers tune it at 
 - **HTTP/2** has a window for every stream, and one for the whole connection that all streams draw from.
   Implementations either fix them (hyper: 1 or 2 MiB for a stream by default) or grow them with the measured
   bandwidth (hyper's adaptive window, gRPC).
-- **yamux** has a window for every stream. The Rust implementation doubles the window of a busy stream, out of a
+- **Yamux** has a window for every stream. The Rust implementation doubles the window of a busy stream, out of a
   budget that the connection shares, and takes the growth back only when the stream is dropped.
 
 The receiver knows how fast its own application reads. It does not know what the sender has waiting, so
 it cannot divide the memory by need. The results, measured below:
 
 1. **Fixed windows cap every stream**, however idle the link is.
-2. **The first stream takes the budget, and a latecomer is choked** (yamux). The early stream keeps its
+2. **The first stream takes the budget, and a latecomer is choked** (Yamux). The early stream keeps its
    grown window even when it goes silent.
 3. **A slow reader takes the connection window from everybody** (HTTP/2 with large windows). Its unread
    data fills the shared window, and the healthy streams wait for the slow one.
@@ -38,7 +38,7 @@ credit, and it decides for every frame:
   first;
 - a new or idle stream gets a bounded **advance**, so it does not have to prove itself from zero.
 
-Nothing of this is on the wire. The peer sees only `DATA` that stays within its limits.
+Nothing of this is on the wire. The receiver sees only `DATA` that stays within its limits. The sender sees only granular `WINDOW` updates.
 
 ## How the sender decides
 
@@ -50,7 +50,7 @@ Nothing of this is on the wire. The peer sees only `DATA` that stays within its 
 | `borrowed` | `max(0, unacked - B)`: what a stream uses of the pool. The sum over the streams, `U`, never exceeds `P`. |
 | `srtt` | Smoothed round trip time, measured with `PING` and `PONG`. |
 | `T_c` | `max(1, min(32 KiB, B / 2))`: the step in which the receiver returns credit. |
-| `g`, `G` | The advance: what one stream may take, and all streams together (`stream_advance_grant`, `conn_advance_grant`). |
+| `g`, `G` | The advance: what one stream may take without the reader rate proof, and all streams together (`stream_advance_grant`, `conn_advance_grant`). |
 
 ### Within the base window
 
@@ -75,7 +75,7 @@ in a round trip.
   trips of its read rate in flight, and the rest of the pool stays with the others.
 - When the reader stalls, the allowance decays to zero and the stream stops borrowing. What it already
   holds stays in the pool until the reader reads, the stream closes, or the writer resets the stream.
-- A stream that pauses for more than a few round trips starts over, as TCP does after idle.
+- A stream that pauses for more than a few round trips starts over, as TCP usually does after idle.
 
 A stream whose reader keeps up has about one round trip of its rate in flight, so it uses less than half of
 its allowance. The rest is slack for credit that comes late. A loss in TCP holds all credit back for about a
@@ -112,10 +112,7 @@ A reader that is slow gets one advance, and after that only what it proves.
 
 ## Measured
 
-All numbers come from Linux TCP over netem links, with hyper 1.12 (h2 0.4.20) and yamux 0.13.10. Every
-multiplexer has the same memory for the connection, 16 MiB, which is the cap of hyper's adaptive window:
-rammux runs with 16 MiB pools and otherwise default settings. Every scenario ran twice, and the tables show
-the mean of the runs (the median of ten bursts in the last one).
+All numbers come from Linux TCP over netem links, with hyper 1.12 (h2 0.4.20) and yamux 0.13.10. Every multiplexer has the same memory for the connection, 16 MiB, which is the non-configurable cap of hyper's adaptive window. Every scenario ran twice, and the tables show the mean of the runs (the median of ten bursts in the last one).
 
 ### A latecomer, and a reader that slows down
 
@@ -129,8 +126,7 @@ A 300 Mbit/s link with a 250 ms round trip. Stream A uploads alone, then B joins
 | yamux | 235 | 265 and 4 | 8 | 8 |
 | rammux | 278 | 143 and 143 | 271 | 285 |
 
-With yamux, B stays choked while A is silent, until A is dropped. With hyper's adaptive window, B gets the link back
-only as A's reader drains the 16 MiB that A holds.
+With yamux, B stays choked while A is silent, until A is dropped. With hyper's adaptive window, B gets the link back only as A's reader drains the 16 MiB that A holds.
 
 ### A burst on a new stream
 
@@ -149,38 +145,14 @@ Time until the receiver has read the whole burst:
 On a connection that was idle, TCP restarts its own window, and bursts above about 256 KiB are as slow as
 TCP makes them, for every multiplexer.
 
-## Costs and limits
+## Costs
 
-- **A latecomer needs a moment.** Next to a stream that holds the pool, a new stream reached 40% of the 300 Mbit/s
-  link after 1.25 s (about 3.5 s with the advance turned off). hyper's adaptive window needed 0.25 s, yamux never got there.
-- **A reader that stalls keeps what it holds.** Its stream stops borrowing within a few round trips, but the bytes
-  that are already in the pool stay there until they are read or the stream closes. When one of two bulk streams
-  stalled, it held 12.0 MB of the 16 MiB pool, and the other stream got 154 of 287 Mbit/s
-  (8 Mbit/s with yamux, 14 to 136 with hyper's adaptive window). The writer can ask how many
-  bytes of its stream are in flight and when the reader last released some, and reset the stream when it
-  gives up. The receiving side then discards the bytes: 0.6 s after the reset, the other stream had the
-  whole link (286 Mbit/s).
-- **Shares are equal in frames, not in bytes.** A turn moves one frame, and a frame holds at most one write.
-  A stream that writes less than `frame_limit` bytes at a time gets a proportionally smaller share next to a
-  stream that writes more.
-- **More small packets when data flows one way.** The receiver returns credit for every `T_c` that its reader
-  consumes. Once it has measured the round trip, each side adds a `PING` to its data or credit at most every
-  eighth of it, and the other side answers with a `PONG`. When the other direction has data, they ride along.
-  When it has none, they are packets of their own.
-- **The queue is not limited.** Like the other multiplexers, a connection with enough data fills what it is
-  given, here `streams * B + P`, and an interactive stream waits behind the bulk that is already on the path.
-  The pool is the bound. `TCP_NOTSENT_LOWAT` can be used as a mitigation on platforms that support it.
-- **`TCP_NODELAY` is required.** Without it, credit and `PING`s wait behind Nagle's algorithm and delayed ACKs.
+- **A latecomer needs a moment.** Next to a stream that holds the pool, a new stream reached 40% of the 300 Mbit/s link after 1.25 s. hyper's adaptive window needed 0.25 s, yamux never got there.
+- **Shares are equal in frames, not in bytes.** A turn moves one frame, and a frame holds at most one write. A stream that writes less than `frame_limit` bytes at a time gets a proportionally smaller share next to a stream that writes more.
+- **More small packets when data flows one way.** The receiver returns credit for every `T_c` that its reader consumes. Once it has measured the round trip, each side adds a `PING` to its data or credit at most every eighth of it, and the other side answers with a `PONG`. When the other direction has data, they ride along. When it has none, they are packets of their own.
 
 ## Choosing the settings
 
-- **The pool** (`local_recv_pool`, and the peer's `remote_recv_pool`). A connection carries at most about
-  `(streams * B + P) / round trip time`, and queues up to `(streams * B + P) / bandwidth` on the path. A pool
-  of about the bandwidth times the round trip time gives full speed: 300 Mbit/s at 250 ms needs about 9.4 MB.
-  A smaller pool means less latency for interactive streams and less memory. Any size works, zero included.
-- **The base window** (`local_recv_window`, and the peer's `remote_recv_window`). Every stream gets it, whatever
-  the others do, and the memory for it is reserved for every open stream. Keep it small.
-- **The advance** (`stream_advance_grant`, `conn_advance_grant`). Fractions of the pool, a quarter each by default.
-  A larger `stream_advance_grant` makes bursts and latecomers faster. `conn_advance_grant` is what readers that
-  never read can pin.
-  Set both to 0 to turn the advance off.
+- **The pool** (`local_recv_pool`, and the peer's `remote_recv_pool`). A connection carries at most about `(streams * B + P) / RTT`, and queues up to `(streams * B + P) / bandwidth` on the path. A pool of about one BDP gives full speed: 300 Mbit/s at 250 ms needs about 9.4 MB. A smaller pool means less latency for interactive streams and less memory. Any size works, zero included.
+- **The base window** (`local_recv_window`, and the peer's `remote_recv_window`). Every stream gets it, whatever the others do, and the memory for it is reserved for every open stream. Keep it small.
+- **The advance** (`stream_advance_grant`, `conn_advance_grant`). Fractions of the pool, a quarter each by default. A larger `stream_advance_grant` makes bursts and latecomers faster. `conn_advance_grant` is what readers that never read can pin. Set both to 0 to turn the advance off.

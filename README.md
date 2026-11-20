@@ -6,26 +6,19 @@
 [![CI](https://github.com/Razz4780/rammux/actions/workflows/ci.yaml/badge.svg)](https://github.com/Razz4780/rammux/actions/workflows/ci.yaml)
 [![MSRV](https://img.shields.io/crates/msrv/rammux)](https://crates.io/crates/rammux)
 
-`rammux` is a stream multiplexer for Tokio. Two peers run many independent bidirectional byte streams
-over one reliable byte stream transport, such as a TCP connection, and the streams share the bandwidth
-of that transport fairly.
+`rammux` is a generic stream multiplexer for Tokio. Two peers run many independent bidirectional byte streams over one reliable byte stream transport, such as a TCP connection, and the streams share the bandwidth of that transport fairly.
 
 ## Why rammux
 
-Use it when you need many independent streams over one connection, and no stream should be able to starve
-the others.
+Use it when you need many independent streams over one connection, and no stream should be able to starve the others.
 
-The mainstream multiplexers (HTTP/2, yamux) let the *receiver* tune how much each stream may send, and the
-receiver cannot see what the sender has waiting. Depending on the implementation:
+Commonly used multiplexing protocols (HTTP/2, yamux) let the *receiver* tune how much each stream may receive, and the receiver cannot see what the sender has waiting. Depending on the implementation:
 
 - the stream that comes first takes most of the bandwidth, and a stream that comes later is choked; or
 - when the reader of a busy stream slows down, the other streams slow down with it; or
 - every stream is capped by a fixed window, however idle the connection is.
 
-In rammux the *sender* decides, for every frame, which stream may use the memory that the receiver offers.
-Streams get equal shares, a latecomer catches up within a few round trips, and a stream whose reader is slow or
-stalled leaves the bandwidth to the others. The cost is some more small packets on connections that carry data
-in one direction only.
+In rammux the *sender* decides, for every frame, which stream may use the memory in the receiver's buffers. Streams get equal shares, a latecomer catches up within a few round trips, and a stream with a slow/stalled reader the bandwidth to the others. The cost is some more small packets on connections that carry data in one direction only.
 
 [TRANSIT_CONTROL.md](TRANSIT_CONTROL.md) explains how it works, with measurements against hyper and yamux.
 
@@ -55,6 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Any reliable byte stream can be the transport, for example a `TcpStream`.
     let (client_io, server_io) = tokio::io::duplex(4096);
     // The peers take opposite roles, and their configs must be compatible. The defaults are.
+    // rammux has no in-band handshake, thus some config changes must be negotiated beforehand.
     let mut client = RammuxConnection::new(RammuxRole::Client, client_io, RammuxConfig::new());
     let mut server = RammuxConnection::new(RammuxRole::Server, server_io, RammuxConfig::new());
 
@@ -69,7 +63,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 // Completes the downgrade, and returns the transport.
                 RammuxProgress::Downgraded(downgraded) => break downgraded.await,
-                RammuxProgress::Empty => {},
+                RammuxProgress::Empty => {
+                    // Our example transport is an in-memory duplex,
+                    // so it might always be ready, and never force yielding.
+                    // rammux reliably returns control to the caller.
+                    tokio::task::coop::consume_budget().await;
+                },
             }
         }
     });
@@ -80,8 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .try_start_outbound()?
         .expect("the stream limit is not reached");
     let mut echo = tokio::spawn(async move {
-        stream.send(Bytes::from_static(b"hello")).await?;
-        // Only closing the sink ends the stream cleanly. The server's reader ends, and so does the echo.
+        stream.feed(Bytes::from_static(b"hello")).await?;
         stream.close().await?;
         let mut reply = Vec::new();
         while let Some(chunk) = stream.next().await {
@@ -90,7 +88,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok::<_, StreamError>(reply)
     });
 
-    // Nothing runs in the background: streams make progress only while the connection is polled.
+    // Nothing implicitly runs in the background:
+    // streams make progress only while the connection is polled.
     let reply = loop {
         tokio::select! {
             reply = &mut echo => break reply??,
@@ -110,8 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### The connection
 
-`RammuxConnection` owns the transport and runs the protocol on it. It does not spawn tasks, and nothing happens
-in the background: your code polls `RammuxConnection::progress` in a loop. While it does, the connection
+`RammuxConnection` owns the transport and runs the protocol on it. It does not spawn tasks, and nothing happens in the background: your code polls `RammuxConnection::progress` in a loop. While it does, the connection:
 
 - moves the data of all streams,
 - hands you the streams that the peer starts (`RammuxProgress::Inbound`),
@@ -121,83 +119,44 @@ If the connection is not polled, all of its streams stall.
 
 ### Streams
 
-Either peer starts a stream with `RammuxConnection::try_start_outbound`, up to the configured limit.
-A stream is a `RammuxDuplex`:
+Either peer starts a stream with `RammuxConnection::try_start_outbound`, up to the configured limit. A stream is a `RammuxDuplex`:
 
-- a `futures::Sink<bytes::Bytes>` for writing,
+- a `futures::Sink<bytes::Bytes, Error = StreamError>` for writing,
 - a `futures::Stream<Item = Result<bytes::Bytes, StreamError>>` for reading.
 
-It can move to another task, and `into_split` separates the two halves. Flushing the sink waits until the
-connection has taken the data, not until the peer has read it.
-
-The directions close independently, and the reader learns how the writer on the other side ended:
-
-- Closing the sink and dropping it both close writing, in the way that `on_close(SinkClose)` set:
-  - `SinkClose::Clean`, the default: the peer's reader gets the data, and then `None`.
-  - `SinkClose::Abort`: the data that the connection has not taken yet is discarded, and the peer's reader
-    gets the data that arrived, then `StreamError::PeerAborted`, then `None`.
-  - `SinkClose::Reset` gives up on the stream, for example when the peer's reader stalls and its unread data
-    holds buffers that other streams need. The data that the peer's reader has not got yet is discarded:
-    it gets `StreamError::PeerReset`, then `None`, and the peer's buffers are free for other streams.
-    A clean close that waits for a stalled reader can still turn into a reset.
-- `stats()` tells where the bytes of the stream are: sent and not acked by the peer's reader yet, written
-  and not sent yet, received and not read yet. It also tells when the peer last acked some. A write that
-  does not complete does not tell that a reader stalled, the unacked bytes and the time of the last ack do.
-- Dropping the reader tells the peer's writer to stop: its sink fails with `StreamError::PeerStoppedReading`.
-- When the connection ends, so do the streams that are still open. Their readers get the data that arrived,
-  then `StreamError::ConnectionFailed`, `ConnectionDowngraded` or `ConnectionDropped`, and their sinks fail
-  with the same error.
+It can be moved to another task, and split into halves with `into_split`. The directions close independently.
 
 ### Configuration
 
-rammux has no handshake. Both peers create their `RammuxConfig` up front, with opposite roles
-(`RammuxRole::Client` and `RammuxRole::Server`) and settings that match:
-
-- `frame_limit` is the same on both sides,
-- one side's `max_outbound_streams` does not exceed the other side's `max_inbound_streams`,
-- one side's `remote_recv_window` and `remote_recv_pool` are the other side's `local_recv_window` and
-  `local_recv_pool`.
-
-Two default configs match each other. If the peers do not share their settings in advance, they exchange them before starting rammux:
-[examples/negotiation.rs](https://github.com/Razz4780/rammux/blob/main/examples/negotiation.rs) shows how.
+rammux has no handshake. Both peers create their `RammuxConfig` up front, with opposite role (`RammuxRole::Client`/`RammuxRole::Server`) and matching settings. Two default configs always match each other.
 
 ### Flow control
 
-Every stream may have `local_recv_window` bytes waiting to be read (64 KiB by default), and all streams of a
-connection share `local_recv_pool` bytes on top of that (4 MiB by default). The memory that a connection uses
-for received data is bounded by these two.
+Every stream may have `local_recv_window` bytes waiting to be read (64 KiB by default), and all streams of a connection share `local_recv_pool` bytes on top of that (4 MiB by default). The memory that a connection uses for received data is bounded by these two.
 
-The pool is also what limits the speed of the connection and the queue it builds: about one BDP is enough for full speed, and a smaller pool keeps interactive streams more responsive
-next to bulk transfers. See [TRANSIT_CONTROL.md](TRANSIT_CONTROL.md#choosing-the-settings).
+The pool is also what limits the speed of the connection: about one BDP is enough for full speed without building a queue on the link. See [TRANSIT_CONTROL.md](TRANSIT_CONTROL.md#choosing-the-settings).
 
 ### Keepalive
 
-The connection sends a `PING` at least every `ping_interval` (5 s by default), and the peer answers. If nothing
-arrives for `inbound_frame_timeout` (10 s by default), the connection fails with a timeout error.
-The same exchange measures the round trip time, reported in `RammuxConnection::stats`.
+The connection sends a `PING` **at least** every `ping_interval` (5s by default), and the peer answers with a `PONG`. If nothing arrives for `inbound_frame_timeout` (10s by default), the connection fails with a timeout error. The same exchange measures the round trip time, reported in `RammuxConnection::stats`.
 
 ### Shutdown
 
-rammux never closes the transport. `RammuxConnection::downgrade` ends the session with a short exchange,
-and returns the transport, ready for whatever comes next. The peer learns about it from
-`RammuxProgress::Downgraded`, and gets its transport back the same way.
+rammux never closes the transport. `RammuxConnection::downgrade` ends the session with a short exchange, and returns the transport clean. A downgrade ends all open streams.
 
-A downgrade ends the streams that are still open, on both sides, with `StreamError::ConnectionDowngraded`.
-The side that calls `downgrade` loses only the data that its connection has not sent yet: a stream whose sink
-completed its close before the call ends cleanly for the peer's reader. What the peer sent and this side had not
-received at the call is not delivered, even from sinks that the peer closed. So close your sinks and read your
-streams to the end before you call `downgrade`. Dropping the connection instead ends everything abruptly: its
-streams end with `StreamError::ConnectionDropped`, and the peer's connection fails with an error, which ends
-the peer's streams with `StreamError::ConnectionFailed`.
+Dropping the connection instead ends everything abruptly: both its streams and the peer's connection fail with an error.
 
 ## Requirements
 
 - **Tokio with timers.** Create the connection inside a Tokio runtime that has the time driver enabled
   (`enable_time` or `enable_all`). It panics otherwise.
-- **`TCP_NODELAY`.** Set it if the transport is a TCP socket. rammux sends small control frames, and Nagle's
-  algorithm would hold them back.
-- **A transport that takes a frame in one write.** rammux writes the header and the payload of a frame together.
-  If your transport has no vectored writes, wrap it in `tokio::io::BufWriter`.
+
+## Advisories
+
+- **`TCP_NODELAY`.** Set it if the transport is a TCP socket. Like any multiplexer, rammux sends small control frames, and Nagle's algorithm would hold them back.
+- **`TCP_NOTSENT_LOWAT`.** Like any multiplexer, rammux cannot do anything about the queue of data that already sits on the link. If the conditions (link length, peer with generous receive pool) allow for building a long queue, interactive streams may experience amplified latency next to bulk streams. `TCP_NOTSENT_LOWAT` helps on direct links.
+- **A transport that handles vectored writes.** rammux writes the header and the payload of a frame together in one vectored write. If your transport has no vectored writes, consider using a buffered wrapper.
+- **A transport that handles small reads.** rammux reads the header and the payload of a frame in separate reads, which can be unnecessary overhead. If your transport does not buffer reads, consider using a buffered wrapper.
 
 ## Examples
 

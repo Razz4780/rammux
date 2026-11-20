@@ -314,9 +314,10 @@ impl Default for RammuxConfig {
     }
 }
 
-/// The highest stream limit a side can have.
+/// The highest limit for concurrent streams opened by one side.
 ///
 /// Stream IDs have 16 bits, and the lowest bit says which side started the stream.
+/// Freed IDs are reused.
 pub const MAX_STREAMS_PER_SIDE: u16 = 1 << 15;
 
 fn config_error(message: String) -> RammuxError {
