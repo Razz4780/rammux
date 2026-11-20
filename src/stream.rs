@@ -3,6 +3,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use futures::task::AtomicWaker;
+use tokio::time::Instant;
 
 use crate::{
     StreamId,
@@ -17,8 +18,7 @@ use crate::{
 };
 
 pub(crate) use conn_flow::{ConnFlow, RxFlow};
-pub use duplex::{RammuxDuplex, RammuxSink, RammuxStream};
-pub use outbound::ReaderStall;
+pub use duplex::{RammuxDuplex, RammuxSink, RammuxStream, SinkClose};
 
 pub use crate::error::StreamError;
 
@@ -125,6 +125,58 @@ impl StreamState {
     fn fin_state(&self) -> FinState {
         self.inbound.fin_state().and(self.outbound.fin_state())
     }
+
+    /// Returns the byte counts of the stream.
+    fn stats(&self) -> StreamStats {
+        StreamStats {
+            unacked: self.outbound.unacked(),
+            unsent: self.outbound.unsent(),
+            unread: self.inbound.unread(),
+            last_ack: self.outbound.last_ack(),
+        }
+    }
+}
+
+/// Statistics of a single rammux stream.
+///
+/// With [`Self::unacked`] and [`Self::last_ack`], the application can decide that the peer's reader stalls,
+/// and close the sink with [`SinkClose::Reset`]. Not that:
+/// - [`Self::unacked`] counts the bytes that are still on their way, too.
+/// - The peer acks bytes in steps. A small count does not have to move, ever.
+/// - On a slow connection, or on one that many streams share, a stream whose reader keeps up also goes
+///   for long between two acks. A limit has to allow for the connection.
+///
+/// ```
+/// # use std::time::Duration;
+/// # use rammux::stream::{RammuxSink, SinkClose};
+/// # fn give_up(mut sink: RammuxSink) {
+/// let stats = sink.stats();
+/// let waited = stats.last_ack.map(|at| at.elapsed());
+/// if stats.unacked >= 1024 * 1024 && waited.is_some_and(|waited| waited > Duration::from_secs(30)) {
+///     sink.on_close(SinkClose::Reset);
+///     drop(sink);
+/// }
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StreamStats {
+    /// Bytes that this side sent, and that the peer's reader did not ack yet.
+    /// They count against the buffers of the peer, wherever they are.
+    ///
+    /// Once the peer stopped reading, nothing is unacked.
+    pub unacked: u64,
+    /// Bytes that the application wrote, and that the connection did not send yet.
+    ///
+    /// Once writing ended in a way that discards them, nothing is unsent.
+    pub unsent: u64,
+    /// Bytes that this side received, and that the application did not read yet.
+    ///
+    /// Once the application stopped reading, or the peer reset the stream, nothing is unread.
+    pub unread: u64,
+    /// When the peer last acked bytes of the stream: when its last window update arrived.
+    /// [`None`] before the first ack.
+    pub last_ack: Option<Instant>,
 }
 
 /// Tells which `FIN_*` frames of a stream, or of one of its directions, were sent and received.

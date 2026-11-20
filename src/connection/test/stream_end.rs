@@ -19,7 +19,7 @@ use tokio::{
 use crate::{
     config::{RammuxConfig, RammuxRole},
     connection::{RammuxConnection, RammuxProgress},
-    stream::{RammuxDuplex, StreamError},
+    stream::{RammuxDuplex, SinkClose, StreamError},
 };
 
 /// How many times a future is polled, with the connections driven in between, before a test gives up on it.
@@ -157,10 +157,20 @@ async fn close_is_a_clean_end() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_dropped_sink_aborts() {
+async fn a_dropped_sink_closes_cleanly() {
     let mut pair = pair();
     let (a, mut b) = pair.open(b"abc");
     let (sink, _reader) = a.into_split();
+    drop(sink);
+    assert_eq!(read_to_end(&mut b, || pair.run()), (b"abc".to_vec(), None));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dropped_sink_aborts_on_request() {
+    let mut pair = pair();
+    let (a, mut b) = pair.open(b"abc");
+    let (mut sink, _reader) = a.into_split();
+    sink.on_close(SinkClose::Abort);
     drop(sink);
     assert_eq!(
         read_to_end(&mut b, || pair.run()),
@@ -169,9 +179,10 @@ async fn a_dropped_sink_aborts() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_dropped_duplex_aborts() {
+async fn a_dropped_duplex_aborts_on_request() {
     let mut pair = pair();
-    let (a, mut b) = pair.open(b"abc");
+    let (mut a, mut b) = pair.open(b"abc");
+    a.on_close(SinkClose::Abort);
     drop(a);
     assert_eq!(
         read_to_end(&mut b, || pair.run()),
@@ -180,7 +191,7 @@ async fn a_dropped_duplex_aborts() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_dropped_sink_discards_what_the_connection_did_not_take() {
+async fn an_abort_discards_what_the_connection_did_not_take() {
     let mut pair = pair();
     let (a, mut b) = pair.open(b"abc");
     assert_eq!(
@@ -193,6 +204,7 @@ async fn a_dropped_sink_discards_what_the_connection_did_not_take() {
     let chunk = chunk(4096);
     pair.drive(sink.feed(chunk.clone())).unwrap();
     pair.run();
+    sink.on_close(SinkClose::Abort);
     drop(sink);
 
     let (data, error) = read_to_end(&mut b, || pair.run());
@@ -234,7 +246,8 @@ async fn a_reset_discards_what_the_peer_did_not_read() {
     let (mut sink, _reader) = a.into_split();
     pair.drive(sink.feed(chunk(4096))).unwrap();
     pair.run();
-    sink.reset();
+    sink.on_close(SinkClose::Reset);
+    drop(sink);
     pair.run();
 
     assert_eq!(
@@ -246,8 +259,9 @@ async fn a_reset_discards_what_the_peer_did_not_read() {
 #[tokio::test(start_paused = true)]
 async fn a_reset_duplex_resets_writing_and_stops_reading() {
     let mut pair = pair();
-    let (a, b) = pair.open(b"abc");
-    a.reset();
+    let (mut a, b) = pair.open(b"abc");
+    a.on_close(SinkClose::Reset);
+    drop(a);
     pair.run();
     let (mut b_sink, mut b_reader) = b.into_split();
     assert_eq!(
@@ -270,8 +284,8 @@ async fn a_reset_ends_a_close_that_waits_for_the_reader() {
     assert!(sink.close().now_or_never().is_none());
     pair.run();
     assert!(sink.close().now_or_never().is_none());
-    sink.reset();
-    pair.run();
+    sink.on_close(SinkClose::Reset);
+    pair.drive(sink.close()).unwrap();
 
     assert_eq!(
         read_to_end(&mut b, || pair.run()),
@@ -285,7 +299,8 @@ async fn a_reset_after_a_close_keeps_the_clean_end() {
     let (a, mut b) = pair.open(b"abc");
     let (mut sink, _reader) = a.into_split();
     pair.drive(sink.close()).unwrap();
-    sink.reset();
+    sink.on_close(SinkClose::Reset);
+    drop(sink);
     assert_eq!(read_to_end(&mut b, || pair.run()), (b"abc".to_vec(), None));
 }
 
@@ -299,12 +314,14 @@ async fn a_reset_closes_the_stream_without_the_reader() {
     // B never reads, and gives up on its own direction. Only A's data keeps the stream open.
     let (b_sink, _b_reader) = b.into_split();
     drop(b_sink);
-    let (sink, reader) = a.into_split();
+    let (mut sink, reader) = a.into_split();
     drop(reader);
     pair.run();
     assert_eq!(pair.a.conn.stats().outbound_streams, 1);
 
-    sink.reset();
+    sink.on_close(SinkClose::Reset);
+
+    drop(sink);
     pair.run();
     assert_eq!(pair.a.conn.stats().outbound_streams, 0);
     assert_eq!(pair.b.conn.stats().inbound_streams, 0);
@@ -509,6 +526,7 @@ async fn an_abort_survives_the_connection() {
     let (a, b) = pair.open(b"abc");
     let (mut b_sink, _b_reader) = b.into_split();
     pair.drive(b_sink.send(Bytes::from_static(b"xyz"))).unwrap();
+    b_sink.on_close(SinkClose::Abort);
     drop(b_sink);
     pair.run();
 

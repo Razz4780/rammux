@@ -29,7 +29,7 @@ use crate::{
         Downgraded, RammuxProgress,
         test::wire::{Rig, raw, rig},
     },
-    stream::{RammuxSink, RammuxStream, StreamError},
+    stream::{RammuxSink, RammuxStream, SinkClose, StreamError},
     wire::{
         codec::decoder::{DecodedFrame, InboundFrame},
         header::{ControlFlags, Header, Pong, StreamHeader},
@@ -130,8 +130,8 @@ struct Peer {
     last_ping: Option<u32>,
     /// Bytes of `DATA` the connection sent.
     received: u64,
-    /// Streams whose sinks the application dropped before closing them, or reset, and whose `FIN_WRITE`
-    /// must say so.
+    /// Streams whose sinks the application closed with [`SinkClose::Abort`] or [`SinkClose::Reset`],
+    /// and whose `FIN_WRITE` must say so.
     ended_sinks: BTreeMap<u16, SinkEnd>,
     /// Streams that the peer reset, and whose `FIN_READ` the connection owes at once.
     awaiting_fin_read: BTreeSet<u16>,
@@ -141,11 +141,11 @@ struct Peer {
     resets: u64,
 }
 
-/// How the application ended a sink without closing it.
+/// How the application closed a sink, when not cleanly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SinkEnd {
     /// `FIN_WRITE` must carry `ABORT`.
-    Dropped,
+    Aborted,
     /// `FIN_WRITE` must carry `RESET`.
     Reset,
 }
@@ -243,13 +243,13 @@ impl Peer {
             let end = self.ended_sinks.remove(&id);
             assert_eq!(
                 part.flags.abort,
-                end == Some(SinkEnd::Dropped),
-                "ABORT if and only if the sink was dropped before it was closed"
+                end == Some(SinkEnd::Aborted),
+                "ABORT if and only if the sink was closed with an abort"
             );
             assert_eq!(
                 part.flags.reset,
                 end == Some(SinkEnd::Reset),
-                "RESET if and only if the sink was reset"
+                "RESET if and only if the sink was closed with a reset"
             );
             self.aborts += u64::from(part.flags.abort);
             self.resets += u64::from(part.flags.reset);
@@ -553,34 +553,54 @@ impl Session {
             },
 
             14 => {
-                // Drop the sink without closing it.
+                // Drop the sink with an abort.
                 if let Some((sink_slot, _)) = self.app.get_mut(at)
                     && let Some(mut sink) = sink_slot.take()
                 {
+                    sink.on_close(SinkClose::Abort);
                     // Unless the peer stopped reading, writing is still open: the connection aborts it.
                     let flushed = sink.flush().now_or_never();
                     if flushed != Some(Err(StreamError::PeerStoppedReading)) {
                         let id = u16::from_be_bytes(sink.id().to_be_bytes());
-                        self.peer.ended_sinks.insert(id, SinkEnd::Dropped);
+                        self.peer.ended_sinks.insert(id, SinkEnd::Aborted);
                     }
                 }
             },
 
             15 => {
-                // Reset the stream, maybe in the middle of a close.
+                // Close the sink with a kind chosen at random, maybe in the middle of a clean close,
+                // and drop it.
                 if let Some((sink_slot, _)) = self.app.get_mut(at)
                     && let Some(mut sink) = sink_slot.take()
                 {
-                    // Unless the peer stopped reading, `FIN_WRITE` did not go out yet: the connection resets.
-                    let flushed = sink.flush().now_or_never();
-                    if flushed != Some(Err(StreamError::PeerStoppedReading)) {
-                        let id = u16::from_be_bytes(sink.id().to_be_bytes());
-                        self.peer.ended_sinks.insert(id, SinkEnd::Reset);
-                    }
+                    // Writing is open, or a clean close waits to send its `FIN_WRITE`:
+                    // a close that is not clean replaces it.
+                    let open = if self.rng.below(4) == 0 {
+                        sink.close().now_or_never().is_none()
+                    } else {
+                        sink.flush().now_or_never() != Some(Err(StreamError::PeerStoppedReading))
+                    };
+                    // Mostly a reset: 14 aborts already.
+                    let close = match self.rng.below(4) {
+                        0 => SinkClose::Clean,
+                        1 => SinkClose::Abort,
+                        _ => SinkClose::Reset,
+                    };
+                    sink.on_close(close);
                     if self.rng.coin() {
                         let _ = sink.close().now_or_never();
                     }
-                    sink.reset();
+                    let ended = match close {
+                        SinkClose::Clean => None,
+                        SinkClose::Abort => Some(SinkEnd::Aborted),
+                        SinkClose::Reset => Some(SinkEnd::Reset),
+                    };
+                    if let Some(ended) = ended
+                        && open
+                    {
+                        let id = u16::from_be_bytes(sink.id().to_be_bytes());
+                        self.peer.ended_sinks.insert(id, ended);
+                    }
                 }
             },
 
@@ -610,7 +630,7 @@ impl Session {
         let window = u64::from(self.peer.config.remote_recv_window.get());
         let mut full = 0;
         for sink in self.app.iter().filter_map(|(sink, _)| sink.as_ref()) {
-            let stall = sink.reader_stall();
+            let stall = sink.stats();
             // A stream that the peer stopped reading holds nothing, and its ID may be in use again.
             if stall.unacked == 0 {
                 continue;

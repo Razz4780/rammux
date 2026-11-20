@@ -6,21 +6,10 @@
 //! The elements are pinned by their [`Arc`]: the list holds a strong reference to every linked element,
 //! so an element never moves or goes away while the list points to it.
 //!
-//! Every list has a unique ID, and a node records the ID of the list it is linked into.
-//! A list touches only the links of its own nodes, which makes the API safe:
-//! a node of another list is never mistaken for one of ours.
+//! A node does not record which list it is linked into, so the caller keeps track of that:
+//! the methods that take an element are unsafe, and the element must never be in another list.
 
-use std::{
-    cell::UnsafeCell,
-    fmt,
-    marker::PhantomData,
-    num::NonZeroU64,
-    ptr::NonNull,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::{cell::UnsafeCell, fmt, marker::PhantomData, ptr::NonNull, sync::Arc};
 
 /// An element of a [`PinList`].
 ///
@@ -34,11 +23,9 @@ pub unsafe trait Linked: Sized {
 }
 
 /// The links of an element of a [`PinList`], embedded in the element.
+///
+/// Only the list that the node is linked into reads or writes the links.
 pub struct Node<T> {
-    /// ID of the list the node is linked into, or 0 if it is not linked.
-    ///
-    /// Only that list reads or writes [`Self::links`].
-    owner: AtomicU64,
     links: UnsafeCell<Links<T>>,
 }
 
@@ -51,7 +38,6 @@ impl<T> Node<T> {
     /// Creates a node that is not linked.
     pub const fn new() -> Self {
         Self {
-            owner: AtomicU64::new(0),
             links: UnsafeCell::new(Links {
                 prev: None,
                 next: None,
@@ -68,22 +54,19 @@ impl<T> Default for Node<T> {
 
 impl<T> fmt::Debug for Node<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Node")
-            .field("owner", &self.owner.load(Ordering::Relaxed))
-            .finish_non_exhaustive()
+        f.debug_struct("Node").finish_non_exhaustive()
     }
 }
 
 // SAFETY: the links are read only by the list that owns the node, through a shared reference to the list,
-// and written only through an exclusive reference to the list. The ownership of a node passes from one list
-// to the next with the release store and the acquire compare-exchange of `owner`.
+// and written only through an exclusive reference to the list. The callers of the unsafe methods of the list
+// guarantee that a node passes from one list to the next only after the previous one removed it.
 unsafe impl<T: Send + Sync> Send for Node<T> {}
 // SAFETY: as above.
 unsafe impl<T: Send + Sync> Sync for Node<T> {}
 
 /// An intrusive doubly linked list of [`Arc`]s, see the [module docs](self).
 pub struct PinList<T: Linked> {
-    id: NonZeroU64,
     head: Option<NonNull<T>>,
     tail: Option<NonNull<T>>,
     len: usize,
@@ -98,11 +81,8 @@ unsafe impl<T: Linked + Send + Sync> Sync for PinList<T> {}
 
 impl<T: Linked> PinList<T> {
     /// Creates an empty list.
-    pub fn new() -> Self {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    pub const fn new() -> Self {
         Self {
-            id: NonZeroU64::new(id).expect("list IDs do not run out"),
             head: None,
             tail: None,
             len: 0,
@@ -122,31 +102,33 @@ impl<T: Linked> PinList<T> {
     }
 
     /// Returns whether the element is in this list.
-    pub fn contains(&self, element: &T) -> bool {
-        element.node().owner.load(Ordering::Relaxed) == self.id.get()
+    ///
+    /// # Safety
+    ///
+    /// The element must not be in another list.
+    pub unsafe fn contains(&self, element: &T) -> bool {
+        // SAFETY: the caller guarantees that the links are either ours or not touched by anyone.
+        let has_prev = unsafe { (*element.node().links.get()).prev.is_some() };
+        // Only the head of a list has no `prev`.
+        has_prev || self.head == Some(NonNull::from(element))
     }
 
     /// Puts the element at the back of the list.
     ///
     /// Returns `false` and does nothing if the element is already in this list.
     ///
-    /// # Panics
+    /// # Safety
     ///
-    /// Panics if the element is in another list.
-    pub fn push_back(&mut self, element: &Arc<T>) -> bool {
-        if let Err(owner) = element.node().owner.compare_exchange(
-            0,
-            self.id.get(),
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ) {
-            assert_eq!(owner, self.id.get(), "the element is in another list");
+    /// As for [`Self::contains`].
+    pub unsafe fn push_back(&mut self, element: &Arc<T>) -> bool {
+        // SAFETY: guaranteed by the caller.
+        if unsafe { self.contains(element) } {
             return false;
         }
 
         let ptr = NonNull::new(Arc::into_raw(Arc::clone(element)).cast_mut())
             .expect("Arc::into_raw never returns null");
-        // SAFETY: the element is now owned by this list, and we have exclusive access to the list.
+        // SAFETY: the element is in no list, so it is ours now, and we have exclusive access to the list.
         unsafe {
             *Self::links(ptr) = Links {
                 prev: self.tail,
@@ -165,8 +147,13 @@ impl<T: Linked> PinList<T> {
     /// Takes the element out of the list, wherever it is.
     ///
     /// Returns `false` and does nothing if the element is not in this list.
-    pub fn remove(&mut self, element: &Arc<T>) -> bool {
-        if !self.contains(element) {
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::contains`].
+    pub unsafe fn remove(&mut self, element: &Arc<T>) -> bool {
+        // SAFETY: guaranteed by the caller.
+        if !unsafe { self.contains(element) } {
             return false;
         }
         // The pointer that the list holds, the one from `Arc::into_raw`, is the one to unlink.
@@ -223,7 +210,6 @@ impl<T: Linked> PinList<T> {
                 None => self.tail = prev,
             }
             self.len -= 1;
-            ptr.as_ref().node().owner.store(0, Ordering::Release);
             Arc::from_raw(ptr.as_ptr())
         }
     }
@@ -312,7 +298,8 @@ mod test {
         let mut list = PinList::new();
         let elements = (0..4).map(element).collect::<Vec<_>>();
         for element in &elements {
-            assert!(list.push_back(element));
+            // SAFETY: there is only one list.
+            assert!(unsafe { list.push_back(element) });
         }
         assert_eq!(values(&list), [0, 1, 2, 3]);
         assert_eq!(list.len(), 4);
@@ -330,21 +317,24 @@ mod test {
     fn remove_from_anywhere() {
         let mut list = PinList::new();
         let elements = (0..5).map(element).collect::<Vec<_>>();
-        for element in &elements {
-            list.push_back(element);
+        // SAFETY: there is only one list.
+        unsafe {
+            for element in &elements {
+                list.push_back(element);
+            }
+
+            assert!(list.remove(&elements[2]));
+            assert_eq!(values(&list), [0, 1, 3, 4]);
+            assert!(list.remove(&elements[0]));
+            assert_eq!(values(&list), [1, 3, 4]);
+            assert!(list.remove(&elements[4]));
+            assert_eq!(values(&list), [1, 3]);
+            assert!(!list.remove(&elements[4]), "not in the list anymore");
+            assert_eq!(list.len(), 2);
+
+            // A removed element can come back, at the back.
+            assert!(list.push_back(&elements[0]));
         }
-
-        assert!(list.remove(&elements[2]));
-        assert_eq!(values(&list), [0, 1, 3, 4]);
-        assert!(list.remove(&elements[0]));
-        assert_eq!(values(&list), [1, 3, 4]);
-        assert!(list.remove(&elements[4]));
-        assert_eq!(values(&list), [1, 3]);
-        assert!(!list.remove(&elements[4]), "not in the list anymore");
-        assert_eq!(list.len(), 2);
-
-        // A removed element can come back, at the back.
-        assert!(list.push_back(&elements[0]));
         assert_eq!(values(&list), [1, 3, 0]);
     }
 
@@ -352,8 +342,11 @@ mod test {
     fn pushing_twice_does_nothing() {
         let mut list = PinList::new();
         let a = element(1);
-        assert!(list.push_back(&a));
-        assert!(!list.push_back(&a));
+        // SAFETY: there is only one list.
+        unsafe {
+            assert!(list.push_back(&a));
+            assert!(!list.push_back(&a));
+        }
         assert_eq!(values(&list), [1]);
     }
 
@@ -361,12 +354,15 @@ mod test {
     fn the_list_holds_a_strong_reference() {
         let mut list = PinList::new();
         let a = element(1);
-        list.push_back(&a);
-        assert_eq!(Arc::strong_count(&a), 2);
-        list.remove(&a);
-        assert_eq!(Arc::strong_count(&a), 1);
+        // SAFETY: there is only one list.
+        unsafe {
+            list.push_back(&a);
+            assert_eq!(Arc::strong_count(&a), 2);
+            list.remove(&a);
+            assert_eq!(Arc::strong_count(&a), 1);
 
-        list.push_back(&a);
+            list.push_back(&a);
+        }
         let weak = Arc::downgrade(&a);
         drop(a);
         // The element lives on in the list.
@@ -379,28 +375,39 @@ mod test {
     }
 
     #[test]
-    fn another_list_does_not_touch_our_elements() {
-        let mut ours = PinList::new();
-        let mut theirs = PinList::<Element>::new();
-        let a = element(1);
-        ours.push_back(&a);
-        assert!(ours.contains(&a));
-        assert!(!theirs.contains(&a));
-        assert!(!theirs.remove(&a));
-        assert_eq!(values(&ours), [1]);
-
-        ours.remove(&a);
-        assert!(theirs.push_back(&a), "a free element can join any list");
+    fn contains_only_linked_elements() {
+        let mut list = PinList::<Element>::new();
+        let elements = (0..3).map(element).collect::<Vec<_>>();
+        // SAFETY: there is only one list.
+        unsafe {
+            assert!(!list.contains(&elements[0]));
+            list.push_back(&elements[0]);
+            assert!(list.contains(&elements[0]), "the only element");
+            list.push_back(&elements[1]);
+            assert!(list.contains(&elements[0]), "the head");
+            assert!(list.contains(&elements[1]), "the tail");
+            assert!(!list.contains(&elements[2]));
+            list.remove(&elements[0]);
+            assert!(!list.contains(&elements[0]));
+            assert!(list.contains(&elements[1]));
+        }
     }
 
     #[test]
-    #[should_panic(expected = "in another list")]
-    fn pushing_an_element_of_another_list_panics() {
-        let mut ours = PinList::new();
+    fn a_removed_element_can_join_another_list() {
+        let mut ours = PinList::<Element>::new();
         let mut theirs = PinList::new();
         let a = element(1);
-        ours.push_back(&a);
-        theirs.push_back(&a);
+        // SAFETY: the element is removed from one list before it joins the other.
+        unsafe {
+            ours.push_back(&a);
+            assert!(ours.remove(&a));
+            assert!(theirs.push_back(&a));
+            assert!(theirs.contains(&a));
+            assert!(!ours.contains(&a));
+        }
+        assert_eq!(values(&theirs), [1]);
+        assert_eq!(ours.len(), 0);
     }
 
     #[test]
@@ -411,11 +418,14 @@ mod test {
                 scope.spawn(move || {
                     let mut list = PinList::new();
                     for _ in 0..4 {
-                        for element in chunk {
-                            list.push_back(element);
-                        }
-                        for element in chunk.iter().step_by(2) {
-                            list.remove(element);
+                        // SAFETY: the chunks are disjoint, so every element is only ever in this list.
+                        unsafe {
+                            for element in chunk {
+                                list.push_back(element);
+                            }
+                            for element in chunk.iter().step_by(2) {
+                                list.remove(element);
+                            }
                         }
                         while list.pop_front().is_some() {}
                     }

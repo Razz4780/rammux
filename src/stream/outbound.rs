@@ -12,7 +12,7 @@ use tokio::time::Instant;
 use crate::{
     error::{StreamError, StreamViolation},
     flow::{Loan, RateEstimate, Window},
-    stream::{ConnFlow, FinState, StreamRef, waker::WakerSlot},
+    stream::{ConnFlow, FinState, SinkClose, StreamRef, waker::WakerSlot},
 };
 
 /// What the sending direction of a stream needs from the rest of the connection.
@@ -52,10 +52,12 @@ enum OutboundState {
     },
     /// The application closed writing, and `FIN_WRITE` was not handed to the connection yet.
     HalfClosed {
-        /// Data to send before `FIN_WRITE`, if any.
+        /// Data to send before `FIN_WRITE`, if any. Always empty unless the close is [`SinkClose::Clean`].
         ready_data: Bytes,
         /// Waits for `FIN_WRITE` to be sent.
         writer: WakerSlot,
+        /// What `FIN_WRITE` says.
+        close: SinkClose,
     },
     /// Nothing more will be sent but `FIN_WRITE`, if it was not sent yet.
     Closed { fin_state: FinState, end: WriteEnd },
@@ -64,45 +66,50 @@ enum OutboundState {
 /// Why the sending direction of a stream is closed.
 #[derive(Clone, Copy)]
 enum WriteEnd {
-    /// The application closed it.
+    /// The application closed it with [`SinkClose::Clean`].
     Closed,
-    /// The application dropped its sink without closing it. `FIN_WRITE` carries `ABORT`.
-    Dropped,
-    /// The application reset the stream. `FIN_WRITE` carries `RESET`.
+    /// The application closed it with [`SinkClose::Abort`]. `FIN_WRITE` carries `ABORT`.
+    Aborted,
+    /// The application closed it with [`SinkClose::Reset`]. `FIN_WRITE` carries `RESET`.
     Reset,
     /// The peer stopped reading, or the connection is gone. The application gets the error.
     Failed(StreamError),
 }
 
 impl WriteEnd {
+    /// Returns the end of a close of the application.
+    fn of_close(close: SinkClose) -> Self {
+        match close {
+            SinkClose::Clean => Self::Closed,
+            SinkClose::Abort => Self::Aborted,
+            SinkClose::Reset => Self::Reset,
+        }
+    }
+
     /// Returns what a write of the application gets.
     fn write_error(self) -> StreamError {
         match self {
-            Self::Closed | Self::Dropped | Self::Reset => StreamError::SinkClosed,
+            Self::Closed | Self::Aborted | Self::Reset => StreamError::SinkClosed,
             Self::Failed(error) => error,
+        }
+    }
+
+    /// Returns what `FIN_WRITE` says.
+    fn fin_write(self) -> FinWrite {
+        match self {
+            Self::Closed | Self::Failed(..) => FinWrite::Clean,
+            Self::Aborted => FinWrite::Abort,
+            Self::Reset => FinWrite::Reset,
         }
     }
 
     /// Returns what a flush or a close of the application gets.
     fn flushed(self) -> Result<(), StreamError> {
         match self {
-            Self::Closed | Self::Dropped | Self::Reset => Ok(()),
+            Self::Closed | Self::Aborted | Self::Reset => Ok(()),
             Self::Failed(error) => Err(error),
         }
     }
-}
-
-/// What the writer of a stream knows about the progress of its reader, see
-/// [`RammuxSink::reader_stall`](super::RammuxSink::reader_stall).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct ReaderStall {
-    /// How many bytes of the stream are in flight: sent, and not released by the peer's reader yet.
-    /// They count against the buffers of the peer, wherever they are.
-    pub unacked: u64,
-    /// When the peer last released bytes of the stream: when its last window update arrived.
-    /// [`None`] if none has arrived yet.
-    pub last_window_update: Option<Instant>,
 }
 
 /// The `FIN_WRITE` of a sending direction.
@@ -110,9 +117,9 @@ pub struct ReaderStall {
 pub enum FinWrite {
     /// The application closed writing, or the peer stopped reading, or the connection is gone.
     Clean,
-    /// The application dropped its sink without closing it: `FIN_WRITE` with `ABORT`.
+    /// The application closed writing with [`SinkClose::Abort`]: `FIN_WRITE` with `ABORT`.
     Abort,
-    /// The application reset the stream: `FIN_WRITE` with `RESET`.
+    /// The application closed writing with [`SinkClose::Reset`]: `FIN_WRITE` with `RESET`.
     Reset,
 }
 
@@ -128,7 +135,7 @@ impl OutboundTraffic {
                 frame_limit: u64::from(frame_limit.get()),
                 loan: Loan::default(),
                 rate: RateEstimate::new(Instant::now()),
-                last_window_update: None,
+                last_ack: None,
             },
         }
     }
@@ -191,13 +198,35 @@ impl OutboundTraffic {
         }
     }
 
-    /// The application closes writing. `FIN_WRITE` follows the data that is not sent yet.
+    /// The application closes writing. With [`SinkClose::Clean`], `FIN_WRITE` follows the data that is
+    /// not sent yet. With [`SinkClose::Abort`] or [`SinkClose::Reset`], the data that is not sent yet
+    /// is dropped, and `FIN_WRITE` with `ABORT` or `RESET` follows at once.
+    ///
+    /// A close that is not clean replaces a close that waits to send its `FIN_WRITE`, and drops the data
+    /// of that close too. A clean close changes no close. Does nothing once `FIN_WRITE` went out,
+    /// or once the direction ended for another reason.
     ///
     /// Wakes the `data_task` of the stream if `FIN_WRITE` is due now: no data is left to send.
-    pub fn close_writing(&mut self, data_task: &AtomicWaker) {
-        let OutboundState::Open { ready_data, writer } = &mut self.state else {
-            return;
+    pub fn close_writing(&mut self, close: SinkClose, data_task: &AtomicWaker) {
+        let (ready_data, writer) = match &mut self.state {
+            OutboundState::Open { ready_data, writer } => (ready_data, writer),
+            OutboundState::HalfClosed {
+                ready_data,
+                close: pending,
+                ..
+            } => {
+                if close != SinkClose::Clean {
+                    *ready_data = Bytes::new();
+                    *pending = close;
+                    data_task.wake();
+                }
+                return;
+            },
+            OutboundState::Closed { .. } => return,
         };
+        if close != SinkClose::Clean {
+            *ready_data = Bytes::new();
+        }
         if ready_data.is_empty() {
             data_task.wake();
         }
@@ -206,46 +235,27 @@ impl OutboundTraffic {
         self.state = OutboundState::HalfClosed {
             ready_data: std::mem::take(ready_data),
             writer: std::mem::take(writer),
+            close,
         };
     }
 
-    /// The application dropped its sink. A sink that was not closed aborts: the data that was not sent
-    /// is dropped, and `FIN_WRITE` with `ABORT` follows. A sink that started to close finishes it.
-    ///
-    /// Wakes the `data_task` of the stream, which sends `FIN_WRITE`.
-    pub fn drop_writing(&mut self, data_task: &AtomicWaker) {
-        let OutboundState::Open { .. } = &self.state else {
-            return;
-        };
-        data_task.wake();
-        self.state = OutboundState::Closed {
-            fin_state: FinState::default(),
-            end: WriteEnd::Dropped,
-        };
+    /// Returns the bytes sent and not acked by the peer.
+    pub fn unacked(&self) -> u64 {
+        self.ledger.window.unacked()
     }
 
-    /// The application resets the stream: the data that was not sent is dropped, and `FIN_WRITE` with `RESET`
-    /// follows. A sink that started to close is reset too, as long as its `FIN_WRITE` did not go out.
-    ///
-    /// Does nothing once `FIN_WRITE` went out, or once the direction ended for another reason.
-    /// Wakes the `data_task` of the stream, which sends `FIN_WRITE`.
-    pub fn reset_writing(&mut self, data_task: &AtomicWaker) {
-        let (OutboundState::Open { .. } | OutboundState::HalfClosed { .. }) = &self.state else {
-            return;
-        };
-        data_task.wake();
-        self.state = OutboundState::Closed {
-            fin_state: FinState::default(),
-            end: WriteEnd::Reset,
-        };
-    }
-
-    /// Returns what this side knows about the progress of the peer's reader.
-    pub fn reader_stall(&self) -> ReaderStall {
-        ReaderStall {
-            unacked: self.ledger.window.unacked(),
-            last_window_update: self.ledger.last_window_update,
+    /// Returns the bytes written by the application and not sent yet.
+    pub fn unsent(&self) -> u64 {
+        match &self.state {
+            OutboundState::Open { ready_data, .. }
+            | OutboundState::HalfClosed { ready_data, .. } => ready_data.len() as u64,
+            OutboundState::Closed { .. } => 0,
         }
+    }
+
+    /// Returns when the peer last acked bytes, if it did.
+    pub fn last_ack(&self) -> Option<Instant> {
+        self.ledger.last_ack
     }
 
     // The connection side.
@@ -266,7 +276,11 @@ impl OutboundTraffic {
                 Poll::Ready((chunk, None))
             },
 
-            OutboundState::HalfClosed { ready_data, writer } => {
+            OutboundState::HalfClosed {
+                ready_data,
+                writer,
+                close,
+            } => {
                 // Only data waits for room. `FIN_WRITE` alone goes out at once.
                 let chunk = if ready_data.is_empty() {
                     Bytes::new()
@@ -281,14 +295,15 @@ impl OutboundTraffic {
                     chunk
                 };
                 writer.wake();
+                let end = WriteEnd::of_close(*close);
                 self.state = OutboundState::Closed {
                     fin_state: FinState {
                         sent: true,
                         received: false,
                     },
-                    end: WriteEnd::Closed,
+                    end,
                 };
-                Poll::Ready((chunk, Some(FinWrite::Clean)))
+                Poll::Ready((chunk, Some(end.fin_write())))
             },
 
             OutboundState::Closed { fin_state, end } => {
@@ -298,12 +313,7 @@ impl OutboundTraffic {
                     return Poll::Pending;
                 }
                 fin_state.sent = true;
-                let fin_write = match end {
-                    WriteEnd::Dropped => FinWrite::Abort,
-                    WriteEnd::Reset => FinWrite::Reset,
-                    WriteEnd::Closed | WriteEnd::Failed(..) => FinWrite::Clean,
-                };
-                Poll::Ready((Bytes::new(), Some(fin_write)))
+                Poll::Ready((Bytes::new(), Some(end.fin_write())))
             },
         }
     }
@@ -330,7 +340,7 @@ impl OutboundTraffic {
             .ok_or(StreamViolation("returned more credit than was in flight"))?;
 
         let freed = self.ledger.window.set(&mut ctx.flow.tx_pool, unacked);
-        self.ledger.last_window_update = Some(ctx.now);
+        self.ledger.last_ack = Some(ctx.now);
         // The credit pays back the advance first.
         self.ledger
             .loan
@@ -373,10 +383,23 @@ impl OutboundTraffic {
 
     /// The peer stopped reading, or the connection is gone: nothing more is sent but `FIN_WRITE`,
     /// the data that was not sent is dropped, and the application gets the `error`.
+    /// A close that is not clean has no data to lose, and keeps its end.
     ///
     /// Wakes the `data_task` of the stream if `FIN_WRITE` is due now.
     fn end(&mut self, error: StreamError, data_task: &AtomicWaker) -> Result<(), StreamViolation> {
         match &mut self.state {
+            OutboundState::HalfClosed { writer, close, .. } if *close != SinkClose::Clean => {
+                writer.wake();
+                data_task.wake();
+                self.state = OutboundState::Closed {
+                    fin_state: FinState {
+                        sent: false,
+                        received: true,
+                    },
+                    end: WriteEnd::of_close(*close),
+                };
+                Ok(())
+            },
             OutboundState::Open { writer, .. } | OutboundState::HalfClosed { writer, .. } => {
                 writer.wake();
                 data_task.wake();
@@ -397,11 +420,6 @@ impl OutboundTraffic {
                 Ok(())
             },
         }
-    }
-
-    #[cfg(test)]
-    pub fn unacked(&self) -> u64 {
-        self.ledger.window.unacked()
     }
 
     /// Returns the advance the stream drew and has not repaid.
@@ -432,7 +450,7 @@ struct Ledger {
     /// The rate at which the reader of the peer proved to read, `R_s`.
     rate: RateEstimate,
     /// When the peer last returned credit, if it did.
-    last_window_update: Option<Instant>,
+    last_ack: Option<Instant>,
 }
 
 impl Ledger {

@@ -215,7 +215,7 @@ impl InboundTraffic {
         }
     }
 
-    /// The peer stopped writing: it closed its sink, or it dropped it if `abort`.
+    /// The peer stopped writing: it closed its sink, with [`SinkClose::Abort`](super::SinkClose::Abort) if `abort`.
     ///
     /// Wakes the `credit_task` of the stream if `FIN_READ` is due now: nothing is left to read.
     pub fn received_fin_write(
@@ -289,6 +289,18 @@ impl InboundTraffic {
                 fin_state.received = true;
                 Ok(())
             },
+        }
+    }
+
+    /// Returns the bytes received and not read by the application yet.
+    pub fn unread(&self) -> u64 {
+        match &self.state {
+            // The bytes received and not credited back, but those read already.
+            InboundState::Open { .. } | InboundState::HalfClosed { .. } => {
+                self.window.unacked() - self.credit
+            },
+            // Discarded, or read.
+            InboundState::Closed { .. } => 0,
         }
     }
 
