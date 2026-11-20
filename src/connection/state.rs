@@ -50,7 +50,7 @@ impl<IO> ConnState<IO> {
     pub fn poison(&mut self) {
         if let Self::Active(active) = self {
             active.end_streams(StreamError::ConnectionFailed);
+            *self = Self::Poisoned;
         }
-        *self = Self::Poisoned;
     }
 }

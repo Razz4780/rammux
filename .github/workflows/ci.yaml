@@ -104,7 +104,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run the tests of the unsafe modules
-        run: "cargo miri test --lib -- buffer:: pin_list::"
+        run: "cargo miri test --lib -- buffer:: pin_list:: stream::test::turns::"
 
   # The crate that would be published builds on its own.
   package:

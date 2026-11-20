@@ -164,10 +164,10 @@ impl RammuxSink {
     /// It takes effect at the next [`Sink::poll_close`], or at the drop.
     /// A close that waits to hand its end of the stream to the connection can still turn into
     /// [`SinkClose::Abort`] or [`SinkClose::Reset`] for example when the peer's reader stalls.
-    /// It cannot turn back into [`SinkClose::Clean`] the data is discarded by then.
+    /// It cannot turn back into [`SinkClose::Clean`], the data is discarded by then.
     ///
     /// Once the end of the stream is handed to the connection, or once writing
-    /// ended for another reason, this method is a noop.
+    /// ended for another reason, this method does nothing.
     pub fn on_close(&mut self, close: SinkClose) {
         self.on_close = close;
     }
